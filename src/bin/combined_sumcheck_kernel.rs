@@ -20,7 +20,8 @@ use whir::{
     bits::Bits,
     hash::{BLAKE3, HASH_COUNTER},
     lilac_merkle::{
-        combine_equal_subtrees, parent, prefix_root, zero_roots, Digest, MerkleAccumulator,
+        combine_equal_subtrees, parent, prefix_root, scaled_prefix_root, zero_roots, Digest,
+        MerkleAccumulator,
     },
     parameters::ProtocolParameters,
     transcript::{codecs::Empty, DomainSeparator, Proof, ProverState, VerifierState},
@@ -2706,31 +2707,42 @@ fn virtual_index_selected_roots(
     }
     let factors = cached_virtual_index_factors(level_index, level, transcript_roots);
     let (coefficients, alpha) = factors.as_ref();
-    selected
-        .iter()
-        .map(|row| {
-            let cache_key = (component_roots[2 * level.inverse_rate], row_capacity, *row);
-            if let Some(root) = virtual_index_row_root_cache()
-                .lock()
-                .expect("virtual-W row-root cache mutex must not be poisoned")
-                .get(&cache_key)
-                .copied()
-            {
-                return Some(root);
+    if selected.iter().any(|row| *row >= coefficients.len()) {
+        return None;
+    }
+    let descriptor = component_roots[2 * level.inverse_rate];
+    let mut roots = vec![None; selected.len()];
+    {
+        let cache = virtual_index_row_root_cache()
+            .lock()
+            .expect("virtual-W row-root cache mutex must not be poisoned");
+        for (slot, row) in roots.iter_mut().zip(selected) {
+            *slot = cache.get(&(descriptor, row_capacity, *row)).copied();
+        }
+    }
+    roots
+        .par_iter_mut()
+        .zip(selected.par_iter())
+        .for_each(|(slot, row)| {
+            if slot.is_none() {
+                *slot = Some(scaled_prefix_root(
+                    alpha,
+                    coefficients[*row],
+                    row_capacity,
+                    zeros,
+                ));
             }
-            let coefficient = *coefficients.get(*row)?;
-            let values = alpha
-                .iter()
-                .map(|lane_weight| coefficient * *lane_weight)
-                .collect::<Vec<_>>();
-            let root = prefix_root(&values, row_capacity, zeros);
-            virtual_index_row_root_cache()
-                .lock()
-                .expect("virtual-W row-root cache mutex must not be poisoned")
-                .insert(cache_key, root);
-            Some(root)
-        })
-        .collect()
+        });
+    let roots = roots.into_iter().collect::<Option<Vec<_>>>()?;
+    {
+        let mut cache = virtual_index_row_root_cache()
+            .lock()
+            .expect("virtual-W row-root cache mutex must not be poisoned");
+        for (row, root) in selected.iter().zip(&roots) {
+            cache.insert((descriptor, row_capacity, *row), *root);
+        }
+    }
+    Some(roots)
 }
 
 fn virtual_index_ood_row(
