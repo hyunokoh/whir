@@ -344,6 +344,159 @@ fn prove_tensor_product_relation(
     }
 }
 
+fn rank_one_left_row_round_polynomial(
+    coefficients: &[Field192],
+    alpha: &[Field192],
+    right: &[Field192],
+    active_rows: usize,
+    width: usize,
+) -> (Field192, Field192) {
+    assert!(active_rows.is_power_of_two());
+    let half = active_rows / 2;
+    (0..half)
+        .into_par_iter()
+        .map(|row| {
+            let low_start = row * width;
+            let high_start = (half + row) * width;
+            let mut low_inner = Field192::ZERO;
+            let mut difference_inner = Field192::ZERO;
+            for lane in 0..width {
+                low_inner += alpha[lane] * right[low_start + lane];
+                difference_inner +=
+                    alpha[lane] * (right[high_start + lane] - right[low_start + lane]);
+            }
+            (
+                coefficients[row] * low_inner,
+                (coefficients[half + row] - coefficients[row]) * difference_inner,
+            )
+        })
+        .reduce(
+            || (Field192::ZERO, Field192::ZERO),
+            |(ca, qa), (cb, qb)| (ca + cb, qa + qb),
+        )
+}
+
+fn fold_rank_one_coefficients(
+    coefficients: &mut [Field192],
+    active_rows: usize,
+    challenge: Field192,
+) -> usize {
+    assert!(active_rows.is_power_of_two());
+    let half = active_rows / 2;
+    let (low, high) = coefficients[..active_rows].split_at_mut(half);
+    low.par_iter_mut()
+        .zip(high.par_iter())
+        .for_each(|(low, high)| *low += (*high - *low) * challenge);
+    half
+}
+
+/// Tensor product sumcheck for a public rank-one left matrix
+/// `left[row,lane] = coefficients[row] * alpha[lane]`.  It emits exactly the
+/// same transcript as materializing `left` and calling
+/// [`prove_tensor_product_relation`], while storing and folding only the row
+/// coefficients and the final OOD row.
+fn prove_rank_one_left_tensor_product_relation(
+    mut coefficients: Vec<Field192>,
+    alpha: Vec<Field192>,
+    mut right: Vec<Field192>,
+    rows: usize,
+    width: usize,
+    roots: Vec<Digest>,
+) -> TensorProductProof {
+    assert!(
+        rows > 1
+            && width > 1
+            && rows.is_power_of_two()
+            && width.is_power_of_two()
+            && coefficients.len() == rows
+            && alpha.len() == width
+            && right.len() == rows * width
+    );
+    let claimed_sum = right
+        .par_chunks_exact(width)
+        .zip(coefficients.par_iter())
+        .map(|(row, coefficient)| {
+            let inner = alpha
+                .iter()
+                .zip(row)
+                .fold(Field192::ZERO, |sum, (left, right)| sum + *left * *right);
+            *coefficient * inner
+        })
+        .reduce(|| Field192::ZERO, |left, right| left + right);
+    let fields = rows * width;
+    let variables = fields.trailing_zeros() as usize;
+    let row_variables = rows.trailing_zeros() as usize;
+    let mut claim = claimed_sum;
+    let mut pairs = Vec::with_capacity(variables);
+    let mut active_rows = rows;
+    for _ in 0..row_variables {
+        let (constant, quadratic) =
+            rank_one_left_row_round_polynomial(&coefficients, &alpha, &right, active_rows, width);
+        pairs.push((constant, quadratic));
+        let challenge = transcript_challenge(fields, variables, &roots, claimed_sum, &pairs);
+        let linear = claim - constant.double() - quadratic;
+        let next_left = fold_rank_one_coefficients(&mut coefficients, active_rows, challenge);
+        let next_right = fold_tensor_rows(&mut right, active_rows, width, challenge);
+        assert_eq!(next_left, next_right);
+        active_rows = next_left;
+        claim = (quadratic * challenge + linear) * challenge + constant;
+    }
+    assert_eq!(active_rows, 1);
+    let mut left_ood_row = alpha;
+    left_ood_row
+        .par_iter_mut()
+        .for_each(|value| *value *= coefficients[0]);
+    let right_ood_row = right[..width].to_vec();
+    let mut left = left_ood_row.clone();
+    let mut active_lanes = width;
+    for _ in row_variables..variables {
+        let (constant, quadratic) =
+            compute_sumcheck_polynomial(&left[..active_lanes], &right[..active_lanes]);
+        pairs.push((constant, quadratic));
+        let challenge = transcript_challenge(fields, variables, &roots, claimed_sum, &pairs);
+        let linear = claim - constant.double() - quadratic;
+        let next_left = fold_active(&mut left, active_lanes, challenge);
+        let next_right = fold_active(&mut right, active_lanes, challenge);
+        assert_eq!(next_left, next_right);
+        active_lanes = next_left;
+        claim = (quadratic * challenge + linear) * challenge + constant;
+    }
+    assert_eq!(active_lanes, 1);
+    let proof = PackedSumcheckProof {
+        fields,
+        roots,
+        claimed_sum,
+        pairs,
+        terminal_left: left[0],
+        terminal_right: right[0],
+    };
+    assert!(proof.challenges().is_some());
+    TensorProductProof {
+        proof,
+        left_ood_row,
+        right_ood_row,
+    }
+}
+
+fn prove_rank_one_right_tensor_product_relation(
+    left: Vec<Field192>,
+    coefficients: Vec<Field192>,
+    alpha: Vec<Field192>,
+    rows: usize,
+    width: usize,
+    roots: Vec<Digest>,
+) -> TensorProductProof {
+    let mut result =
+        prove_rank_one_left_tensor_product_relation(coefficients, alpha, left, rows, width, roots);
+    std::mem::swap(
+        &mut result.proof.terminal_left,
+        &mut result.proof.terminal_right,
+    );
+    std::mem::swap(&mut result.left_ood_row, &mut result.right_ood_row);
+    assert!(result.proof.challenges().is_some());
+    result
+}
+
 fn local_relation_roots(relation: &[u8], level: usize, transcript_roots: &[Digest]) -> Vec<Digest> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"LiLAC/local-transition-relation/v1");
@@ -1180,11 +1333,16 @@ fn tensor_row_commitments(
 
 fn selected_tensor_carry_rows(
     vertical_codeword: &[Field192],
-    index_oracle: &[Field192],
+    index_coefficients: &[Field192],
+    index_alpha: &[Field192],
     horizontal_spectra: &[Vec<Field192>],
     selected: &[usize],
 ) -> Vec<Field192> {
-    assert_eq!(index_oracle.len(), vertical_codeword.len());
+    assert_eq!(index_alpha.len(), CARRYOPEN_WIDTH);
+    assert_eq!(
+        vertical_codeword.len(),
+        index_coefficients.len() * CARRYOPEN_WIDTH
+    );
     assert_eq!(selected.len(), CARRYOPEN_QUERIES);
     let mut terminal = Vec::with_capacity(CARRYOPEN_QUERIES * CARRYOPEN_TERMINAL_BLOCK);
     for row in selected {
@@ -1193,7 +1351,11 @@ fn selected_tensor_carry_rows(
             &vertical_codeword[start..start + CARRYOPEN_WIDTH],
             horizontal_spectra,
         ));
-        terminal.extend_from_slice(&index_oracle[start..start + CARRYOPEN_WIDTH]);
+        terminal.extend(
+            index_alpha
+                .iter()
+                .map(|value| index_coefficients[*row] * *value),
+        );
     }
     assert_eq!(terminal.len(), CARRYOPEN_QUERIES * CARRYOPEN_TERMINAL_BLOCK);
     terminal
@@ -2020,8 +2182,8 @@ fn run_production_carryopen(verifier_repetitions: usize) -> CarryOpenMeasurement
     let mut component_roots = generator_roots;
     component_roots.push(message_root);
     component_roots.extend(proof_commitments.iter().map(|commitment| commitment.root));
-    let mut index_oracle = vec![Field192::ZERO; level.qa_fields()];
-    populate_index_oracle(10, level, &mut index_oracle, &spectra, &component_roots);
+    let (index_coefficients, index_alpha) =
+        index_oracle_factors(10, level, &spectra, &component_roots);
     let index_descriptor = virtual_index_descriptor(10, level, &component_roots);
     component_roots.push(index_descriptor);
     let selected = selected_rows(
@@ -2033,15 +2195,17 @@ fn run_production_carryopen(verifier_repetitions: usize) -> CarryOpenMeasurement
     let (selected_front, _, _) = selected_row_front(level, &proof_commitments, &selected);
     let selected_rows = selected_tensor_carry_rows(
         &proof_codeword,
-        &index_oracle,
+        &index_coefficients,
+        &index_alpha,
         &horizontal_spectra,
         &selected,
     );
     let encode_and_commit = start.elapsed();
 
     let start = Instant::now();
-    let membership_result = prove_tensor_product_relation(
-        index_oracle,
+    let membership_result = prove_rank_one_left_tensor_product_relation(
+        index_coefficients,
+        index_alpha,
         proof_codeword.clone(),
         CARRYOPEN_INVERSE_RATE * CARRYOPEN_ROWS,
         CARRYOPEN_WIDTH,
@@ -2050,19 +2214,12 @@ fn run_production_carryopen(verifier_repetitions: usize) -> CarryOpenMeasurement
     let terminal_point = precarry.sumcheck.challenges().unwrap();
     let row_weights = equality_weights(&terminal_point[..16]);
     let column_weights = equality_weights(&terminal_point[16..]);
-    let mut evaluation_weights = vec![Field192::ZERO; level.qa_fields()];
-    evaluation_weights[..CARRYOPEN_FIELDS]
-        .par_chunks_mut(CARRYOPEN_WIDTH)
-        .enumerate()
-        .for_each(|(row, target)| {
-            target
-                .iter_mut()
-                .zip(&column_weights)
-                .for_each(|(value, column)| *value = row_weights[row] * *column);
-        });
-    let evaluation_result = prove_tensor_product_relation(
+    let mut evaluation_coefficients = vec![Field192::ZERO; CARRYOPEN_INVERSE_RATE * CARRYOPEN_ROWS];
+    evaluation_coefficients[..CARRYOPEN_ROWS].copy_from_slice(&row_weights);
+    let evaluation_result = prove_rank_one_right_tensor_product_relation(
         proof_codeword,
-        evaluation_weights,
+        evaluation_coefficients,
+        column_weights,
         CARRYOPEN_INVERSE_RATE * CARRYOPEN_ROWS,
         CARRYOPEN_WIDTH,
         local_relation_roots(b"CarryOpen-evaluation", 10, &component_roots),
@@ -6354,6 +6511,64 @@ mod tests {
         assert_eq!(
             evaluate_power_of_two_message(&tensor.right_ood_row, lane_point),
             flat.terminal_right
+        );
+    }
+
+    #[test]
+    fn rank_one_tensor_sumcheck_matches_materialized_transcript() {
+        let rows = 8;
+        let width = 4;
+        let coefficients = (0..rows)
+            .map(|index| Field192::from((3 * index + 1) as u64))
+            .collect::<Vec<_>>();
+        let alpha = (0..width)
+            .map(|index| Field192::from((5 * index + 2) as u64))
+            .collect::<Vec<_>>();
+        let rank_one_matrix = coefficients
+            .iter()
+            .flat_map(|coefficient| alpha.iter().map(move |value| *coefficient * *value))
+            .collect::<Vec<_>>();
+        let arbitrary = (0..rows * width).map(right_value).collect::<Vec<_>>();
+        let roots = local_relation_roots(b"rank-one-equivalence", 0, &[[9_u8; 32]]);
+        let materialized_left = prove_tensor_product_relation(
+            rank_one_matrix.clone(),
+            arbitrary.clone(),
+            rows,
+            width,
+            roots.clone(),
+        );
+        let rank_one_left = prove_rank_one_left_tensor_product_relation(
+            coefficients.clone(),
+            alpha.clone(),
+            arbitrary.clone(),
+            rows,
+            width,
+            roots.clone(),
+        );
+        assert_eq!(rank_one_left.proof, materialized_left.proof);
+        assert_eq!(rank_one_left.left_ood_row, materialized_left.left_ood_row);
+        assert_eq!(rank_one_left.right_ood_row, materialized_left.right_ood_row);
+
+        let materialized_right = prove_tensor_product_relation(
+            arbitrary.clone(),
+            rank_one_matrix,
+            rows,
+            width,
+            roots.clone(),
+        );
+        let rank_one_right = prove_rank_one_right_tensor_product_relation(
+            arbitrary,
+            coefficients,
+            alpha,
+            rows,
+            width,
+            roots,
+        );
+        assert_eq!(rank_one_right.proof, materialized_right.proof);
+        assert_eq!(rank_one_right.left_ood_row, materialized_right.left_ood_row);
+        assert_eq!(
+            rank_one_right.right_ood_row,
+            materialized_right.right_ood_row
         );
     }
 
