@@ -513,6 +513,11 @@ where
 }
 
 impl<G: Field> Commitment<G> {
+    /// Return the matrix Merkle root used by the commitment transcript.
+    pub const fn matrix_root(&self) -> crate::hash::Hash {
+        self.matrix_commitment.root()
+    }
+
     /// Returns the out-of-domain evaluations.
     pub const fn out_of_domain(&self) -> &Evaluations<G> {
         &self.out_of_domain

@@ -54,6 +54,14 @@ pub struct Commitment {
     hash: Hash,
 }
 
+impl Commitment {
+    /// Return the committed Merkle root for transcript binding by a
+    /// surrounding protocol.
+    pub const fn root(&self) -> Hash {
+        self.hash
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash, Default, Serialize, Deserialize)]
 #[must_use]
 pub struct Witness {
@@ -275,6 +283,15 @@ impl Config {
 impl Witness {
     pub const fn num_nodes(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Root of the committed tree. This is useful when a surrounding
+    /// protocol must derive its next challenge from the same commitment.
+    pub fn root(&self) -> Hash {
+        *self
+            .nodes
+            .last()
+            .expect("a Merkle witness contains its root")
     }
 }
 

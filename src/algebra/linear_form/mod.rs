@@ -2,6 +2,7 @@
 
 mod covector;
 mod multilinear_extension;
+mod sparse_covector;
 mod univariate_evaluation;
 
 use std::any::Any;
@@ -11,7 +12,7 @@ use static_assertions::assert_obj_safe;
 
 pub use self::{
     covector::Covector, multilinear_extension::MultilinearExtension,
-    univariate_evaluation::UnivariateEvaluation,
+    sparse_covector::SparseCovector, univariate_evaluation::UnivariateEvaluation,
 };
 use crate::algebra::{
     embedding::{self, Embedding},

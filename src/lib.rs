@@ -4,6 +4,7 @@ pub mod bits;
 pub mod cmdline_utils;
 pub mod engines;
 pub mod hash;
+pub mod lilac_merkle;
 pub mod parameters;
 pub mod protocols;
 pub mod transcript;
