@@ -58,7 +58,7 @@ struct Args {
     final_only: bool,
 }
 
-const PRODUCTION_FIELDS: usize = 60_338_822;
+const PRODUCTION_FIELDS: usize = 60_443_724;
 const PRODUCTION_VARIABLES: usize = 26;
 const TRANSCRIPT_BYTES: usize = 1_526;
 const SUMCHECK_MAGIC: &[u8; 8] = b"LILSC001";
@@ -542,8 +542,8 @@ struct Level {
 
 const LEVELS: [Level; 4] = [
     Level {
-        raw: 5_943_177,
-        blocks: 207,
+        raw: 6_287_709,
+        blocks: 219,
         block_semantic: 28_711,
         components: &[
             (16_406, 1 << 15),
@@ -555,40 +555,40 @@ const LEVELS: [Level; 4] = [
         width: 2_438,
         row_span: 16,
         inverse_rate: 2,
-        next_blocks: 384,
+        next_blocks: 397,
     },
     Level {
-        raw: 1_872_384,
-        blocks: 384,
+        raw: 1_935_772,
+        blocks: 397,
         block_semantic: 4_876,
         components: &[(2_438, 1 << 12), (2_438, 1 << 12)],
         group: 1 << 11,
         width: 1_369,
         row_span: 4,
         inverse_rate: 3,
-        next_blocks: 247,
+        next_blocks: 256,
     },
     Level {
-        raw: 676_286,
-        blocks: 247,
+        raw: 700_928,
+        blocks: 256,
         block_semantic: 2_738,
         components: &[(1_369, 1 << 11), (1_369, 1 << 11)],
         group: 1 << 10,
         width: 823,
         row_span: 4,
         inverse_rate: 4,
-        next_blocks: 206,
+        next_blocks: 212,
     },
     Level {
-        raw: 339_076,
-        blocks: 206,
+        raw: 348_952,
+        blocks: 212,
         block_semantic: 1_646,
         components: &[(823, 1 << 10), (823, 1 << 10)],
         group: 1 << 10,
         width: 583,
         row_span: 4,
         inverse_rate: 4,
-        next_blocks: 206,
+        next_blocks: 212,
     },
 ];
 
@@ -690,7 +690,7 @@ fn direct_tail_context_digest(component_roots: &[Digest]) -> Digest {
 }
 
 fn direct_whir_parameters(vector_size: usize) -> whir::protocols::whir::Config<Identity<Field192>> {
-    whir_parameters(vector_size, 128, 20)
+    whir_parameters(vector_size, 136, 20)
 }
 
 fn whir_parameters(
@@ -767,7 +767,7 @@ const CARRYOPEN_SEGMENT_CAPACITY: usize = 1 << 19;
 const STRONG_GROUP: usize = 1 << 10;
 const STRONG_WIDTH: usize = 1 << 10;
 const STRONG_INVERSE_RATE: usize = 24;
-const STRONG_QUERIES: usize = 30;
+const STRONG_QUERIES: usize = 31;
 const STRONG_NEXT_BLOCKS: usize = STRONG_QUERIES + 1;
 const STRONG_SOURCE_FIELDS: usize = STRONG_GROUP * STRONG_WIDTH;
 const STRONG_TERMINAL_FIELDS: usize = 2 * STRONG_NEXT_BLOCKS * STRONG_WIDTH;
@@ -5725,7 +5725,7 @@ fn main() {
                     percentile(&end_to_end_verify_ms, 0.95)
                 );
                 println!(
-                "- one joint root binds the 240,196-field certificate Phi state and {}-field tensor CarryOpen terminal; root mutation rejected",
+                "- one joint root binds the 247,192-field certificate Phi state and {}-field tensor CarryOpen terminal; root mutation rejected",
                 CARRYOPEN_TERMINAL_FIELDS
             );
                 println!(
