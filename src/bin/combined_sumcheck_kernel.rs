@@ -871,10 +871,27 @@ fn precarry_opening_points(root: &Digest, openings: usize) -> Vec<Vec<Field192>>
 fn evaluate_power_of_two_message(message: &[Field192], point: &[Field192]) -> Field192 {
     assert_eq!(message.len(), 1_usize << point.len());
     let mut scratch = message.to_vec();
+    fold_message_at_point(&mut scratch, point)
+}
+
+fn evaluate_power_of_two_message_with_scratch(
+    message: &[Field192],
+    point: &[Field192],
+    scratch: &mut [Field192],
+) -> Field192 {
+    assert_eq!(message.len(), scratch.len());
+    assert_eq!(message.len(), 1_usize << point.len());
+    scratch.copy_from_slice(message);
+    fold_message_at_point(scratch, point)
+}
+
+fn fold_message_at_point(scratch: &mut [Field192], point: &[Field192]) -> Field192 {
+    assert_eq!(scratch.len(), 1_usize << point.len());
     let mut active = scratch.len();
     for challenge in point {
-        active = fold_active(&mut scratch, active, *challenge);
+        active = fold_active(scratch, active, *challenge);
     }
+    assert_eq!(active, 1);
     scratch[0]
 }
 
@@ -920,10 +937,20 @@ fn precarry_coefficients(statement: &Digest, openings: usize) -> Vec<Field192> {
         .collect()
 }
 
-fn scaled_equality_weights(point: &[Field192], scale: Field192) -> Vec<Field192> {
-    let mut weights = equality_weights(point);
-    weights.par_iter_mut().for_each(|weight| *weight *= scale);
-    weights
+fn fill_scaled_equality_weights(point: &[Field192], scale: Field192, target: &mut [Field192]) {
+    assert_eq!(target.len(), 1_usize << point.len());
+    target[0] = scale;
+    let mut active = 1;
+    for coordinate in point.iter().rev() {
+        let (low, high_and_tail) = target.split_at_mut(active);
+        let high = &mut high_and_tail[..active];
+        high.copy_from_slice(low);
+        high.par_iter_mut().for_each(|value| *value *= *coordinate);
+        low.par_iter_mut()
+            .zip(high.par_iter())
+            .for_each(|(low, high)| *low -= *high);
+        active *= 2;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1061,9 +1088,10 @@ fn build_production_precarry(
 ) -> ProductionPreCarryProof {
     assert_eq!(message.len(), CARRYOPEN_FIELDS);
     let points = precarry_opening_points(&commitment_root, 16);
+    let mut scratch = vec![Field192::ZERO; message.len()];
     let claims = points
         .iter()
-        .map(|point| evaluate_power_of_two_message(message, point))
+        .map(|point| evaluate_power_of_two_message_with_scratch(message, point, &mut scratch))
         .collect::<Vec<_>>();
     let statement = precarry_statement_root(&commitment_root, &points, &claims);
     let coefficients = precarry_coefficients(&statement, claims.len());
@@ -1074,12 +1102,13 @@ fn build_production_precarry(
         .sum::<Field192>();
     let mut combined_weight = vec![Field192::ZERO; message.len()];
     for (point, coefficient) in points.iter().zip(coefficients) {
-        let weights = scaled_equality_weights(point, coefficient);
+        fill_scaled_equality_weights(point, coefficient, &mut scratch);
         combined_weight
             .par_iter_mut()
-            .zip(weights)
-            .for_each(|(target, weight)| *target += weight);
+            .zip(scratch.par_iter())
+            .for_each(|(target, weight)| *target += *weight);
     }
+    drop(scratch);
     let proof = ProductionPreCarryProof {
         commitment_root,
         points,
@@ -1149,61 +1178,15 @@ fn tensor_row_commitments(
         .collect()
 }
 
-fn derive_tensor_carry_source(
-    level: Level,
+fn selected_tensor_carry_rows(
     vertical_codeword: &[Field192],
     index_oracle: &[Field192],
     horizontal_spectra: &[Vec<Field192>],
-    membership_point: &[Field192],
-    evaluation_point: &[Field192],
     selected: &[usize],
 ) -> Vec<Field192> {
-    let rows = level.inverse_rate * level.group;
-    assert_eq!(vertical_codeword.len(), rows * level.width);
     assert_eq!(index_oracle.len(), vertical_codeword.len());
     assert_eq!(selected.len(), CARRYOPEN_QUERIES);
-    let row_variables = rows.trailing_zeros() as usize;
-    assert_eq!(
-        membership_point.len(),
-        row_variables + CARRYOPEN_WIDTH.trailing_zeros() as usize
-    );
-    assert_eq!(evaluation_point.len(), membership_point.len());
-    let membership_weights = equality_weights(&membership_point[..row_variables]);
-    let evaluation_weights = equality_weights(&evaluation_point[..row_variables]);
-    let membership_vertical_ood = (0..CARRYOPEN_WIDTH)
-        .into_par_iter()
-        .map(|lane| {
-            (0..rows).fold(Field192::ZERO, |sum, row| {
-                sum + vertical_codeword[row * CARRYOPEN_WIDTH + lane] * membership_weights[row]
-            })
-        })
-        .collect::<Vec<_>>();
-    let membership_index_ood = (0..CARRYOPEN_WIDTH)
-        .into_par_iter()
-        .map(|lane| {
-            (0..rows).fold(Field192::ZERO, |sum, row| {
-                sum + index_oracle[row * CARRYOPEN_WIDTH + lane] * membership_weights[row]
-            })
-        })
-        .collect::<Vec<_>>();
-    let evaluation_vertical_ood = (0..CARRYOPEN_WIDTH)
-        .into_par_iter()
-        .map(|lane| {
-            (0..rows).fold(Field192::ZERO, |sum, row| {
-                sum + vertical_codeword[row * CARRYOPEN_WIDTH + lane] * evaluation_weights[row]
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut terminal = Vec::with_capacity(CARRYOPEN_TERMINAL_FIELDS);
-    terminal.extend(encode_horizontal_row(
-        &membership_vertical_ood,
-        horizontal_spectra,
-    ));
-    terminal.extend(membership_index_ood);
-    terminal.extend(encode_horizontal_row(
-        &evaluation_vertical_ood,
-        horizontal_spectra,
-    ));
+    let mut terminal = Vec::with_capacity(CARRYOPEN_QUERIES * CARRYOPEN_TERMINAL_BLOCK);
     for row in selected {
         let start = row * CARRYOPEN_WIDTH;
         terminal.extend(encode_horizontal_row(
@@ -1212,6 +1195,34 @@ fn derive_tensor_carry_source(
         ));
         terminal.extend_from_slice(&index_oracle[start..start + CARRYOPEN_WIDTH]);
     }
+    assert_eq!(terminal.len(), CARRYOPEN_QUERIES * CARRYOPEN_TERMINAL_BLOCK);
+    terminal
+}
+
+fn derive_tensor_carry_source_from_folds(
+    membership: &TensorProductProof,
+    evaluation: &TensorProductProof,
+    horizontal_spectra: &[Vec<Field192>],
+    selected_rows: Vec<Field192>,
+) -> Vec<Field192> {
+    assert_eq!(membership.left_ood_row.len(), CARRYOPEN_WIDTH);
+    assert_eq!(membership.right_ood_row.len(), CARRYOPEN_WIDTH);
+    assert_eq!(evaluation.left_ood_row.len(), CARRYOPEN_WIDTH);
+    assert_eq!(
+        selected_rows.len(),
+        CARRYOPEN_QUERIES * CARRYOPEN_TERMINAL_BLOCK
+    );
+    let mut terminal = Vec::with_capacity(CARRYOPEN_TERMINAL_FIELDS);
+    terminal.extend(encode_horizontal_row(
+        &membership.right_ood_row,
+        horizontal_spectra,
+    ));
+    terminal.extend_from_slice(&membership.left_ood_row);
+    terminal.extend(encode_horizontal_row(
+        &evaluation.left_ood_row,
+        horizontal_spectra,
+    ));
+    terminal.extend(selected_rows);
     assert_eq!(terminal.len(), CARRYOPEN_TERMINAL_FIELDS);
     terminal
 }
@@ -2020,12 +2031,20 @@ fn run_production_carryopen(verifier_repetitions: usize) -> CarryOpenMeasurement
         &component_roots,
     );
     let (selected_front, _, _) = selected_row_front(level, &proof_commitments, &selected);
+    let selected_rows = selected_tensor_carry_rows(
+        &proof_codeword,
+        &index_oracle,
+        &horizontal_spectra,
+        &selected,
+    );
     let encode_and_commit = start.elapsed();
 
     let start = Instant::now();
-    let membership = prove_local_product_relation(
-        index_oracle.clone(),
+    let membership_result = prove_tensor_product_relation(
+        index_oracle,
         proof_codeword.clone(),
+        CARRYOPEN_INVERSE_RATE * CARRYOPEN_ROWS,
+        CARRYOPEN_WIDTH,
         local_relation_roots(b"CarryOpen-QA-membership", 10, &component_roots),
     );
     let terminal_point = precarry.sumcheck.challenges().unwrap();
@@ -2041,25 +2060,25 @@ fn run_production_carryopen(verifier_repetitions: usize) -> CarryOpenMeasurement
                 .zip(&column_weights)
                 .for_each(|(value, column)| *value = row_weights[row] * *column);
         });
-    let evaluation = prove_local_product_relation_with_claim(
-        proof_codeword.clone(),
+    let evaluation_result = prove_tensor_product_relation(
+        proof_codeword,
         evaluation_weights,
+        CARRYOPEN_INVERSE_RATE * CARRYOPEN_ROWS,
+        CARRYOPEN_WIDTH,
         local_relation_roots(b"CarryOpen-evaluation", 10, &component_roots),
-        precarry.sumcheck.terminal_left,
     );
-    let terminal_source = derive_tensor_carry_source(
-        level,
-        &proof_codeword,
-        &index_oracle,
+    assert_eq!(
+        evaluation_result.proof.claimed_sum,
+        precarry.sumcheck.terminal_left
+    );
+    let terminal_source = derive_tensor_carry_source_from_folds(
+        &membership_result,
+        &evaluation_result,
         &horizontal_spectra,
-        &membership
-            .challenges()
-            .expect("membership sumcheck must produce its OOD point"),
-        &evaluation
-            .challenges()
-            .expect("evaluation sumcheck must produce its OOD point"),
-        &selected,
+        selected_rows,
     );
+    let membership = membership_result.proof;
+    let evaluation = evaluation_result.proof;
     assert!(audit_tensor_carry_restoration(
         level,
         &component_roots,
@@ -6308,6 +6327,57 @@ mod tests {
         let padded_len = fold_active(&mut padded, 16, weight);
         assert_eq!(packed_len, padded_len);
         assert_eq!(&packed[..packed_len], &padded[..padded_len]);
+    }
+
+    #[test]
+    fn tensor_sumcheck_matches_flat_transcript_and_exposes_ood_rows() {
+        let rows = 8;
+        let width = 4;
+        let left = (0..rows * width).map(left_value).collect::<Vec<_>>();
+        let right = (0..rows * width).map(right_value).collect::<Vec<_>>();
+        let roots = local_relation_roots(b"tensor-flat-equivalence", 0, &[[7_u8; 32]]);
+        let claim = dot(&left, &right);
+        let flat = prove_local_product_relation_with_claim(
+            left.clone(),
+            right.clone(),
+            roots.clone(),
+            claim,
+        );
+        let tensor = prove_tensor_product_relation(left, right, rows, width, roots);
+        assert_eq!(tensor.proof, flat);
+        let point = flat.challenges().unwrap();
+        let lane_point = &point[rows.trailing_zeros() as usize..];
+        assert_eq!(
+            evaluate_power_of_two_message(&tensor.left_ood_row, lane_point),
+            flat.terminal_left
+        );
+        assert_eq!(
+            evaluate_power_of_two_message(&tensor.right_ood_row, lane_point),
+            flat.terminal_right
+        );
+    }
+
+    #[test]
+    fn reusable_precarry_scratch_matches_materialized_helpers() {
+        let point = [
+            Field192::from(2_u64),
+            Field192::from(3_u64),
+            Field192::from(5_u64),
+        ];
+        let message = (0..8).map(left_value).collect::<Vec<_>>();
+        let mut scratch = vec![Field192::ZERO; message.len()];
+        assert_eq!(
+            evaluate_power_of_two_message_with_scratch(&message, &point, &mut scratch),
+            evaluate_power_of_two_message(&message, &point)
+        );
+
+        let scale = Field192::from(17_u64);
+        fill_scaled_equality_weights(&point, scale, &mut scratch);
+        let materialized = equality_weights(&point)
+            .into_iter()
+            .map(|weight| scale * weight)
+            .collect::<Vec<_>>();
+        assert_eq!(scratch, materialized);
     }
 
     #[test]
