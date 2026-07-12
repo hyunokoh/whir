@@ -394,14 +394,27 @@ mod neon4 {
     }
 
     #[inline(always)]
+    unsafe fn compress_message_xof32_words8_packed(
+        cvs: &[Packed8; 8],
+        message: &[Packed8; 16],
+        block_len: u8,
+        flags: u8,
+    ) -> [Packed8; 8] {
+        let state = unsafe { compress_message_state8_packed(cvs, message, block_len, flags) };
+        std::array::from_fn(|word| unsafe { xor8(state[word], state[word + 8]) })
+    }
+
+    #[inline(always)]
     unsafe fn compress_message_xof32_words8(
         cvs: &[[u32; 8]; 8],
         message: &[Packed8; 16],
         block_len: u8,
         flags: u8,
     ) -> [Packed8; 8] {
-        let state = unsafe { compress_message_state8(cvs, message, block_len, flags) };
-        std::array::from_fn(|word| unsafe { xor8(state[word], state[word + 8]) })
+        let packed = std::array::from_fn(|word| unsafe {
+            set8(std::array::from_fn(|lane| cvs[lane][word]))
+        });
+        unsafe { compress_message_xof32_words8_packed(&packed, message, block_len, flags) }
     }
 
     #[inline(always)]
@@ -679,28 +692,46 @@ mod neon4 {
         unsafe { parent_messages8_from_words(&left, &right) }
     }
 
-    /// Hash sixteen field leaves and their eight immediate parents without
-    /// materializing the sixteen intermediate digests in lane-major memory.
-    #[target_feature(enable = "neon")]
-    pub unsafe fn compress_field_level1_8(
-        first: &[[u64; 3]; 8],
-        second: &[[u64; 3]; 8],
-    ) -> [Digest; 8] {
-        let first_words = unsafe { field_digest_words8(first) };
-        let second_words = unsafe { field_digest_words8(second) };
+    #[inline(always)]
+    unsafe fn pair_child_words8(
+        first: &[Packed8; 8],
+        second: &[Packed8; 8],
+    ) -> ([Packed8; 8], [Packed8; 8]) {
         let left = std::array::from_fn(|word| {
             Packed8([
-                vuzp1q_u32(first_words[word].0[0], first_words[word].0[1]),
-                vuzp1q_u32(second_words[word].0[0], second_words[word].0[1]),
+                unsafe { vuzp1q_u32(first[word].0[0], first[word].0[1]) },
+                unsafe { vuzp1q_u32(second[word].0[0], second[word].0[1]) },
             ])
         });
         let right = std::array::from_fn(|word| {
             Packed8([
-                vuzp2q_u32(first_words[word].0[0], first_words[word].0[1]),
-                vuzp2q_u32(second_words[word].0[0], second_words[word].0[1]),
+                unsafe { vuzp2q_u32(first[word].0[0], first[word].0[1]) },
+                unsafe { vuzp2q_u32(second[word].0[0], second[word].0[1]) },
             ])
         });
-        let (first_block, final_block) = unsafe { parent_messages8_from_words(&left, &right) };
+        (left, right)
+    }
+
+    #[inline(always)]
+    unsafe fn compress_parent_words8(left: &[Packed8; 8], right: &[Packed8; 8]) -> [Packed8; 8] {
+        let (first_block, final_block) = unsafe { parent_messages8_from_words(left, right) };
+        let state = unsafe {
+            compress_message_state8(&[BLAKE3_IV; 8], &first_block, 64, super::BLAKE3_CHUNK_START)
+        };
+        let cvs = std::array::from_fn(|word| unsafe { xor8(state[word], state[word + 8]) });
+        unsafe {
+            compress_message_xof32_words8_packed(
+                &cvs,
+                &final_block,
+                19,
+                super::BLAKE3_CHUNK_END | super::BLAKE3_ROOT,
+            )
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn compress_parent_digests8(left: &[Packed8; 8], right: &[Packed8; 8]) -> [Digest; 8] {
+        let (first_block, final_block) = unsafe { parent_messages8_from_words(left, right) };
         let state = unsafe {
             compress_message_state8(&[BLAKE3_IV; 8], &first_block, 64, super::BLAKE3_CHUNK_START)
         };
@@ -713,6 +744,39 @@ mod neon4 {
                 super::BLAKE3_CHUNK_END | super::BLAKE3_ROOT,
             )
         }
+    }
+
+    #[inline(always)]
+    unsafe fn compress_parents8_words(children: &[Digest; 16]) -> [Packed8; 8] {
+        let left = unsafe { load_digest_words8(children, 0) };
+        let right = unsafe { load_digest_words8(children, 1) };
+        unsafe { compress_parent_words8(&left, &right) }
+    }
+
+    /// Hash sixteen field leaves and their eight immediate parents without
+    /// materializing the sixteen intermediate digests in lane-major memory.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_field_level1_8(
+        first: &[[u64; 3]; 8],
+        second: &[[u64; 3]; 8],
+    ) -> [Digest; 8] {
+        let first_words = unsafe { field_digest_words8(first) };
+        let second_words = unsafe { field_digest_words8(second) };
+        let (left, right) = unsafe { pair_child_words8(&first_words, &second_words) };
+        unsafe { compress_parent_digests8(&left, &right) }
+    }
+
+    /// Hash two groups of eight parents and their eight immediate parents
+    /// without materializing the sixteen intermediate digests.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_parent_level2_8(
+        first: &[Digest; 16],
+        second: &[Digest; 16],
+    ) -> [Digest; 8] {
+        let first_words = unsafe { compress_parents8_words(first) };
+        let second_words = unsafe { compress_parents8_words(second) };
+        let (left, right) = unsafe { pair_child_words8(&first_words, &second_words) };
+        unsafe { compress_parent_digests8(&left, &right) }
     }
 
     /// Hash eight 83-byte nodes directly from their child digests, avoiding
@@ -1123,6 +1187,35 @@ fn parent8(children: &[Digest; 16]) -> [Digest; 8] {
     }
 }
 
+#[allow(dead_code)] // Retained as the exact AArch64 benchmark oracle.
+fn parent_level2_8_unfused(children: &[Digest; 32]) -> [Digest; 8] {
+    let first_children: &[Digest; 16] = children[..16].try_into().unwrap();
+    let second_children: &[Digest; 16] = children[16..].try_into().unwrap();
+    let first = parent8(first_children);
+    let second = parent8(second_children);
+    let intermediate = std::array::from_fn(|index| {
+        if index < 8 {
+            first[index]
+        } else {
+            second[index - 8]
+        }
+    });
+    parent8(&intermediate)
+}
+
+fn parent_level2_8(children: &[Digest; 32]) -> [Digest; 8] {
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    {
+        let first: &[Digest; 16] = children[..16].try_into().unwrap();
+        let second: &[Digest; 16] = children[16..].try_into().unwrap();
+        unsafe { neon4::compress_parent_level2_8(first, second) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    {
+        parent_level2_8_unfused(children)
+    }
+}
+
 fn parent8_scatter(children: &[Digest; 16]) -> [Digest; 8] {
     #[cfg(target_arch = "aarch64")]
     {
@@ -1200,7 +1293,7 @@ thread_local! {
     static EXACT_ROOT_SCRATCH: RefCell<Vec<Digest>> = const { RefCell::new(Vec::new()) };
 }
 
-fn reduce_exact_digests(scratch: &mut [Digest]) -> Digest {
+fn reduce_exact_digests_unfused_parent_levels(scratch: &mut [Digest]) -> Digest {
     assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
     let mut active = scratch.len();
     while active > 1 {
@@ -1229,6 +1322,24 @@ fn reduce_exact_digests(scratch: &mut [Digest]) -> Digest {
         active = pairs;
     }
     scratch[0]
+}
+
+fn reduce_exact_digests(scratch: &mut [Digest]) -> Digest {
+    assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
+    let mut active = scratch.len();
+    while active >= 32 {
+        let outputs = active / 4;
+        for output in (0..outputs).step_by(8) {
+            let child = 4 * output;
+            let roots = {
+                let children: &[Digest; 32] = scratch[child..child + 32].try_into().unwrap();
+                parent_level2_8(children)
+            };
+            scratch[output..output + 8].copy_from_slice(&roots);
+        }
+        active = outputs;
+    }
+    reduce_exact_digests_unfused_parent_levels(&mut scratch[..active])
 }
 
 fn reduce_exact_digests_copied(scratch: &mut [Digest]) -> Digest {
@@ -1675,6 +1786,26 @@ pub fn prefix_root_unfused_leaf_parent_io_for_benchmark(
             scratch.clear();
             extend_field_level1_batched_unfused_io(values, &mut scratch);
             reduce_exact_digests(&mut scratch)
+        });
+    }
+    prefix_root(values, capacity, zeros)
+}
+
+/// Reproduce the pre-fused upper-parent reduction schedule for crossed
+/// artifact benchmarks. This is transcript-identical to [`prefix_root`].
+#[doc(hidden)]
+pub fn prefix_root_unfused_parent_levels_for_benchmark(
+    values: &[Field192],
+    capacity: usize,
+    zeros: &[Digest],
+) -> Digest {
+    assert!(values.len() <= capacity && capacity.is_power_of_two());
+    if values.len() == capacity && values.len() >= 16 {
+        return EXACT_ROOT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.clear();
+            extend_field_level1_batched(values, &mut scratch);
+            reduce_exact_digests_unfused_parent_levels(&mut scratch)
         });
     }
     prefix_root(values, capacity, zeros)
@@ -2413,6 +2544,58 @@ mod tests {
         let fused_second = run(field_level1_8);
         eprintln!(
             "field-level1 iterations={iterations} fused={:.3}/{:.3} ms unfused={:.3}/{:.3} ms",
+            fused_first.as_secs_f64() * 1_000.0,
+            fused_second.as_secs_f64() * 1_000.0,
+            unfused_first.as_secs_f64() * 1_000.0,
+            unfused_second.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    fn fused_parent_level2_matches_unfused() {
+        for batch in 0..256_u64 {
+            let children = std::array::from_fn(|index| {
+                *blake3::hash(&(batch.wrapping_mul(32).wrapping_add(index as u64)).to_le_bytes())
+                    .as_bytes()
+            });
+            assert_eq!(
+                parent_level2_8(&children),
+                parent_level2_8_unfused(&children)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "register-fused versus materialized two-parent-level benchmark"]
+    fn fused_parent_level2_benchmark_unfused_io() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let children = std::array::from_fn(|index| {
+            *blake3::hash(&(index as u64 + 0x5032_4655).to_le_bytes()).as_bytes()
+        });
+        assert_eq!(
+            parent_level2_8(&children),
+            parent_level2_8_unfused(&children)
+        );
+        let iterations = 100_000;
+        let run = |candidate: fn(&[Digest; 32]) -> [Digest; 8]| {
+            let mut children = children;
+            let start = Instant::now();
+            for iteration in 0..iterations {
+                let hashes = candidate(black_box(&children));
+                children[iteration & 31] = hashes[iteration & 7];
+            }
+            black_box(children);
+            start.elapsed()
+        };
+
+        let fused_first = run(parent_level2_8);
+        let unfused_first = run(parent_level2_8_unfused);
+        let unfused_second = run(parent_level2_8_unfused);
+        let fused_second = run(parent_level2_8);
+        eprintln!(
+            "parent-level2 iterations={iterations} fused={:.3}/{:.3} ms unfused={:.3}/{:.3} ms",
             fused_first.as_secs_f64() * 1_000.0,
             fused_second.as_secs_f64() * 1_000.0,
             unfused_first.as_secs_f64() * 1_000.0,

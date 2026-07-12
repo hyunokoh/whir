@@ -36,7 +36,7 @@ use whir::lilac_merkle::{
     prefix_root_scalar_leaf_messages_for_benchmark,
     prefix_root_scalar_parent_messages_for_benchmark, prefix_root_scatter_for_benchmark,
     prefix_root_unfused_for_benchmark, prefix_root_unfused_leaf_parent_io_for_benchmark,
-    scaled_prefix_root_sequential_for_benchmark,
+    prefix_root_unfused_parent_levels_for_benchmark, scaled_prefix_root_sequential_for_benchmark,
 };
 
 #[derive(Debug, Parser)]
@@ -9109,6 +9109,73 @@ mod tests {
         }
         eprintln!(
             "unfused-first-order={unfused_first_order} fused-leaf-parent={:.3}/{:.3} ms unfused-leaf-parent={:.3}/{:.3} ms",
+            fused_first_time.as_secs_f64() * 1_000.0,
+            fused_second_time.as_secs_f64() * 1_000.0,
+            unfused_first_time.as_secs_f64() * 1_000.0,
+            unfused_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale fused versus materialized upper-parent benchmark"]
+    fn fused_parent_levels_benchmark_unfused_tensor_roots() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let (_, message_row_roots) =
+            exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
+        let vertical_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(10, component, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(11, component, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &message, &mut proof_codeword, &vertical_spectra, 64);
+        let run = |row_root: fn(&[Field192], usize, &[Digest]) -> Digest| {
+            let start = Instant::now();
+            let commitments = tensor_row_commitments_with_root(
+                &proof_codeword,
+                &message_row_roots,
+                &horizontal_spectra,
+                &zeros,
+                row_root,
+                combine_equal_subtrees,
+            );
+            (commitments, start.elapsed())
+        };
+
+        let unfused_first_order = std::env::var_os("LILAC_PARENT_LEVELS_UNFUSED_FIRST").is_some();
+        let (
+            (fused_first, fused_first_time),
+            (unfused_first, unfused_first_time),
+            (unfused_second, unfused_second_time),
+            (fused_second, fused_second_time),
+        ) = if unfused_first_order {
+            let unfused_first = run(prefix_root_unfused_parent_levels_for_benchmark);
+            let fused_first = run(prefix_root);
+            let fused_second = run(prefix_root);
+            let unfused_second = run(prefix_root_unfused_parent_levels_for_benchmark);
+            (fused_first, unfused_first, unfused_second, fused_second)
+        } else {
+            let fused_first = run(prefix_root);
+            let unfused_first = run(prefix_root_unfused_parent_levels_for_benchmark);
+            let unfused_second = run(prefix_root_unfused_parent_levels_for_benchmark);
+            let fused_second = run(prefix_root);
+            (fused_first, unfused_first, unfused_second, fused_second)
+        };
+        for candidate in [&unfused_first, &unfused_second, &fused_second] {
+            assert_eq!(candidate.len(), fused_first.len());
+            for (candidate, expected) in candidate.iter().zip(&fused_first) {
+                assert_eq!(candidate.root, expected.root);
+                assert_eq!(candidate.row_roots, expected.row_roots);
+            }
+        }
+        eprintln!(
+            "unfused-first-order={unfused_first_order} fused-parent-levels={:.3}/{:.3} ms unfused-parent-levels={:.3}/{:.3} ms",
             fused_first_time.as_secs_f64() * 1_000.0,
             fused_second_time.as_secs_f64() * 1_000.0,
             unfused_first_time.as_secs_f64() * 1_000.0,
