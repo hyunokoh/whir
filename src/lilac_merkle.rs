@@ -7,7 +7,7 @@ use crate::algebra::fields::Field192;
 pub type Digest = [u8; 32];
 
 const FIELD_LEAF_DOMAIN: &[u8; 19] = b"LiLAC/field-leaf/v1";
-const FIELD_NODE_DOMAIN: &[u8; 19] = b"LiLAC/field-node/v1";
+const FIELD_NODE_DOMAIN_V1: &[u8; 19] = b"LiLAC/field-node/v1";
 const BLAKE3_IV: [u32; 8] = [
     0x6A09_E667,
     0xBB67_AE85,
@@ -20,6 +20,7 @@ const BLAKE3_IV: [u32; 8] = [
 ];
 const BLAKE3_CHUNK_START: u8 = 1 << 0;
 const BLAKE3_CHUNK_END: u8 = 1 << 1;
+const BLAKE3_PARENT: u8 = 1 << 2;
 const BLAKE3_ROOT: u8 = 1 << 3;
 const PARALLEL_MIN_FIELDS: usize = 1 << 18;
 const CHUNK_FIELDS: usize = 1 << 12;
@@ -793,6 +794,82 @@ mod neon4 {
     }
 
     #[inline(always)]
+    fn parent_v2_message8(left: &[Packed8; 8], right: &[Packed8; 8]) -> [Packed8; 16] {
+        std::array::from_fn(|word| {
+            if word < 8 {
+                left[word]
+            } else {
+                right[word - 8]
+            }
+        })
+    }
+
+    #[inline(always)]
+    unsafe fn compress_parent_v2_words8(left: &[Packed8; 8], right: &[Packed8; 8]) -> [Packed8; 8] {
+        let message = parent_v2_message8(left, right);
+        unsafe {
+            compress_message_xof32_words8(
+                &[BLAKE3_IV; 8],
+                &message,
+                64,
+                super::BLAKE3_PARENT | super::BLAKE3_ROOT,
+            )
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn compress_parent_v2_digests8(
+        left: &[Packed8; 8],
+        right: &[Packed8; 8],
+    ) -> [Digest; 8] {
+        let message = parent_v2_message8(left, right);
+        unsafe {
+            compress_message_xof32_8::<true>(
+                &[BLAKE3_IV; 8],
+                &message,
+                64,
+                super::BLAKE3_PARENT | super::BLAKE3_ROOT,
+            )
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn compress_parents_v2_words8(children: &[Digest; 16]) -> [Packed8; 8] {
+        let left = unsafe { load_digest_words8(children, 0) };
+        let right = unsafe { load_digest_words8(children, 1) };
+        unsafe { compress_parent_v2_words8(&left, &right) }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_parents_v2_8(children: &[Digest; 16]) -> [Digest; 8] {
+        let left = unsafe { load_digest_words8(children, 0) };
+        let right = unsafe { load_digest_words8(children, 1) };
+        unsafe { compress_parent_v2_digests8(&left, &right) }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_field_level1_v2_8(
+        first: &[[u64; 3]; 8],
+        second: &[[u64; 3]; 8],
+    ) -> [Digest; 8] {
+        let first_words = unsafe { field_digest_words8(first) };
+        let second_words = unsafe { field_digest_words8(second) };
+        let (left, right) = unsafe { pair_child_words8(&first_words, &second_words) };
+        unsafe { compress_parent_v2_digests8(&left, &right) }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_parent_level2_v2_8(
+        first: &[Digest; 16],
+        second: &[Digest; 16],
+    ) -> [Digest; 8] {
+        let first_words = unsafe { compress_parents_v2_words8(first) };
+        let second_words = unsafe { compress_parents_v2_words8(second) };
+        let (left, right) = unsafe { pair_child_words8(&first_words, &second_words) };
+        unsafe { compress_parent_v2_digests8(&left, &right) }
+    }
+
+    #[inline(always)]
     unsafe fn compress_parent_words8(left: &[Packed8; 8], right: &[Packed8; 8]) -> [Packed8; 8] {
         let (first_block, final_block) = unsafe { parent_messages8_from_words(left, right) };
         let state = unsafe {
@@ -1076,9 +1153,9 @@ fn fixed_blake3_hash_83(first: &[u8; 64], second: &[u8; 64]) -> Digest {
 
 fn node_blocks(left: Digest, right: Digest) -> ([u8; 64], [u8; 64]) {
     let mut first = [0_u8; 64];
-    first[..FIELD_NODE_DOMAIN.len()].copy_from_slice(FIELD_NODE_DOMAIN);
-    first[FIELD_NODE_DOMAIN.len()..FIELD_NODE_DOMAIN.len() + 32].copy_from_slice(&left);
-    first[FIELD_NODE_DOMAIN.len() + 32..].copy_from_slice(&right[..13]);
+    first[..FIELD_NODE_DOMAIN_V1.len()].copy_from_slice(FIELD_NODE_DOMAIN_V1);
+    first[FIELD_NODE_DOMAIN_V1.len()..FIELD_NODE_DOMAIN_V1.len() + 32].copy_from_slice(&left);
+    first[FIELD_NODE_DOMAIN_V1.len() + 32..].copy_from_slice(&right[..13]);
     let mut second = [0_u8; 64];
     second[..19].copy_from_slice(&right[13..]);
     (first, second)
@@ -1159,7 +1236,7 @@ fn field_level1_8_unfused(values: &[Field192; 16]) -> [Digest; 8] {
     parent8(&children)
 }
 
-fn field_level1_8(values: &[Field192; 16]) -> [Digest; 8] {
+fn field_level1_two_block_v1(values: &[Field192; 16]) -> [Digest; 8] {
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     {
         let first = std::array::from_fn(|index| values[index].into_bigint().0);
@@ -1172,10 +1249,16 @@ fn field_level1_8(values: &[Field192; 16]) -> [Digest; 8] {
     }
 }
 
-fn parent4(children: &[Digest; 8]) -> [Digest; 4] {
+fn field_level1_8(values: &[Field192; 16]) -> [Digest; 8] {
+    field_level1_one_block_v2(values)
+}
+
+fn parent4_two_block_v1(children: &[Digest; 8]) -> [Digest; 4] {
     let platform = blake3_platform();
     if platform.simd_degree() < 4 {
-        return std::array::from_fn(|index| parent(children[2 * index], children[2 * index + 1]));
+        return std::array::from_fn(|index| {
+            parent_two_block_v1(children[2 * index], children[2 * index + 1])
+        });
     }
     let blocks = std::array::from_fn::<_, 4, _>(|index| {
         node_blocks(children[2 * index], children[2 * index + 1])
@@ -1202,10 +1285,16 @@ fn parent4(children: &[Digest; 8]) -> [Digest; 4] {
     fixed_blake3_xof4(&cvs, &final_blocks, 19, BLAKE3_CHUNK_END | BLAKE3_ROOT)
 }
 
+fn parent4(children: &[Digest; 8]) -> [Digest; 4] {
+    parent4_one_block_v2(children)
+}
+
 fn parent8_materialized_fixed_first_compression(children: &[Digest; 16]) -> [Digest; 8] {
     let platform = blake3_platform();
     if platform.simd_degree() < 4 {
-        return std::array::from_fn(|index| parent(children[2 * index], children[2 * index + 1]));
+        return std::array::from_fn(|index| {
+            parent_two_block_v1(children[2 * index], children[2 * index + 1])
+        });
     }
     let blocks = std::array::from_fn::<_, 8, _>(|index| {
         node_blocks(children[2 * index], children[2 * index + 1])
@@ -1250,10 +1339,12 @@ fn parent8_materialized_fixed_first_compression(children: &[Digest; 16]) -> [Dig
     fixed_blake3_xof8(&cvs, &final_blocks, 19, BLAKE3_CHUNK_END | BLAKE3_ROOT)
 }
 
-fn parent8(children: &[Digest; 16]) -> [Digest; 8] {
+fn parent8_two_block_v1(children: &[Digest; 16]) -> [Digest; 8] {
     let platform = blake3_platform();
     if platform.simd_degree() < 4 {
-        return std::array::from_fn(|index| parent(children[2 * index], children[2 * index + 1]));
+        return std::array::from_fn(|index| {
+            parent_two_block_v1(children[2 * index], children[2 * index + 1])
+        });
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -1265,6 +1356,10 @@ fn parent8(children: &[Digest; 16]) -> [Digest; 8] {
     {
         parent8_materialized_fixed_first_compression(children)
     }
+}
+
+fn parent8(children: &[Digest; 16]) -> [Digest; 8] {
+    parent8_one_block_v2(children)
 }
 
 #[allow(dead_code)] // Retained as the exact AArch64 benchmark oracle.
@@ -1283,7 +1378,7 @@ fn parent_level2_8_unfused(children: &[Digest; 32]) -> [Digest; 8] {
     parent8(&intermediate)
 }
 
-fn parent_level2_8(children: &[Digest; 32]) -> [Digest; 8] {
+fn parent_level2_two_block_v1(children: &[Digest; 32]) -> [Digest; 8] {
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     {
         let first: &[Digest; 16] = children[..16].try_into().unwrap();
@@ -1294,6 +1389,10 @@ fn parent_level2_8(children: &[Digest; 32]) -> [Digest; 8] {
     {
         parent_level2_8_unfused(children)
     }
+}
+
+fn parent_level2_8(children: &[Digest; 32]) -> [Digest; 8] {
+    parent_level2_one_block_v2(children)
 }
 
 fn parent8_scatter(children: &[Digest; 16]) -> [Digest; 8] {
@@ -1364,9 +1463,93 @@ pub fn field_leaf(value: Field192) -> Digest {
     fixed_blake3_hash_43(&field_leaf_block(value))
 }
 
-pub fn parent(left: Digest, right: Digest) -> Digest {
+fn parent_two_block_v1(left: Digest, right: Digest) -> Digest {
     let (first, second) = node_blocks(left, right);
     fixed_blake3_hash_83(&first, &second)
+}
+
+/// Production v2 internal-node hash: one Blake3 parent compression over the
+/// two 32-byte child digests. The `PARENT | ROOT` flags separate these nodes
+/// from the domain-prefixed field leaves.
+fn parent_one_block_v2(left: Digest, right: Digest) -> Digest {
+    let mut block = [0_u8; 64];
+    block[..32].copy_from_slice(&left);
+    block[32..].copy_from_slice(&right);
+    let output =
+        blake3_platform().compress_xof(&BLAKE3_IV, &block, 64, 0, BLAKE3_PARENT | BLAKE3_ROOT);
+    output[..32].try_into().unwrap()
+}
+
+pub fn parent(left: Digest, right: Digest) -> Digest {
+    parent_one_block_v2(left, right)
+}
+
+fn parent4_one_block_v2(children: &[Digest; 8]) -> [Digest; 4] {
+    let blocks = std::array::from_fn(|index| {
+        let mut block = [0_u8; 64];
+        block[..32].copy_from_slice(&children[2 * index]);
+        block[32..].copy_from_slice(&children[2 * index + 1]);
+        block
+    });
+    fixed_blake3_xof4(&[BLAKE3_IV; 4], &blocks, 64, BLAKE3_PARENT | BLAKE3_ROOT)
+}
+
+fn parent8_one_block_v2(children: &[Digest; 16]) -> [Digest; 8] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: the function is compiled with NEON enabled and AArch64
+        // guarantees NEON support.
+        unsafe { neon4::compress_parents_v2_8(children) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        std::array::from_fn(|index| {
+            parent_one_block_v2(children[2 * index], children[2 * index + 1])
+        })
+    }
+}
+
+fn field_level1_one_block_v2(values: &[Field192; 16]) -> [Digest; 8] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let first = std::array::from_fn(|index| values[index].into_bigint().0);
+        let second = std::array::from_fn(|index| values[8 + index].into_bigint().0);
+        // SAFETY: the function is compiled with NEON enabled and AArch64
+        // guarantees NEON support.
+        unsafe { neon4::compress_field_level1_v2_8(&first, &second) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let children = std::array::from_fn(|index| field_leaf(values[index]));
+        parent8_one_block_v2(&children)
+    }
+}
+
+fn parent_level2_one_block_v2(children: &[Digest; 32]) -> [Digest; 8] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let (first, second) = children.split_at(16);
+        let first: &[Digest; 16] = first.try_into().unwrap();
+        let second: &[Digest; 16] = second.try_into().unwrap();
+        // SAFETY: the function is compiled with NEON enabled and AArch64
+        // guarantees NEON support.
+        unsafe { neon4::compress_parent_level2_v2_8(first, second) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let first: &[Digest; 16] = children[..16].try_into().unwrap();
+        let second: &[Digest; 16] = children[16..].try_into().unwrap();
+        let first = parent8_one_block_v2(first);
+        let second = parent8_one_block_v2(second);
+        let intermediate = std::array::from_fn(|index| {
+            if index < 8 {
+                first[index]
+            } else {
+                second[index - 8]
+            }
+        });
+        parent8_one_block_v2(&intermediate)
+    }
 }
 
 thread_local! {
@@ -1420,6 +1603,92 @@ fn reduce_exact_digests(scratch: &mut [Digest]) -> Digest {
         active = outputs;
     }
     reduce_exact_digests_unfused_parent_levels(&mut scratch[..active])
+}
+
+fn reduce_exact_digests_one_block_v2(scratch: &mut [Digest]) -> Digest {
+    assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
+    let mut active = scratch.len();
+    while active >= 32 {
+        let outputs = active / 4;
+        for output in (0..outputs).step_by(8) {
+            let child = 4 * output;
+            let roots = {
+                let children: &[Digest; 32] = scratch[child..child + 32].try_into().unwrap();
+                parent_level2_one_block_v2(children)
+            };
+            scratch[output..output + 8].copy_from_slice(&roots);
+        }
+        active = outputs;
+    }
+    while active > 1 {
+        let pairs = active / 2;
+        let batched8 = pairs / 8 * 8;
+        for pair in (0..batched8).step_by(8) {
+            let child = 2 * pair;
+            let roots = {
+                let children: &[Digest; 16] = scratch[child..child + 16].try_into().unwrap();
+                parent8_one_block_v2(children)
+            };
+            scratch[pair..pair + 8].copy_from_slice(&roots);
+        }
+        let batched4 = batched8 + (pairs - batched8) / 4 * 4;
+        for pair in (batched8..batched4).step_by(4) {
+            let child = 2 * pair;
+            let roots = {
+                let children: &[Digest; 8] = scratch[child..child + 8].try_into().unwrap();
+                parent4_one_block_v2(children)
+            };
+            scratch[pair..pair + 4].copy_from_slice(&roots);
+        }
+        for pair in batched4..pairs {
+            scratch[pair] = parent_one_block_v2(scratch[2 * pair], scratch[2 * pair + 1]);
+        }
+        active = pairs;
+    }
+    scratch[0]
+}
+
+fn reduce_exact_digests_two_block_v1(scratch: &mut [Digest]) -> Digest {
+    assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
+    let mut active = scratch.len();
+    while active >= 32 {
+        let outputs = active / 4;
+        for output in (0..outputs).step_by(8) {
+            let child = 4 * output;
+            let roots = {
+                let children: &[Digest; 32] = scratch[child..child + 32].try_into().unwrap();
+                parent_level2_two_block_v1(children)
+            };
+            scratch[output..output + 8].copy_from_slice(&roots);
+        }
+        active = outputs;
+    }
+    while active > 1 {
+        let pairs = active / 2;
+        let batched8 = pairs / 8 * 8;
+        for pair in (0..batched8).step_by(8) {
+            let child = 2 * pair;
+            let roots = {
+                let children: &[Digest; 16] = scratch[child..child + 16].try_into().unwrap();
+                parent8_two_block_v1(children)
+            };
+            scratch[pair..pair + 8].copy_from_slice(&roots);
+        }
+        let batched4 = batched8 + (pairs - batched8) / 4 * 4;
+        for pair in (batched8..batched4).step_by(4) {
+            let child = 2 * pair;
+            let roots = {
+                let children: &[Digest; 8] = scratch[child..child + 8].try_into().unwrap();
+                parent4_two_block_v1(children)
+            };
+            scratch[pair..pair + 4].copy_from_slice(&roots);
+        }
+        for pair in batched4..pairs {
+            scratch[pair] = parent_two_block_v1(scratch[2 * pair], scratch[2 * pair + 1]);
+        }
+        active = pairs;
+    }
+    scratch[0]
 }
 
 fn reduce_exact_digests_copied(scratch: &mut [Digest]) -> Digest {
@@ -1527,11 +1796,11 @@ fn reduce_exact_digests_scatter(scratch: &mut [Digest]) -> Digest {
         for pair in (batched8..batched4).step_by(4) {
             let child = 2 * pair;
             let children = std::array::from_fn(|index| scratch[child + index]);
-            let roots = parent4(&children);
+            let roots = parent4_two_block_v1(&children);
             scratch[pair..pair + 4].copy_from_slice(&roots);
         }
         for pair in batched4..pairs {
-            scratch[pair] = parent(scratch[2 * pair], scratch[2 * pair + 1]);
+            scratch[pair] = parent_two_block_v1(scratch[2 * pair], scratch[2 * pair + 1]);
         }
         active = pairs;
     }
@@ -1626,6 +1895,22 @@ fn extend_field_level1_batched(values: &[Field192], scratch: &mut Vec<Digest>) {
     for chunk in values.chunks_exact(16) {
         let values: &[Field192; 16] = chunk.try_into().unwrap();
         scratch.extend_from_slice(&field_level1_8(values));
+    }
+}
+
+fn extend_field_level1_batched_one_block_v2(values: &[Field192], scratch: &mut Vec<Digest>) {
+    assert!(values.len() >= 16 && values.len().is_power_of_two());
+    for chunk in values.chunks_exact(16) {
+        let values: &[Field192; 16] = chunk.try_into().unwrap();
+        scratch.extend_from_slice(&field_level1_one_block_v2(values));
+    }
+}
+
+fn extend_field_level1_batched_two_block_v1(values: &[Field192], scratch: &mut Vec<Digest>) {
+    assert!(values.len() >= 16 && values.len().is_power_of_two());
+    for chunk in values.chunks_exact(16) {
+        let values: &[Field192; 16] = chunk.try_into().unwrap();
+        scratch.extend_from_slice(&field_level1_two_block_v1(values));
     }
 }
 
@@ -1729,6 +2014,51 @@ pub fn exact_prefix_root_with_scratch(values: &[Field192], scratch: &mut Vec<Dig
     reduce_exact_digests(scratch)
 }
 
+/// Experimental exact root for a v2 layout whose internal nodes use one
+/// Blake3 compression with `PARENT | ROOT`. Leaves are unchanged. The third
+/// argument is retained so this function can be crossed against [`prefix_root`].
+#[doc(hidden)]
+pub fn prefix_root_one_block_nodes_v2_for_benchmark(
+    values: &[Field192],
+    capacity: usize,
+    _zeros: &[Digest],
+) -> Digest {
+    assert_eq!(values.len(), capacity);
+    assert!(capacity >= 8 && capacity.is_power_of_two());
+    EXACT_ROOT_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        scratch.clear();
+        if values.len() >= 16 {
+            extend_field_level1_batched_one_block_v2(values, &mut scratch);
+        } else {
+            extend_field_leaves_batched(values, &mut scratch, |value| value);
+        }
+        reduce_exact_digests_one_block_v2(&mut scratch)
+    })
+}
+
+/// Historical two-compression `LiLAC/field-node/v1` exact root used to
+/// benchmark the production one-block parent layout.
+#[doc(hidden)]
+pub fn prefix_root_two_block_nodes_v1_for_benchmark(
+    values: &[Field192],
+    capacity: usize,
+    _zeros: &[Digest],
+) -> Digest {
+    assert_eq!(values.len(), capacity);
+    assert!(capacity >= 8 && capacity.is_power_of_two());
+    EXACT_ROOT_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        scratch.clear();
+        if values.len() >= 16 {
+            extend_field_level1_batched_two_block_v1(values, &mut scratch);
+        } else {
+            extend_field_leaves_batched(values, &mut scratch, |value| value);
+        }
+        reduce_exact_digests_two_block_v1(&mut scratch)
+    })
+}
+
 /// Reproduce the unfused exact-root schedule for crossed artifact benchmarks.
 #[doc(hidden)]
 pub fn prefix_root_unfused_for_benchmark(
@@ -1764,6 +2094,9 @@ pub fn prefix_root_scatter_for_benchmark(
             extend_field_level1_batched_scatter(values, &mut scratch);
             reduce_exact_digests_scatter(&mut scratch)
         });
+    }
+    if values.len() == capacity && values.len() >= 8 {
+        return prefix_root_two_block_nodes_v1_for_benchmark(values, capacity, zeros);
     }
     prefix_root(values, capacity, zeros)
 }
@@ -2016,6 +2349,17 @@ pub fn zero_roots(max_height: usize) -> Vec<Digest> {
     roots
 }
 
+/// Zero-subtree table for the experimental one-block-node v2 layout.
+#[doc(hidden)]
+pub fn zero_roots_one_block_nodes_v2_for_benchmark(max_height: usize) -> Vec<Digest> {
+    let mut roots = Vec::with_capacity(max_height + 1);
+    roots.push(field_leaf(Field192::from(0_u64)));
+    for height in 0..max_height {
+        roots.push(parent_one_block_v2(roots[height], roots[height]));
+    }
+    roots
+}
+
 #[derive(Debug)]
 pub struct MerkleAccumulator {
     stack: Vec<Option<Digest>>,
@@ -2177,6 +2521,39 @@ pub fn combine_equal_subtrees(roots: &[Digest]) -> Digest {
     combine_equal_subtrees_parallel(roots)
 }
 
+/// Combine equal-height roots under the experimental one-block-node v2
+/// layout using the same fused eight-lane reducer as exact row roots.
+#[doc(hidden)]
+pub fn combine_equal_subtrees_one_block_nodes_v2_for_benchmark(roots: &[Digest]) -> Digest {
+    assert!(!roots.is_empty() && roots.len().is_power_of_two());
+    match roots {
+        [root] => return *root,
+        [left, right] => return parent_one_block_v2(*left, *right),
+        [a, b, c, d] => {
+            return parent_one_block_v2(parent_one_block_v2(*a, *b), parent_one_block_v2(*c, *d));
+        }
+        _ => {}
+    }
+    let mut scratch = roots.to_vec();
+    reduce_exact_digests_one_block_v2(&mut scratch)
+}
+
+/// Historical two-compression node reducer for v1/v2 crossed benchmarks.
+#[doc(hidden)]
+pub fn combine_equal_subtrees_two_block_nodes_v1_for_benchmark(roots: &[Digest]) -> Digest {
+    assert!(!roots.is_empty() && roots.len().is_power_of_two());
+    match roots {
+        [root] => return *root,
+        [left, right] => return parent_two_block_v1(*left, *right),
+        [a, b, c, d] => {
+            return parent_two_block_v1(parent_two_block_v1(*a, *b), parent_two_block_v1(*c, *d));
+        }
+        _ => {}
+    }
+    let mut scratch = roots.to_vec();
+    reduce_exact_digests_two_block_v1(&mut scratch)
+}
+
 fn combine_equal_subtrees_parallel(roots: &[Digest]) -> Digest {
     let mut level = roots.to_vec();
     while level.len() > 1 {
@@ -2260,7 +2637,7 @@ mod tests {
             .collect::<Vec<_>>();
         for size in [8, 16, 64, 256, 1024, 4096] {
             assert_eq!(
-                prefix_root(&values[..size], size, &zeros),
+                prefix_root_two_block_nodes_v1_for_benchmark(&values[..size], size, &zeros),
                 prefix_root_scatter_for_benchmark(&values[..size], size, &zeros)
             );
         }
@@ -2415,19 +2792,109 @@ mod tests {
 
     fn legacy_parent(left: Digest, right: Digest) -> Digest {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(FIELD_NODE_DOMAIN);
+        hasher.update(FIELD_NODE_DOMAIN_V1);
         hasher.update(&left);
         hasher.update(&right);
         *hasher.finalize().as_bytes()
     }
 
     #[test]
-    fn one_shot_hashes_match_legacy_transcript_bytes() {
+    fn historical_v1_one_shot_hashes_match_legacy_transcript_bytes() {
         let left = legacy_field_leaf(Field192::from(17_u64));
         let right = legacy_field_leaf(Field192::from(29_u64));
         assert_eq!(field_leaf(Field192::from(17_u64)), left);
         assert_eq!(field_leaf(Field192::from(29_u64)), right);
-        assert_eq!(parent(left, right), legacy_parent(left, right));
+        assert_eq!(parent_two_block_v1(left, right), legacy_parent(left, right));
+        assert_ne!(parent(left, right), legacy_parent(left, right));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn one_block_v2_parent_matches_blake3_parent_root_mode() {
+        for index in 0..4096_u64 {
+            let left = *blake3::hash(&(2 * index).to_le_bytes()).as_bytes();
+            let right = *blake3::hash(&(2 * index + 1).to_le_bytes()).as_bytes();
+            let expected = blake3::guts::parent_cv(
+                &blake3::Hash::from_bytes(left),
+                &blake3::Hash::from_bytes(right),
+                true,
+            );
+            assert_eq!(parent_one_block_v2(left, right), *expected.as_bytes());
+        }
+    }
+
+    fn sequential_one_block_v2_root(values: &[Field192]) -> Digest {
+        let mut level = values.iter().copied().map(field_leaf).collect::<Vec<_>>();
+        while level.len() > 1 {
+            level = level
+                .chunks_exact(2)
+                .map(|pair| parent_one_block_v2(pair[0], pair[1]))
+                .collect();
+        }
+        level[0]
+    }
+
+    #[test]
+    fn one_block_v2_exact_roots_match_scalar_reference() {
+        let values = (0..4096_u64)
+            .map(|index| {
+                let seed = blake3::hash(&(index + 911).to_le_bytes());
+                Field192::from_le_bytes_mod_order(seed.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        let zeros = zero_roots_one_block_nodes_v2_for_benchmark(12);
+        for size in [8, 16, 64, 256, 1024, 4096] {
+            let candidate =
+                prefix_root_one_block_nodes_v2_for_benchmark(&values[..size], size, &zeros);
+            assert_eq!(candidate, sequential_one_block_v2_root(&values[..size]));
+            assert_eq!(
+                candidate,
+                prefix_root(&values[..size], size, &zero_roots(12))
+            );
+            assert_ne!(
+                candidate,
+                prefix_root_two_block_nodes_v1_for_benchmark(
+                    &values[..size],
+                    size,
+                    &zero_roots(12),
+                )
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "one-block-node v2 versus two-block v1 1,024-field exact-root benchmark"]
+    fn one_block_v2_benchmarks_two_block_v1_exact_root() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let values = (0..1024_u64)
+            .map(|index| {
+                let seed = blake3::hash(&(index + 977).to_le_bytes());
+                Field192::from_le_bytes_mod_order(seed.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        let zeros_v1 = zero_roots(10);
+        let zeros_v2 = zero_roots_one_block_nodes_v2_for_benchmark(10);
+        let iterations = 10_000;
+        let run = |root: fn(&[Field192], usize, &[Digest]) -> Digest, zeros: &[Digest]| {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(root(black_box(&values), values.len(), zeros));
+            }
+            start.elapsed()
+        };
+        let v1_first = run(prefix_root_two_block_nodes_v1_for_benchmark, &zeros_v1);
+        let v2_first = run(prefix_root_one_block_nodes_v2_for_benchmark, &zeros_v2);
+        let v2_second = run(prefix_root_one_block_nodes_v2_for_benchmark, &zeros_v2);
+        let v1_second = run(prefix_root_two_block_nodes_v1_for_benchmark, &zeros_v1);
+        eprintln!(
+            "one-block-v2 exact_root_1024 iterations={iterations} v1={:.3}/{:.3} ms v2={:.3}/{:.3} ms",
+            v1_first.as_secs_f64() * 1_000.0,
+            v1_second.as_secs_f64() * 1_000.0,
+            v2_first.as_secs_f64() * 1_000.0,
+            v2_second.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]
@@ -2445,7 +2912,8 @@ mod tests {
             right_input[..8].copy_from_slice(&index.wrapping_add(1).to_le_bytes());
             right_input[8..].copy_from_slice(&index.wrapping_mul(7).to_le_bytes());
             let right = *blake3::hash(&right_input).as_bytes();
-            assert_eq!(parent(left, right), legacy_parent(left, right));
+            assert_eq!(parent_two_block_v1(left, right), legacy_parent(left, right));
+            assert_eq!(parent(left, right), parent_one_block_v2(left, right));
         }
     }
 
@@ -2751,9 +3219,12 @@ mod tests {
             let batched = parent8(&children);
             let scalar =
                 std::array::from_fn(|index| parent(children[2 * index], children[2 * index + 1]));
+            let scalar_v1 = std::array::from_fn(|index| {
+                parent_two_block_v1(children[2 * index], children[2 * index + 1])
+            });
             assert_eq!(batched, scalar);
-            assert_eq!(parent8_scalar_messages(&children), scalar);
-            assert_eq!(parent8_materialized_cv(&children), scalar);
+            assert_eq!(parent8_scalar_messages(&children), scalar_v1);
+            assert_eq!(parent8_materialized_cv(&children), scalar_v1);
         }
     }
 

@@ -30,13 +30,18 @@ use whir::{
 
 #[cfg(test)]
 use whir::lilac_merkle::{
-    combine_equal_subtrees_parallel_for_benchmark, prefix_root_copied_parents_for_benchmark,
-    prefix_root_materialized_blocks_for_benchmark, prefix_root_materialized_cv_for_benchmark,
-    prefix_root_materialized_leaves_for_benchmark, prefix_root_materialized_parents_for_benchmark,
+    combine_equal_subtrees_one_block_nodes_v2_for_benchmark,
+    combine_equal_subtrees_parallel_for_benchmark,
+    combine_equal_subtrees_two_block_nodes_v1_for_benchmark,
+    prefix_root_copied_parents_for_benchmark, prefix_root_materialized_blocks_for_benchmark,
+    prefix_root_materialized_cv_for_benchmark, prefix_root_materialized_leaves_for_benchmark,
+    prefix_root_materialized_parents_for_benchmark, prefix_root_one_block_nodes_v2_for_benchmark,
     prefix_root_scalar_leaf_messages_for_benchmark,
     prefix_root_scalar_parent_messages_for_benchmark, prefix_root_scatter_for_benchmark,
-    prefix_root_unfused_for_benchmark, prefix_root_unfused_leaf_parent_io_for_benchmark,
+    prefix_root_two_block_nodes_v1_for_benchmark, prefix_root_unfused_for_benchmark,
+    prefix_root_unfused_leaf_parent_io_for_benchmark,
     prefix_root_unfused_parent_levels_for_benchmark, scaled_prefix_root_sequential_for_benchmark,
+    zero_roots_one_block_nodes_v2_for_benchmark,
 };
 
 #[derive(Debug, Parser)]
@@ -10377,6 +10382,97 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "production-scale one-block-node v2 versus two-block v1 tensor roots"]
+    fn one_block_v2_benchmarks_two_block_v1_tensor_roots() {
+        let level = carryopen_level();
+        let zeros_v1 = zero_roots(30);
+        let zeros_v2 = zero_roots_one_block_nodes_v2_for_benchmark(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let message_row_roots_v1 = message
+            .par_chunks_exact(CARRYOPEN_WIDTH)
+            .map(|row| {
+                prefix_root_two_block_nodes_v1_for_benchmark(row, CARRYOPEN_WIDTH, &zeros_v1)
+            })
+            .collect::<Vec<_>>();
+        let message_row_roots_v2 = message
+            .par_chunks_exact(CARRYOPEN_WIDTH)
+            .map(|row| {
+                prefix_root_one_block_nodes_v2_for_benchmark(row, CARRYOPEN_WIDTH, &zeros_v2)
+            })
+            .collect::<Vec<_>>();
+        let vertical_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(10, component, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(11, component, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &message, &mut proof_codeword, &vertical_spectra, 64);
+        let run = |message_roots: &[Digest],
+                   zeros: &[Digest],
+                   row_root: fn(&[Field192], usize, &[Digest]) -> Digest,
+                   combine_roots: fn(&[Digest]) -> Digest| {
+            let start = Instant::now();
+            let commitments = tensor_row_commitments_with_root(
+                &proof_codeword,
+                message_roots,
+                &horizontal_spectra,
+                zeros,
+                row_root,
+                combine_roots,
+            );
+            (commitments, start.elapsed())
+        };
+        let v1_first = run(
+            &message_row_roots_v1,
+            &zeros_v1,
+            prefix_root_two_block_nodes_v1_for_benchmark,
+            combine_equal_subtrees_two_block_nodes_v1_for_benchmark,
+        );
+        let v2_first = run(
+            &message_row_roots_v2,
+            &zeros_v2,
+            prefix_root_one_block_nodes_v2_for_benchmark,
+            combine_equal_subtrees_one_block_nodes_v2_for_benchmark,
+        );
+        let v2_second = run(
+            &message_row_roots_v2,
+            &zeros_v2,
+            prefix_root_one_block_nodes_v2_for_benchmark,
+            combine_equal_subtrees_one_block_nodes_v2_for_benchmark,
+        );
+        let v1_second = run(
+            &message_row_roots_v1,
+            &zeros_v1,
+            prefix_root_two_block_nodes_v1_for_benchmark,
+            combine_equal_subtrees_two_block_nodes_v1_for_benchmark,
+        );
+        for (candidate, expected) in v2_second.0.iter().zip(&v2_first.0) {
+            assert_eq!(candidate.root, expected.root);
+            assert_eq!(candidate.row_roots, expected.row_roots);
+        }
+        for (candidate, expected) in v1_second.0.iter().zip(&v1_first.0) {
+            assert_eq!(candidate.root, expected.root);
+            assert_eq!(candidate.row_roots, expected.row_roots);
+        }
+        assert!(v1_first
+            .0
+            .iter()
+            .zip(&v2_first.0)
+            .all(|(v1, v2)| v1.root != v2.root && v1.row_roots != v2.row_roots));
+        eprintln!(
+            "one-block-v2 tensor-roots v1={:.3}/{:.3} ms v2={:.3}/{:.3} ms",
+            v1_first.1.as_secs_f64() * 1_000.0,
+            v1_second.1.as_secs_f64() * 1_000.0,
+            v2_first.1.as_secs_f64() * 1_000.0,
+            v2_second.1.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
     #[ignore = "production-scale matrix-local versus flat row-root staging benchmark"]
     fn matrix_local_row_roots_benchmark_flat_staging() {
         let level = carryopen_level();
@@ -11052,7 +11148,7 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 301_740);
+        assert_eq!(payload.len(), 303_204);
 
         let breakdown = proof.byte_breakdown(payload.len());
         assert_eq!(breakdown.total, payload.len());
@@ -11181,7 +11277,7 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 301_740);
+        assert_eq!(payload.len(), 303_204);
 
         clear_fixed_generator_spectra_cache();
         let preprocessing_start = Instant::now();
@@ -11427,7 +11523,7 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 301_740);
+        assert_eq!(payload.len(), 303_204);
 
         let strong_sizes = proof
             .strong
@@ -11487,17 +11583,17 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 301_740);
         let digest = blake3::hash(&payload);
-        assert_eq!(
-            digest.as_bytes(),
-            &hex::decode("c19fe62415f7607f84900e3692bedcd0fae827770343dadf0dce70db49168d10")
-                .unwrap()[..]
-        );
         eprintln!(
             "canonical-payload-bytes={} blake3={}",
             payload.len(),
             digest.to_hex()
+        );
+        assert_eq!(payload.len(), 303_204);
+        assert_eq!(
+            digest.as_bytes(),
+            &hex::decode("20809657e67ec20c3db9096bd7abe05baae2b4840951b5b4a3b2a1b9ed83ae09")
+                .unwrap()[..]
         );
     }
 
