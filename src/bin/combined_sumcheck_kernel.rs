@@ -46,8 +46,8 @@ struct Args {
     semantic: bool,
     #[arg(long, default_value_t = 64)]
     batch_lanes: usize,
-    /// Commit the real final Phi vector directly with WHIR and prove its
-    /// terminal multilinear and sparse linear forms.
+    /// Run the diagnostic WHIR terminal backend outside canonical final-only
+    /// mode. Canonical final-only proving uses the recursive explicit base.
     #[arg(long, default_value_t = false)]
     direct_whir_tail: bool,
     /// Bind the combined sumcheck's terminal evaluations to two actual WHIR
@@ -63,7 +63,8 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     whir_verifier_repetitions: usize,
     /// Run only the canonical three-stage strong-terminal end-to-end path,
-    /// omitting communication ablations and diagnostic terminal proofs.
+    /// ending in the explicit private-F base and omitting diagnostic WHIR
+    /// terminal proofs.
     #[arg(long, default_value_t = false)]
     final_only: bool,
 }
@@ -6989,7 +6990,7 @@ fn main() {
     }
     assert!(!args.direct_whir_tail || args.semantic);
     assert!(!args.relation_whir || args.semantic);
-    assert!(!args.final_only || (args.semantic && args.carryopen && args.direct_whir_tail));
+    assert!(!args.final_only || (args.semantic && args.carryopen));
     let verifier_preprocessing_start = Instant::now();
     if args.semantic {
         preprocess_canonical_verifier_generators();
@@ -7025,7 +7026,9 @@ fn main() {
     let mut certificate_verify_ms = Vec::with_capacity(args.iterations);
     let mut certificate_proof_bytes = 0;
     let mut carryopen_measurements = Vec::with_capacity(args.iterations);
-    let joint_mode = args.carryopen && args.semantic && args.direct_whir_tail;
+    // Final-only always enters the recursive aggregate. `direct_whir_tail` is
+    // retained only for the non-final diagnostic joint-WHIR construction.
+    let joint_mode = args.carryopen && args.semantic && (args.final_only || args.direct_whir_tail);
     let certificate_direct_tail = args.direct_whir_tail && !joint_mode;
     let mut joint_tail_measurements = Vec::with_capacity(args.iterations);
     let mut end_to_end_verify_ms = Vec::with_capacity(args.iterations);
