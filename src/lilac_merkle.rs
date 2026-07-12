@@ -33,6 +33,18 @@ const BLAKE3_MSG_SCHEDULE: [[usize; 16]; 7] = [
     [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
     [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
 ];
+#[cfg(target_arch = "aarch64")]
+const _: () = {
+    let mut round = 0;
+    while round < BLAKE3_MSG_SCHEDULE.len() {
+        let mut word = 0;
+        while word < BLAKE3_MSG_SCHEDULE[round].len() {
+            assert!(BLAKE3_MSG_SCHEDULE[round][word] < 16);
+            word += 1;
+        }
+        round += 1;
+    }
+};
 
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::inline_always)] // Preserve one vectorized compression body in this hot path.
@@ -225,14 +237,82 @@ mod neon4 {
     unsafe fn round8(state: &mut [Packed8; 16], message: &[Packed8; 16], round: usize) {
         let s = BLAKE3_MSG_SCHEDULE[round];
         unsafe {
-            g8(state, 0, 4, 8, 12, message[s[0]], message[s[1]]);
-            g8(state, 1, 5, 9, 13, message[s[2]], message[s[3]]);
-            g8(state, 2, 6, 10, 14, message[s[4]], message[s[5]]);
-            g8(state, 3, 7, 11, 15, message[s[6]], message[s[7]]);
-            g8(state, 0, 5, 10, 15, message[s[8]], message[s[9]]);
-            g8(state, 1, 6, 11, 12, message[s[10]], message[s[11]]);
-            g8(state, 2, 7, 8, 13, message[s[12]], message[s[13]]);
-            g8(state, 3, 4, 9, 14, message[s[14]], message[s[15]]);
+            // Every compile-time schedule entry is in 0..16.  Keeping the
+            // compact runtime-round loop avoids the instruction-footprint
+            // regression of full unrolling, while unchecked message reads
+            // remove sixteen redundant bounds checks per round.
+            g8(
+                state,
+                0,
+                4,
+                8,
+                12,
+                *message.get_unchecked(s[0]),
+                *message.get_unchecked(s[1]),
+            );
+            g8(
+                state,
+                1,
+                5,
+                9,
+                13,
+                *message.get_unchecked(s[2]),
+                *message.get_unchecked(s[3]),
+            );
+            g8(
+                state,
+                2,
+                6,
+                10,
+                14,
+                *message.get_unchecked(s[4]),
+                *message.get_unchecked(s[5]),
+            );
+            g8(
+                state,
+                3,
+                7,
+                11,
+                15,
+                *message.get_unchecked(s[6]),
+                *message.get_unchecked(s[7]),
+            );
+            g8(
+                state,
+                0,
+                5,
+                10,
+                15,
+                *message.get_unchecked(s[8]),
+                *message.get_unchecked(s[9]),
+            );
+            g8(
+                state,
+                1,
+                6,
+                11,
+                12,
+                *message.get_unchecked(s[10]),
+                *message.get_unchecked(s[11]),
+            );
+            g8(
+                state,
+                2,
+                7,
+                8,
+                13,
+                *message.get_unchecked(s[12]),
+                *message.get_unchecked(s[13]),
+            );
+            g8(
+                state,
+                3,
+                4,
+                9,
+                14,
+                *message.get_unchecked(s[14]),
+                *message.get_unchecked(s[15]),
+            );
         }
     }
 
