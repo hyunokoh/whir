@@ -210,6 +210,15 @@ fn prove_local_product_relation_with_claim_reusing(
     roots: Vec<Digest>,
     claimed_sum: Field192,
 ) -> PackedSumcheckProof {
+    prove_local_product_relation_with_claim_slices(left, right, roots, claimed_sum)
+}
+
+fn prove_local_product_relation_with_claim_slices(
+    left: &mut [Field192],
+    right: &mut [Field192],
+    roots: Vec<Digest>,
+    claimed_sum: Field192,
+) -> PackedSumcheckProof {
     assert!(left.len() > 1 && left.len() == right.len());
     assert_eq!(dot(&left, &right), claimed_sum);
     let fields = left.len();
@@ -1751,6 +1760,7 @@ impl ProductionPreCarryProof {
     }
 }
 
+#[cfg(test)]
 fn build_production_precarry(
     message: &[Field192],
     commitment_root: Digest,
@@ -1784,6 +1794,70 @@ fn build_production_precarry(
             local_relation_roots(b"pre-Carry-batch", 0, &[commitment_root, statement]),
             claimed,
         ),
+    };
+    assert!(proof.verify());
+    proof
+}
+
+/// Build the pre-Carry batch inside the allocation already reserved for the
+/// four-quarter vertical codeword. The message occupies the first quarter;
+/// the remaining quarters are the evaluation scratch, combined equality
+/// weight, and the product-sumcheck copy. Keeping the original first quarter
+/// intact avoids regenerating it before vertical encoding. Once the sumcheck
+/// finishes, truncating back to the message retains the same allocation for
+/// the three parity quarters instead of leaving three freed allocations in
+/// the allocator.
+fn build_production_precarry_in_codeword(
+    codeword: &mut Vec<Field192>,
+    commitment_root: Digest,
+) -> ProductionPreCarryProof {
+    assert_eq!(codeword.len(), CARRYOPEN_FIELDS);
+    assert!(codeword.capacity() >= 4 * CARRYOPEN_FIELDS);
+    let points = precarry_opening_points(&commitment_root, 16);
+    // Seed the scratch with the first evaluation message, zero only the
+    // accumulator quarter, and append the sumcheck copy directly. This avoids
+    // zero-filling two quarters that would immediately be overwritten.
+    codeword.extend_from_within(..CARRYOPEN_FIELDS);
+    codeword.resize(3 * CARRYOPEN_FIELDS, Field192::ZERO);
+    codeword.extend_from_within(..CARRYOPEN_FIELDS);
+    let (claims, sumcheck) = {
+        let (message, workspace) = codeword.split_at_mut(CARRYOPEN_FIELDS);
+        let (scratch, workspace) = workspace.split_at_mut(CARRYOPEN_FIELDS);
+        let (combined_weight, sumcheck_message) = workspace.split_at_mut(CARRYOPEN_FIELDS);
+        assert_eq!(sumcheck_message.len(), CARRYOPEN_FIELDS);
+        let mut point_iter = points.iter();
+        let first_point = point_iter.next().expect("pre-Carry has fixed openings");
+        let mut claims = Vec::with_capacity(points.len());
+        claims.push(fold_message_at_point(scratch, first_point));
+        claims.extend(
+            point_iter
+                .map(|point| evaluate_power_of_two_message_with_scratch(message, point, scratch)),
+        );
+        let statement = precarry_statement_root(&commitment_root, &points, &claims);
+        let coefficients = precarry_coefficients(&statement, claims.len());
+        let claimed = claims
+            .iter()
+            .zip(&coefficients)
+            .map(|(claim, coefficient)| *claim * coefficient)
+            .sum::<Field192>();
+        for (point, coefficient) in points.iter().zip(coefficients) {
+            accumulate_scaled_equality_weights(point, coefficient, scratch, combined_weight);
+        }
+        sumcheck_message.copy_from_slice(message);
+        let sumcheck = prove_local_product_relation_with_claim_slices(
+            sumcheck_message,
+            combined_weight,
+            local_relation_roots(b"pre-Carry-batch", 0, &[commitment_root, statement]),
+            claimed,
+        );
+        (claims, sumcheck)
+    };
+    codeword.truncate(CARRYOPEN_FIELDS);
+    let proof = ProductionPreCarryProof {
+        commitment_root,
+        points,
+        claims,
+        sumcheck,
     };
     assert!(proof.verify());
     proof
@@ -3142,7 +3216,7 @@ fn run_production_carryopen(
     let message_commit = start.elapsed();
 
     let start = Instant::now();
-    let precarry = build_production_precarry(&proof_codeword, message_root);
+    let precarry = build_production_precarry_in_codeword(&mut proof_codeword, message_root);
     let precarry_time = start.elapsed();
 
     let start = Instant::now();
@@ -8047,6 +8121,9 @@ fn main() {
             "- production CarryOpen code: vertical and horizontal systematic QA rate 1/4, 2^16 x 2^8 message, 1024-field tensor rows, q={CARRYOPEN_QUERIES}"
         );
         println!(
+            "- pre-Carry message/scratch/weight/sumcheck copy reuse the four quarters of the reserved 1.500-GiB codeword allocation"
+        );
+        println!(
             "- CarryOpen M-root/pre-Carry/encode+commit/algebra/terminal medians: {:.3}/{:.3}/{:.3}/{:.3}/{:.3} ms",
             percentile(&message_ms, 0.5),
             percentile(&precarry_ms, 0.5),
@@ -8364,6 +8441,35 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slice_backed_sumcheck_matches_owned_vectors() {
+        let left = (0..64)
+            .map(|index| Field192::from((7 * index + 3) as u64))
+            .collect::<Vec<_>>();
+        let right = (0..64)
+            .map(|index| Field192::from((11 * index + 5) as u64))
+            .collect::<Vec<_>>();
+        let claimed_sum = dot(&left, &right);
+        let roots = vec![[19_u8; 32], [23_u8; 32]];
+        let expected = prove_local_product_relation_with_claim(
+            left.clone(),
+            right.clone(),
+            roots.clone(),
+            claimed_sum,
+        );
+        let mut shared = left;
+        shared.extend(right);
+        let (slice_left, slice_right) = shared.split_at_mut(64);
+        let actual = prove_local_product_relation_with_claim_slices(
+            slice_left,
+            slice_right,
+            roots,
+            claimed_sum,
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(actual.serialize(), expected.serialize());
+    }
 
     #[test]
     fn packed_non_power_of_two_kernel_reaches_valid_terminal_claim() {
@@ -10557,6 +10663,91 @@ mod tests {
             separate_first_time.as_secs_f64() * 1_000.0,
             separate_second_time.as_secs_f64() * 1_000.0,
         );
+    }
+
+    #[test]
+    #[ignore = "production in-allocation versus separate-allocation pre-Carry benchmark"]
+    fn in_allocation_precarry_matches_and_benchmarks_separate_allocations() {
+        let mut original = Vec::with_capacity(4 * CARRYOPEN_FIELDS);
+        original.resize(CARRYOPEN_FIELDS, Field192::ZERO);
+        original
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, value)| *value = precarry_message_value(index));
+        let commitment_root = prefix_root(
+            &original,
+            CARRYOPEN_FIELDS,
+            &zero_roots(CARRYOPEN_FIELDS.trailing_zeros() as usize),
+        );
+        let run_in_allocation = || {
+            let mut codeword = original.clone();
+            codeword.reserve_exact(3 * CARRYOPEN_FIELDS);
+            let start = Instant::now();
+            let proof = build_production_precarry_in_codeword(&mut codeword, commitment_root);
+            let elapsed = start.elapsed();
+            assert_eq!(codeword, original);
+            (proof, elapsed)
+        };
+        let run_separate = || {
+            let start = Instant::now();
+            let proof = build_production_precarry(&original, commitment_root);
+            (proof, start.elapsed())
+        };
+
+        let (in_allocation_first, in_allocation_first_time) = run_in_allocation();
+        let (separate_first, separate_first_time) = run_separate();
+        let (separate_second, separate_second_time) = run_separate();
+        let (in_allocation_second, in_allocation_second_time) = run_in_allocation();
+        assert_eq!(in_allocation_first, separate_first);
+        assert_eq!(in_allocation_first, separate_second);
+        assert_eq!(in_allocation_first, in_allocation_second);
+        eprintln!(
+            "precarry-in-allocation={:.3}/{:.3} ms separate-allocation={:.3}/{:.3} ms",
+            in_allocation_first_time.as_secs_f64() * 1_000.0,
+            in_allocation_second_time.as_secs_f64() * 1_000.0,
+            separate_first_time.as_secs_f64() * 1_000.0,
+            separate_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production separate-allocation pre-Carry memory profile"]
+    fn separate_allocation_precarry_memory_profile() {
+        let mut codeword = Vec::with_capacity(4 * CARRYOPEN_FIELDS);
+        codeword.resize(CARRYOPEN_FIELDS, Field192::ZERO);
+        codeword
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, value)| *value = precarry_message_value(index));
+        let commitment_root = prefix_root(
+            &codeword,
+            CARRYOPEN_FIELDS,
+            &zero_roots(CARRYOPEN_FIELDS.trailing_zeros() as usize),
+        );
+        let proof = build_production_precarry(&codeword, commitment_root);
+        codeword.resize(4 * CARRYOPEN_FIELDS, Field192::ZERO);
+        assert!(proof.verify());
+        assert_eq!(codeword.len(), 4 * CARRYOPEN_FIELDS);
+    }
+
+    #[test]
+    #[ignore = "production in-allocation pre-Carry memory profile"]
+    fn in_allocation_precarry_memory_profile() {
+        let mut codeword = Vec::with_capacity(4 * CARRYOPEN_FIELDS);
+        codeword.resize(CARRYOPEN_FIELDS, Field192::ZERO);
+        codeword
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, value)| *value = precarry_message_value(index));
+        let commitment_root = prefix_root(
+            &codeword,
+            CARRYOPEN_FIELDS,
+            &zero_roots(CARRYOPEN_FIELDS.trailing_zeros() as usize),
+        );
+        let proof = build_production_precarry_in_codeword(&mut codeword, commitment_root);
+        codeword.resize(4 * CARRYOPEN_FIELDS, Field192::ZERO);
+        assert!(proof.verify());
+        assert_eq!(codeword.len(), 4 * CARRYOPEN_FIELDS);
     }
 
     #[test]
