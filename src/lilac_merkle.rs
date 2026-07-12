@@ -855,6 +855,24 @@ where
     );
 }
 
+fn extend_field_level1_batched(values: &[Field192], scratch: &mut Vec<Digest>) {
+    assert!(values.len() >= 16 && values.len().is_power_of_two());
+    for chunk in values.chunks_exact(16) {
+        let left_values = std::array::from_fn(|index| chunk[index]);
+        let right_values = std::array::from_fn(|index| chunk[8 + index]);
+        let left = field_leaves8(&left_values);
+        let right = field_leaves8(&right_values);
+        let children = std::array::from_fn(|index| {
+            if index < 8 {
+                left[index]
+            } else {
+                right[index - 8]
+            }
+        });
+        scratch.extend_from_slice(&parent8(&children));
+    }
+}
+
 fn extend_field_leaves_batched_materialized<F>(
     values: &[Field192],
     scratch: &mut Vec<Digest>,
@@ -900,8 +918,31 @@ fn exact_prefix_root_batched(values: &[Field192]) -> Digest {
 pub fn exact_prefix_root_with_scratch(values: &[Field192], scratch: &mut Vec<Digest>) -> Digest {
     assert!(values.len() >= 8 && values.len().is_power_of_two());
     scratch.clear();
-    extend_field_leaves_batched(values, scratch, |value| value);
+    if values.len() >= 16 {
+        extend_field_level1_batched(values, scratch);
+    } else {
+        extend_field_leaves_batched(values, scratch, |value| value);
+    }
     reduce_exact_digests(scratch)
+}
+
+/// Reproduce the unfused exact-root schedule for crossed artifact benchmarks.
+#[doc(hidden)]
+pub fn prefix_root_unfused_for_benchmark(
+    values: &[Field192],
+    capacity: usize,
+    zeros: &[Digest],
+) -> Digest {
+    assert!(values.len() <= capacity && capacity.is_power_of_two());
+    if values.len() == capacity && values.len() >= 8 {
+        return EXACT_ROOT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.clear();
+            extend_field_leaves_batched(values, &mut scratch, |value| value);
+            reduce_exact_digests(&mut scratch)
+        });
+    }
+    sequential_prefix_root(values, capacity, zeros)
 }
 
 /// Reproduce the pre-optimization AArch64 exact-root path for crossed
@@ -1205,6 +1246,75 @@ mod tests {
                 prefix_root(&values[..size], size, &zeros)
             );
         }
+    }
+
+    #[test]
+    fn fused_first_parent_level_matches_unfused_exact_root() {
+        let zeros = zero_roots(12);
+        let values = (0..4096)
+            .map(|index| Field192::from((23 * index + 11) as u64))
+            .collect::<Vec<_>>();
+        for size in [8, 16, 64, 256, 1024, 4096] {
+            assert_eq!(
+                prefix_root(&values[..size], size, &zeros),
+                prefix_root_unfused_for_benchmark(&values[..size], size, &zeros)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "fused versus unfused 1,024-field exact-root benchmark"]
+    fn fused_first_parent_level_benchmarks_unfused_root() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let values = (0..1024_u64)
+            .map(|index| {
+                let seed = blake3::hash(&(index + 41).to_le_bytes());
+                Field192::from_le_bytes_mod_order(seed.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        let zeros = zero_roots(10);
+        assert_eq!(
+            prefix_root(&values, values.len(), &zeros),
+            prefix_root_unfused_for_benchmark(&values, values.len(), &zeros)
+        );
+        let iterations = 10_000;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            black_box(prefix_root(black_box(&values), values.len(), &zeros));
+        }
+        let fused_first = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            black_box(prefix_root_unfused_for_benchmark(
+                black_box(&values),
+                values.len(),
+                &zeros,
+            ));
+        }
+        let unfused_first = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            black_box(prefix_root_unfused_for_benchmark(
+                black_box(&values),
+                values.len(),
+                &zeros,
+            ));
+        }
+        let unfused_second = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            black_box(prefix_root(black_box(&values), values.len(), &zeros));
+        }
+        let fused_second = start.elapsed();
+        eprintln!(
+            "fused-level1={:.3}/{:.3} ms unfused={:.3}/{:.3} ms",
+            fused_first.as_secs_f64() * 1_000.0,
+            fused_second.as_secs_f64() * 1_000.0,
+            unfused_first.as_secs_f64() * 1_000.0,
+            unfused_second.as_secs_f64() * 1_000.0,
+        );
     }
 
     fn legacy_parent(left: Digest, right: Digest) -> Digest {
