@@ -1273,6 +1273,31 @@ fn exact_scaled_prefix_root_batched(values: &[Field192], scale: Field192) -> Dig
     })
 }
 
+/// Compute a padded scaled prefix from exact aligned dyadic subtrees.  This
+/// keeps the canonical zero-padding semantics while allowing non-power-of-two
+/// prefixes to use the same batched leaf and parent kernels as exact roots.
+fn dyadic_scaled_prefix_root(
+    values: &[Field192],
+    scale: Field192,
+    capacity: usize,
+    zeros: &[Digest],
+) -> Digest {
+    assert!(values.len() >= 8 && values.len() < capacity && capacity.is_power_of_two());
+    let mut accumulator = MerkleAccumulator::new(capacity.trailing_zeros() as usize);
+    let mut position = 0;
+    while values.len() - position >= 8 {
+        let remaining = values.len() - position;
+        let block = 1usize << (usize::BITS - 1 - remaining.leading_zeros());
+        let root = exact_scaled_prefix_root_batched(&values[position..position + block], scale);
+        accumulator.append_subtree(root, block.trailing_zeros() as usize);
+        position += block;
+    }
+    for value in &values[position..] {
+        accumulator.append_leaf(field_leaf(scale * *value));
+    }
+    accumulator.finish(capacity, zeros)
+}
+
 pub fn zero_roots(max_height: usize) -> Vec<Digest> {
     let mut roots = Vec::with_capacity(max_height + 1);
     roots.push(field_leaf(Field192::from(0_u64)));
@@ -1406,6 +1431,25 @@ pub fn scaled_prefix_root(
     if values.len() == capacity && values.len() >= 8 {
         return exact_scaled_prefix_root_batched(values, scale);
     }
+    if values.len() >= 8 {
+        return dyadic_scaled_prefix_root(values, scale, capacity, zeros);
+    }
+    let mut accumulator = MerkleAccumulator::new(capacity.trailing_zeros() as usize);
+    for value in values {
+        accumulator.append_leaf(field_leaf(scale * *value));
+    }
+    accumulator.finish(capacity, zeros)
+}
+
+/// Reproduce the former scalar padded-prefix path for crossed benchmarks.
+#[doc(hidden)]
+pub fn scaled_prefix_root_sequential_for_benchmark(
+    values: &[Field192],
+    scale: Field192,
+    capacity: usize,
+    zeros: &[Digest],
+) -> Digest {
+    assert!(values.len() <= capacity && capacity.is_power_of_two());
     let mut accumulator = MerkleAccumulator::new(capacity.trailing_zeros() as usize);
     for value in values {
         accumulator.append_leaf(field_leaf(scale * *value));
@@ -2115,8 +2159,8 @@ mod tests {
 
     #[test]
     fn scaled_prefix_root_matches_materialized_row() {
-        let zeros = zero_roots(7);
-        let values = (0..128)
+        let zeros = zero_roots(12);
+        let values = (0..4096)
             .map(|index| Field192::from((3 * index + 5) as u64))
             .collect::<Vec<_>>();
         let scale = Field192::from(17_u64);
@@ -2124,10 +2168,10 @@ mod tests {
             .iter()
             .map(|value| scale * *value)
             .collect::<Vec<_>>();
-        for length in [73, 128] {
+        for length in [0, 1, 7, 8, 9, 73, 128, 583, 823, 1369, 2438, 4096] {
             assert_eq!(
-                scaled_prefix_root(&values[..length], scale, 128, &zeros),
-                sequential_prefix_root(&scaled[..length], 128, &zeros)
+                scaled_prefix_root(&values[..length], scale, 4096, &zeros),
+                sequential_prefix_root(&scaled[..length], 4096, &zeros)
             );
         }
     }

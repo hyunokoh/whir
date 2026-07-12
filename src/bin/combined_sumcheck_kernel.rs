@@ -33,7 +33,7 @@ use whir::lilac_merkle::{
     combine_equal_subtrees_parallel_for_benchmark, prefix_root_copied_parents_for_benchmark,
     prefix_root_materialized_blocks_for_benchmark, prefix_root_materialized_leaves_for_benchmark,
     prefix_root_materialized_parents_for_benchmark, prefix_root_scatter_for_benchmark,
-    prefix_root_unfused_for_benchmark,
+    prefix_root_unfused_for_benchmark, scaled_prefix_root_sequential_for_benchmark,
 };
 
 #[derive(Debug, Parser)]
@@ -9414,6 +9414,82 @@ mod tests {
             transition_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
         }
         eprintln!("certificate-transition-ms={transition_ms:?}");
+    }
+
+    #[test]
+    #[ignore = "production certificate padded scaled-root crossed benchmark"]
+    fn dyadic_scaled_roots_benchmark_scalar_certificate_rows() {
+        let measurement = run_semantic_certificate_only(64, false);
+        let transitions = measurement
+            .transition_proofs
+            .as_ref()
+            .expect("semantic certificate must retain transitions");
+        let transition = &transitions[0];
+        let level = LEVELS[0];
+        let zeros = zero_roots(PRODUCTION_VARIABLES);
+        preprocess_canonical_verifier_generators();
+        clear_virtual_index_factor_cache();
+        let factors = validated_virtual_index_factors(0, level, &transition.component_roots)
+            .expect("level-0 public-W factors must validate");
+        let (coefficients, alpha) = factors.as_ref();
+        let selected = &transition.selected_front.selected;
+        assert_eq!(selected.len(), level.next_blocks - 1);
+
+        let dyadic = || {
+            selected
+                .par_iter()
+                .map(|row| scaled_prefix_root(alpha, coefficients[*row], level.group, &zeros))
+                .collect::<Vec<_>>()
+        };
+        let scalar = || {
+            selected
+                .par_iter()
+                .map(|row| {
+                    scaled_prefix_root_sequential_for_benchmark(
+                        alpha,
+                        coefficients[*row],
+                        level.group,
+                        &zeros,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = scalar();
+        assert_eq!(dyadic(), expected);
+
+        let mut dyadic_ms = Vec::with_capacity(8);
+        let mut scalar_ms = Vec::with_capacity(8);
+        for trial in 0..4 {
+            let order = if trial % 2 == 0 {
+                [true, false, false, true]
+            } else {
+                [false, true, true, false]
+            };
+            for is_dyadic in order {
+                let start = Instant::now();
+                let roots = std::hint::black_box(if is_dyadic { dyadic() } else { scalar() });
+                let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+                assert_eq!(roots, expected);
+                if is_dyadic {
+                    dyadic_ms.push(elapsed);
+                } else {
+                    scalar_ms.push(elapsed);
+                }
+            }
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        eprintln!(
+            "certificate-level0-scaled-roots rows={} width={} capacity={} dyadic-ms={dyadic_ms:?} scalar-ms={scalar_ms:?} dyadic-median={:.3} scalar-median={:.3}",
+            selected.len(),
+            alpha.len(),
+            level.group,
+            median(&dyadic_ms),
+            median(&scalar_ms),
+        );
     }
 
     #[test]
