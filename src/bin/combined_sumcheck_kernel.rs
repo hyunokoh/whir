@@ -979,6 +979,13 @@ impl ProductionTransitionProof {
     }
 
     fn deserialize(payload: &[u8]) -> Option<Self> {
+        let proof = Self::deserialize_unchecked(payload)?;
+        proof.verify().then_some(proof)
+    }
+
+    /// Structural parser for a containing proof that performs the semantic
+    /// verification pass before returning to its caller.
+    fn deserialize_unchecked(payload: &[u8]) -> Option<Self> {
         if payload.len() < 24 || &payload[..8] != Self::MAGIC {
             return None;
         }
@@ -1016,7 +1023,7 @@ impl ProductionTransitionProof {
             selected_front,
             algebra,
         };
-        proof.verify().then_some(proof)
+        Some(proof)
     }
 }
 
@@ -1517,7 +1524,8 @@ impl ProductionPreCarryProof {
         output
     }
 
-    fn deserialize(payload: &[u8]) -> Option<Self> {
+    /// Structural parser used only inside a verified CarryOpen aggregate.
+    fn deserialize_unchecked(payload: &[u8]) -> Option<Self> {
         const HEADER: usize = 8 + 4 + 4 + 4 + 4 + 32;
         if payload.len() < HEADER || &payload[..8] != Self::MAGIC {
             return None;
@@ -1562,7 +1570,7 @@ impl ProductionPreCarryProof {
             claims,
             sumcheck,
         };
-        proof.verify().then_some(proof)
+        Some(proof)
     }
 }
 
@@ -1955,7 +1963,9 @@ fn standard_ood_block_root(level: Level, terminal_source: &[Field192], zeros: &[
 /// Checks the concrete delayed-opening restoration carried by the terminal
 /// witness.  The OOD block has no old-row authentication claim; every sampled
 /// block must be a valid horizontal QA row whose field-Merkle root is the
-/// delayed F root, followed by the W row authenticated by the W multiproof.
+/// delayed F root, followed by the public rank-one W row. State-root
+/// reconstruction still hashes that public row once; this audit compares the
+/// carried values directly with `c[row] * alpha` instead of hashing them again.
 fn audit_tensor_carry_restoration(
     level: Level,
     component_roots: &[Digest],
@@ -1975,14 +1985,7 @@ fn audit_tensor_carry_restoration(
     let Some(evaluation_point) = evaluation.challenges() else {
         return false;
     };
-    let Some(w_roots) = virtual_index_selected_roots(
-        10,
-        level,
-        component_roots,
-        &front.selected,
-        CARRYOPEN_WIDTH,
-        zeros,
-    ) else {
+    let Some(public_w_factors) = validated_virtual_index_factors(10, level, component_roots) else {
         return false;
     };
     let Some(public_membership_w) =
@@ -2017,20 +2020,21 @@ fn audit_tensor_carry_restoration(
     {
         return false;
     }
-    for (ordinal, row) in front.selected.iter().copied().enumerate() {
-        let start = CARRYOPEN_OOD_FIELDS + ordinal * CARRYOPEN_TERMINAL_BLOCK;
-        let block = &terminal[start..start + CARRYOPEN_TERMINAL_BLOCK];
-        let f_row = &block[..CARRYOPEN_TENSOR_WIDTH];
-        let w_row = &block[CARRYOPEN_TENSOR_WIDTH..];
-        if encode_horizontal_row(&f_row[..CARRYOPEN_WIDTH], horizontal_spectra) != f_row
-            || prefix_root(f_row, CARRYOPEN_TENSOR_WIDTH, zeros)
-                != selected_f_row_root(front, level, row).unwrap_or([0_u8; 32])
-            || prefix_root(w_row, CARRYOPEN_WIDTH, zeros) != w_roots[ordinal]
-        {
-            return false;
-        }
-    }
-    true
+    front
+        .selected
+        .par_iter()
+        .copied()
+        .enumerate()
+        .all(|(ordinal, row)| {
+            let start = CARRYOPEN_OOD_FIELDS + ordinal * CARRYOPEN_TERMINAL_BLOCK;
+            let block = &terminal[start..start + CARRYOPEN_TERMINAL_BLOCK];
+            let f_row = &block[..CARRYOPEN_TENSOR_WIDTH];
+            let w_row = &block[CARRYOPEN_TENSOR_WIDTH..];
+            encode_horizontal_row(&f_row[..CARRYOPEN_WIDTH], horizontal_spectra) == f_row
+                && prefix_root(f_row, CARRYOPEN_TENSOR_WIDTH, zeros)
+                    == selected_f_row_root(front, level, row).unwrap_or([0_u8; 32])
+                && virtual_index_row_matches(&public_w_factors, row, w_row)
+        })
 }
 
 fn carry_ood_and_terminal_roots(
@@ -2248,14 +2252,9 @@ fn audit_standard_terminal_restoration(
     let Some(point) = proof.algebra.qa_membership.challenges() else {
         return false;
     };
-    let Some(w_roots) = virtual_index_selected_roots(
-        level_index,
-        level,
-        &proof.component_roots,
-        &proof.selected_front.selected,
-        level.group,
-        zeros,
-    ) else {
+    let Some(public_w_factors) =
+        validated_virtual_index_factors(level_index, level, &proof.component_roots)
+    else {
         return false;
     };
     let Some(public_ood_w) =
@@ -2282,18 +2281,20 @@ fn audit_standard_terminal_restoration(
     {
         return false;
     }
-    for (ordinal, row) in proof.selected_front.selected.iter().copied().enumerate() {
-        let start = (ordinal + 1) * 2 * level.width;
-        let f_row = &terminal[start..start + level.width];
-        let w_row = &terminal[start + level.width..start + 2 * level.width];
-        if prefix_root(f_row, level.group, zeros)
-            != selected_f_row_root(&proof.selected_front, level, row).unwrap_or([0_u8; 32])
-            || prefix_root(w_row, level.group, zeros) != w_roots[ordinal]
-        {
-            return false;
-        }
-    }
-    true
+    proof
+        .selected_front
+        .selected
+        .par_iter()
+        .copied()
+        .enumerate()
+        .all(|(ordinal, row)| {
+            let start = (ordinal + 1) * 2 * level.width;
+            let f_row = &terminal[start..start + level.width];
+            let w_row = &terminal[start + level.width..start + 2 * level.width];
+            prefix_root(f_row, level.group, zeros)
+                == selected_f_row_root(&proof.selected_front, level, row).unwrap_or([0_u8; 32])
+                && virtual_index_row_matches(&public_w_factors, row, w_row)
+        })
 }
 
 fn audit_strong_terminal_restoration(
@@ -2326,14 +2327,9 @@ fn audit_strong_terminal_restoration(
     let Some(point) = membership.challenges() else {
         return false;
     };
-    let Some(w_roots) = virtual_index_selected_roots(
-        level_index,
-        level,
-        component_roots,
-        &front.selected,
-        level.group,
-        zeros,
-    ) else {
+    let Some(public_w_factors) =
+        validated_virtual_index_factors(level_index, level, component_roots)
+    else {
         return false;
     };
     let Some(public_ood_w) = virtual_index_ood_row(level_index, level, component_roots, &point)
@@ -2354,20 +2350,21 @@ fn audit_strong_terminal_restoration(
     {
         return false;
     }
-    for (ordinal, row) in front.selected.iter().copied().enumerate() {
-        let start = (ordinal + 1) * 2 * level.width;
-        if prefix_root(&terminal[start..start + level.width], level.group, zeros)
-            != selected_f_row_root(front, level, row).unwrap_or([0_u8; 32])
-            || prefix_root(
-                &terminal[start + level.width..start + 2 * level.width],
-                level.group,
-                zeros,
-            ) != w_roots[ordinal]
-        {
-            return false;
-        }
-    }
-    true
+    front
+        .selected
+        .par_iter()
+        .copied()
+        .enumerate()
+        .all(|(ordinal, row)| {
+            let start = (ordinal + 1) * 2 * level.width;
+            prefix_root(&terminal[start..start + level.width], level.group, zeros)
+                == selected_f_row_root(front, level, row).unwrap_or([0_u8; 32])
+                && virtual_index_row_matches(
+                    &public_w_factors,
+                    row,
+                    &terminal[start + level.width..start + 2 * level.width],
+                )
+        })
 }
 
 fn terminal_witness_matches_tail(terminal: &[Field192], tail: &DirectTailProofArtifact) -> bool {
@@ -2598,8 +2595,9 @@ impl CarryOpenCoreProof {
             return None;
         }
         let mut position = HEADER;
-        let precarry =
-            ProductionPreCarryProof::deserialize(payload.get(position..position + sizes[0])?)?;
+        let precarry = ProductionPreCarryProof::deserialize_unchecked(
+            payload.get(position..position + sizes[0])?,
+        )?;
         position += sizes[0];
         let component_roots = (0..sizes[1])
             .map(|_| {
@@ -3435,6 +3433,36 @@ fn cached_virtual_index_factors(
     factors
 }
 
+fn validated_virtual_index_factors(
+    level_index: usize,
+    level: Level,
+    component_roots: &[Digest],
+) -> Option<VirtualIndexFactors> {
+    if component_roots.len() != 2 * level.inverse_rate + 1 {
+        return None;
+    }
+    let transcript_roots = &component_roots[..2 * level.inverse_rate];
+    (component_roots[2 * level.inverse_rate]
+        == virtual_index_descriptor(level_index, level, transcript_roots))
+    .then(|| cached_virtual_index_factors(level_index, level, transcript_roots))
+}
+
+fn virtual_index_row_matches(
+    factors: &VirtualIndexFactors,
+    row: usize,
+    values: &[Field192],
+) -> bool {
+    let (coefficients, alpha) = factors.as_ref();
+    let Some(coefficient) = coefficients.get(row) else {
+        return false;
+    };
+    values.len() == alpha.len()
+        && values
+            .iter()
+            .zip(alpha)
+            .all(|(value, lane)| *value == *coefficient * *lane)
+}
+
 fn clear_virtual_index_factor_cache() {
     virtual_index_factor_cache()
         .lock()
@@ -3460,13 +3488,7 @@ fn virtual_index_selected_roots(
     {
         return None;
     }
-    let transcript_roots = &component_roots[..2 * level.inverse_rate];
-    if component_roots[2 * level.inverse_rate]
-        != virtual_index_descriptor(level_index, level, transcript_roots)
-    {
-        return None;
-    }
-    let factors = cached_virtual_index_factors(level_index, level, transcript_roots);
+    let factors = validated_virtual_index_factors(level_index, level, component_roots)?;
     let (coefficients, alpha) = factors.as_ref();
     if selected.iter().any(|row| *row >= coefficients.len()) {
         return None;
@@ -5096,7 +5118,8 @@ impl StrongTransitionCore {
         output
     }
 
-    fn deserialize(payload: &[u8]) -> Option<Self> {
+    /// Structural parser used only inside a verified strong aggregate.
+    fn deserialize_unchecked(payload: &[u8]) -> Option<Self> {
         const HEADER: usize = 8 + 6 * 4;
         if payload.len() < HEADER || &payload[..8] != Self::MAGIC {
             return None;
@@ -5142,7 +5165,7 @@ impl StrongTransitionCore {
             selected_front,
             membership,
         };
-        proof.verify().then_some(proof)
+        Some(proof)
     }
 }
 
@@ -5195,7 +5218,8 @@ impl StrongBaseProof {
         output
     }
 
-    fn deserialize(payload: &[u8], core: &StrongTransitionCore) -> Option<Self> {
+    /// Structural parser used only inside a verified strong aggregate.
+    fn deserialize_unchecked(payload: &[u8], core: &StrongTransitionCore) -> Option<Self> {
         if payload.len() < 24 || &payload[..8] != Self::MAGIC {
             return None;
         }
@@ -5226,7 +5250,7 @@ impl StrongBaseProof {
             tail,
             terminal_witness,
         };
-        proof.verify(core).then_some(proof)
+        Some(proof)
     }
 }
 
@@ -5330,7 +5354,7 @@ impl ProductionCertificateProof {
             let size =
                 u32::from_le_bytes(payload.get(position..position + 4)?.try_into().ok()?) as usize;
             position += 4;
-            transitions.push(ProductionTransitionProof::deserialize(
+            transitions.push(ProductionTransitionProof::deserialize_unchecked(
                 payload.get(position..position + size)?,
             )?);
             position += size;
@@ -5518,7 +5542,7 @@ impl ProductionEndToEndProof {
             let size =
                 u32::from_le_bytes(payload.get(position..position + 4)?.try_into().ok()?) as usize;
             position += 4;
-            certificate.push(ProductionTransitionProof::deserialize(
+            certificate.push(ProductionTransitionProof::deserialize_unchecked(
                 payload.get(position..position + size)?,
             )?);
             position += size;
@@ -5626,7 +5650,7 @@ impl StrongEndToEndProof {
             let size =
                 u32::from_le_bytes(payload.get(position..position + 4)?.try_into().ok()?) as usize;
             position += 4;
-            certificate.push(ProductionTransitionProof::deserialize(
+            certificate.push(ProductionTransitionProof::deserialize_unchecked(
                 payload.get(position..position + size)?,
             )?);
             position += size;
@@ -5825,6 +5849,13 @@ impl RecursiveStrongEndToEndProof {
     }
 
     fn deserialize(payload: &[u8]) -> Option<Self> {
+        let proof = Self::deserialize_unchecked(payload)?;
+        proof.verify().then_some(proof)
+    }
+
+    /// Parse the complete canonical structure without accepting it. The public
+    /// `deserialize` wrapper below returns only after one full semantic pass.
+    fn deserialize_unchecked(payload: &[u8]) -> Option<Self> {
         const HEADER: usize = 8 + 5 * 4;
         if payload.len() < HEADER || &payload[..8] != Self::MAGIC {
             return None;
@@ -5849,7 +5880,7 @@ impl RecursiveStrongEndToEndProof {
             let size =
                 u32::from_le_bytes(payload.get(position..position + 4)?.try_into().ok()?) as usize;
             position += 4;
-            certificate.push(ProductionTransitionProof::deserialize(
+            certificate.push(ProductionTransitionProof::deserialize_unchecked(
                 payload.get(position..position + size)?,
             )?);
             position += size;
@@ -5859,7 +5890,7 @@ impl RecursiveStrongEndToEndProof {
             let size =
                 u32::from_le_bytes(payload.get(position..position + 4)?.try_into().ok()?) as usize;
             position += 4;
-            strong.push(StrongTransitionCore::deserialize(
+            strong.push(StrongTransitionCore::deserialize_unchecked(
                 payload.get(position..position + size)?,
             )?);
             position += size;
@@ -5867,13 +5898,29 @@ impl RecursiveStrongEndToEndProof {
         if payload.len() != position + values[3] {
             return None;
         }
-        let base = StrongBaseProof::deserialize(&payload[position..], strong.last()?)?;
+        let base = StrongBaseProof::deserialize_unchecked(&payload[position..], strong.last()?)?;
         let proof = Self {
             carryopen,
             certificate,
             strong,
             base,
         };
+        Some(proof)
+    }
+
+    #[cfg(test)]
+    fn deserialize_redundantly_verified(payload: &[u8]) -> Option<Self> {
+        let proof = Self::deserialize_unchecked(payload)?;
+        if !proof.carryopen.precarry.verify()
+            || !proof
+                .certificate
+                .iter()
+                .all(ProductionTransitionProof::verify)
+            || !proof.strong.iter().all(StrongTransitionCore::verify)
+            || !proof.base.verify(proof.strong.last()?)
+        {
+            return None;
+        }
         proof.verify().then_some(proof)
     }
 }
@@ -7604,6 +7651,246 @@ mod tests {
         assert_eq!(dot(&link_left, &link_right), Field192::ZERO);
         link_left[0] += Field192::ONE;
         assert_ne!(dot(&link_left, &link_right), Field192::ZERO);
+    }
+
+    #[test]
+    fn public_rank_one_rows_match_their_scaled_merkle_roots() {
+        let level = Level {
+            raw: 10,
+            blocks: 2,
+            block_semantic: 5,
+            components: &[(5, 32)],
+            group: 8,
+            width: 3,
+            row_span: 4,
+            inverse_rate: 2,
+            next_blocks: 2,
+        };
+        let zeros = zero_roots(10);
+        let transcript_roots = vec![[7_u8; 32]; 2 * level.inverse_rate];
+        let mut component_roots = transcript_roots.clone();
+        component_roots.push(virtual_index_descriptor(0, level, &transcript_roots));
+        let factors = validated_virtual_index_factors(0, level, &component_roots).unwrap();
+        let (coefficients, alpha) = factors.as_ref();
+
+        for row in [0, 3, level.inverse_rate * level.group - 1] {
+            let values = alpha
+                .iter()
+                .map(|lane| coefficients[row] * *lane)
+                .collect::<Vec<_>>();
+            assert!(virtual_index_row_matches(&factors, row, &values));
+            assert_eq!(
+                prefix_root(&values, level.group, &zeros),
+                scaled_prefix_root(alpha, coefficients[row], level.group, &zeros)
+            );
+            let mut changed = values;
+            changed[1] += Field192::ONE;
+            assert!(!virtual_index_row_matches(&factors, row, &changed));
+        }
+    }
+
+    #[test]
+    #[ignore = "production-width public-W field-check versus duplicate-hash benchmark"]
+    fn public_rank_one_row_checks_benchmark_duplicate_hashing() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let transcript_roots = vec![[11_u8; 32]; 2 * level.inverse_rate];
+        let mut component_roots = transcript_roots.clone();
+        component_roots.push(virtual_index_descriptor(10, level, &transcript_roots));
+        let factors = validated_virtual_index_factors(10, level, &component_roots).unwrap();
+        let (coefficients, alpha) = factors.as_ref();
+        let selected = (0..CARRYOPEN_QUERIES)
+            .map(|index| index * coefficients.len() / CARRYOPEN_QUERIES)
+            .collect::<Vec<_>>();
+        let rows = selected
+            .iter()
+            .map(|row| {
+                alpha
+                    .iter()
+                    .map(|lane| coefficients[*row] * *lane)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let expected_roots = selected
+            .iter()
+            .map(|row| scaled_prefix_root(alpha, coefficients[*row], CARRYOPEN_WIDTH, &zeros))
+            .collect::<Vec<_>>();
+        let repetitions = 20;
+
+        let start = Instant::now();
+        for _ in 0..repetitions {
+            assert!(selected
+                .iter()
+                .zip(&rows)
+                .all(|(row, values)| virtual_index_row_matches(&factors, *row, values)));
+        }
+        let direct_first = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..repetitions {
+            assert!(rows
+                .iter()
+                .zip(&expected_roots)
+                .all(|(values, root)| prefix_root(values, CARRYOPEN_WIDTH, &zeros) == *root));
+        }
+        let hashed_first = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..repetitions {
+            assert!(rows
+                .iter()
+                .zip(&expected_roots)
+                .all(|(values, root)| prefix_root(values, CARRYOPEN_WIDTH, &zeros) == *root));
+        }
+        let hashed_second = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..repetitions {
+            assert!(selected
+                .iter()
+                .zip(&rows)
+                .all(|(row, values)| virtual_index_row_matches(&factors, *row, values)));
+        }
+        let direct_second = start.elapsed();
+
+        eprintln!(
+            "direct={:.3}/{:.3} ms duplicate-hash={:.3}/{:.3} ms repetitions={repetitions}",
+            direct_first.as_secs_f64() * 1_000.0,
+            direct_second.as_secs_f64() * 1_000.0,
+            hashed_first.as_secs_f64() * 1_000.0,
+            hashed_second.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production-geometry parallel-vs-sequential restoration-row benchmark"]
+    fn parallel_restoration_rows_benchmark_sequential_audit() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(11, block, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let transcript_roots = vec![[13_u8; 32]; 2 * level.inverse_rate];
+        let mut component_roots = transcript_roots.clone();
+        component_roots.push(virtual_index_descriptor(10, level, &transcript_roots));
+        let factors = validated_virtual_index_factors(10, level, &component_roots).unwrap();
+        let (coefficients, alpha) = factors.as_ref();
+        let selected = (0..CARRYOPEN_QUERIES)
+            .map(|index| index * coefficients.len() / CARRYOPEN_QUERIES)
+            .collect::<Vec<_>>();
+        let f_rows = selected
+            .iter()
+            .map(|row| {
+                let base = (0..CARRYOPEN_WIDTH)
+                    .map(|lane| Field192::from((*row + lane + 1) as u64))
+                    .collect::<Vec<_>>();
+                encode_horizontal_row(&base, &horizontal_spectra)
+            })
+            .collect::<Vec<_>>();
+        let f_roots = f_rows
+            .iter()
+            .map(|row| prefix_root(row, CARRYOPEN_TENSOR_WIDTH, &zeros))
+            .collect::<Vec<_>>();
+        let w_rows = selected
+            .iter()
+            .map(|row| {
+                alpha
+                    .iter()
+                    .map(|lane| coefficients[*row] * *lane)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let check = |ordinal: usize| {
+            let f_row = &f_rows[ordinal];
+            encode_horizontal_row(&f_row[..CARRYOPEN_WIDTH], &horizontal_spectra).as_slice()
+                == f_row.as_slice()
+                && prefix_root(f_row, CARRYOPEN_TENSOR_WIDTH, &zeros) == f_roots[ordinal]
+                && virtual_index_row_matches(&factors, selected[ordinal], &w_rows[ordinal])
+        };
+        let repetitions = 10;
+
+        let start = Instant::now();
+        for _ in 0..repetitions {
+            assert!((0..selected.len()).all(&check));
+        }
+        let sequential_first = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..repetitions {
+            assert!((0..selected.len()).into_par_iter().all(&check));
+        }
+        let parallel_first = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..repetitions {
+            assert!((0..selected.len()).into_par_iter().all(&check));
+        }
+        let parallel_second = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..repetitions {
+            assert!((0..selected.len()).all(&check));
+        }
+        let sequential_second = start.elapsed();
+
+        eprintln!(
+            "parallel={:.3}/{:.3} ms sequential={:.3}/{:.3} ms repetitions={repetitions}",
+            parallel_first.as_secs_f64() * 1_000.0,
+            parallel_second.as_secs_f64() * 1_000.0,
+            sequential_first.as_secs_f64() * 1_000.0,
+            sequential_second.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production canonical one-pass-vs-redundant verifier A/B benchmark"]
+    fn canonical_verifier_benchmarks_single_semantic_pass() {
+        let carry = run_production_carryopen(1);
+        let certificate = run_semantic_certificate_only(64, false);
+        let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
+        let payload = proof.serialize();
+        assert_eq!(payload.len(), 443_496);
+        let carry_offset = 8 + 5 * 4;
+        let precarry_size = u32::from_le_bytes(
+            payload[carry_offset + 8..carry_offset + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let first_carry_component_root = carry_offset + 8 + 7 * 4 + precarry_size;
+        let mut changed = payload.clone();
+        changed[first_carry_component_root] ^= 1;
+        assert!(RecursiveStrongEndToEndProof::deserialize_unchecked(&changed).is_some());
+        assert!(RecursiveStrongEndToEndProof::deserialize(&changed).is_none());
+        assert!(RecursiveStrongEndToEndProof::deserialize_redundantly_verified(&changed).is_none());
+
+        clear_virtual_index_factor_cache();
+        let start = Instant::now();
+        let single_first = RecursiveStrongEndToEndProof::deserialize(&payload).unwrap();
+        let single_first_time = start.elapsed();
+        assert_eq!(single_first, proof);
+
+        clear_virtual_index_factor_cache();
+        let start = Instant::now();
+        let redundant_first =
+            RecursiveStrongEndToEndProof::deserialize_redundantly_verified(&payload).unwrap();
+        let redundant_first_time = start.elapsed();
+        assert_eq!(redundant_first, proof);
+
+        clear_virtual_index_factor_cache();
+        let start = Instant::now();
+        let redundant_second =
+            RecursiveStrongEndToEndProof::deserialize_redundantly_verified(&payload).unwrap();
+        let redundant_second_time = start.elapsed();
+        assert_eq!(redundant_second, proof);
+
+        clear_virtual_index_factor_cache();
+        let start = Instant::now();
+        let single_second = RecursiveStrongEndToEndProof::deserialize(&payload).unwrap();
+        let single_second_time = start.elapsed();
+        assert_eq!(single_second, proof);
+
+        eprintln!(
+            "single-pass={:.3}/{:.3} ms redundant={:.3}/{:.3} ms proof={} B",
+            single_first_time.as_secs_f64() * 1_000.0,
+            single_second_time.as_secs_f64() * 1_000.0,
+            redundant_first_time.as_secs_f64() * 1_000.0,
+            redundant_second_time.as_secs_f64() * 1_000.0,
+            payload.len(),
+        );
     }
 
     #[test]
