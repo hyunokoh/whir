@@ -1,6 +1,6 @@
 use ark_ff::PrimeField;
 use rayon::prelude::*;
-use std::sync::OnceLock;
+use std::{cell::RefCell, sync::OnceLock};
 
 use crate::algebra::fields::Field192;
 
@@ -42,6 +42,47 @@ fn fixed_blake3_hash_83(first: &[u8; 64], second: &[u8; 64]) -> Digest {
     output[..32].try_into().unwrap()
 }
 
+fn node_blocks(left: Digest, right: Digest) -> ([u8; 64], [u8; 64]) {
+    let mut first = [0_u8; 64];
+    first[..FIELD_NODE_DOMAIN.len()].copy_from_slice(FIELD_NODE_DOMAIN);
+    first[FIELD_NODE_DOMAIN.len()..FIELD_NODE_DOMAIN.len() + 32].copy_from_slice(&left);
+    first[FIELD_NODE_DOMAIN.len() + 32..].copy_from_slice(&right[..13]);
+    let mut second = [0_u8; 64];
+    second[..19].copy_from_slice(&right[13..]);
+    (first, second)
+}
+
+fn parent4(children: &[Digest; 8]) -> [Digest; 4] {
+    let platform = blake3_platform();
+    if platform.simd_degree() < 4 {
+        return std::array::from_fn(|index| parent(children[2 * index], children[2 * index + 1]));
+    }
+    let blocks = std::array::from_fn::<_, 4, _>(|index| {
+        node_blocks(children[2 * index], children[2 * index + 1])
+    });
+    let first = [&blocks[0].0, &blocks[1].0, &blocks[2].0, &blocks[3].0];
+    let mut chaining_values = [0_u8; 4 * 32];
+    platform.hash_many(
+        &first,
+        &BLAKE3_IV,
+        0,
+        blake3::IncrementCounter::No,
+        0,
+        BLAKE3_CHUNK_START,
+        0,
+        &mut chaining_values,
+    );
+    std::array::from_fn(|index| {
+        let bytes = &chaining_values[index * 32..(index + 1) * 32];
+        let cv = std::array::from_fn(|word| {
+            u32::from_le_bytes(bytes[word * 4..(word + 1) * 4].try_into().unwrap())
+        });
+        let output =
+            platform.compress_xof(&cv, &blocks[index].1, 19, 0, BLAKE3_CHUNK_END | BLAKE3_ROOT);
+        output[..32].try_into().unwrap()
+    })
+}
+
 pub fn field_leaf(value: Field192) -> Digest {
     let mut input = [0_u8; 64];
     input[..FIELD_LEAF_DOMAIN.len()].copy_from_slice(FIELD_LEAF_DOMAIN);
@@ -54,13 +95,61 @@ pub fn field_leaf(value: Field192) -> Digest {
 }
 
 pub fn parent(left: Digest, right: Digest) -> Digest {
-    let mut first = [0_u8; 64];
-    first[..FIELD_NODE_DOMAIN.len()].copy_from_slice(FIELD_NODE_DOMAIN);
-    first[FIELD_NODE_DOMAIN.len()..FIELD_NODE_DOMAIN.len() + 32].copy_from_slice(&left);
-    first[FIELD_NODE_DOMAIN.len() + 32..].copy_from_slice(&right[..13]);
-    let mut second = [0_u8; 64];
-    second[..19].copy_from_slice(&right[13..]);
+    let (first, second) = node_blocks(left, right);
     fixed_blake3_hash_83(&first, &second)
+}
+
+thread_local! {
+    static EXACT_ROOT_SCRATCH: RefCell<Vec<Digest>> = const { RefCell::new(Vec::new()) };
+}
+
+fn reduce_exact_digests(scratch: &mut [Digest]) -> Digest {
+    assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
+    let mut active = scratch.len();
+    while active > 1 {
+        let pairs = active / 2;
+        let batched = pairs / 4 * 4;
+        for pair in (0..batched).step_by(4) {
+            let child = 2 * pair;
+            let children = [
+                scratch[child],
+                scratch[child + 1],
+                scratch[child + 2],
+                scratch[child + 3],
+                scratch[child + 4],
+                scratch[child + 5],
+                scratch[child + 6],
+                scratch[child + 7],
+            ];
+            let roots = parent4(&children);
+            scratch[pair..pair + 4].copy_from_slice(&roots);
+        }
+        for pair in batched..pairs {
+            scratch[pair] = parent(scratch[2 * pair], scratch[2 * pair + 1]);
+        }
+        active = pairs;
+    }
+    scratch[0]
+}
+
+fn exact_prefix_root_batched(values: &[Field192]) -> Digest {
+    assert!(values.len() >= 8 && values.len().is_power_of_two());
+    EXACT_ROOT_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        scratch.clear();
+        scratch.extend(values.iter().map(|value| field_leaf(*value)));
+        reduce_exact_digests(&mut scratch)
+    })
+}
+
+fn exact_scaled_prefix_root_batched(values: &[Field192], scale: Field192) -> Digest {
+    assert!(values.len() >= 8 && values.len().is_power_of_two());
+    EXACT_ROOT_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        scratch.clear();
+        scratch.extend(values.iter().map(|value| field_leaf(scale * *value)));
+        reduce_exact_digests(&mut scratch)
+    })
 }
 
 pub fn zero_roots(max_height: usize) -> Vec<Digest> {
@@ -140,6 +229,9 @@ pub fn prefix_root(values: &[Field192], capacity: usize, zeros: &[Digest]) -> Di
     if values.len() >= PARALLEL_MIN_FIELDS {
         return chunked_prefix_root(values, capacity, zeros, CHUNK_FIELDS);
     }
+    if values.len() == capacity && values.len() >= 8 {
+        return exact_prefix_root_batched(values);
+    }
     sequential_prefix_root(values, capacity, zeros)
 }
 
@@ -165,7 +257,13 @@ fn chunked_prefix_root(
     );
     let chunk_roots = values
         .par_chunks(chunk_fields)
-        .map(|chunk| sequential_prefix_root(chunk, chunk_fields, zeros))
+        .map(|chunk| {
+            if chunk.len() == chunk_fields && chunk.len() >= 8 {
+                exact_prefix_root_batched(chunk)
+            } else {
+                sequential_prefix_root(chunk, chunk_fields, zeros)
+            }
+        })
         .collect::<Vec<_>>();
     assert!(chunk_roots.len() * chunk_fields <= capacity);
     let chunk_height = chunk_fields.trailing_zeros() as usize;
@@ -186,6 +284,9 @@ pub fn scaled_prefix_root(
     zeros: &[Digest],
 ) -> Digest {
     assert!(values.len() <= capacity && capacity.is_power_of_two());
+    if values.len() == capacity && values.len() >= 8 {
+        return exact_scaled_prefix_root_batched(values, scale);
+    }
     let mut accumulator = MerkleAccumulator::new(capacity.trailing_zeros() as usize);
     for value in values {
         accumulator.append_leaf(field_leaf(scale * *value));
@@ -256,6 +357,34 @@ mod tests {
     }
 
     #[test]
+    fn four_way_parents_match_scalar_parents() {
+        for batch in 0..1024_u64 {
+            let children = std::array::from_fn(|index| {
+                let value = batch * 8 + index as u64;
+                *blake3::hash(&value.to_le_bytes()).as_bytes()
+            });
+            let batched = parent4(&children);
+            let scalar =
+                std::array::from_fn(|index| parent(children[2 * index], children[2 * index + 1]));
+            assert_eq!(batched, scalar);
+        }
+    }
+
+    #[test]
+    fn exact_batched_roots_match_sequential_roots() {
+        let zeros = zero_roots(12);
+        let values = (0..4096)
+            .map(|index| Field192::from((17 * index + 11) as u64))
+            .collect::<Vec<_>>();
+        for length in [8, 16, 64, 256, 1024, 4096] {
+            assert_eq!(
+                exact_prefix_root_batched(&values[..length]),
+                sequential_prefix_root(&values[..length], length, &zeros)
+            );
+        }
+    }
+
+    #[test]
     fn chunked_prefix_root_matches_sequential_root() {
         let zeros = zero_roots(8);
         let values = (0..128)
@@ -272,7 +401,7 @@ mod tests {
     #[test]
     fn scaled_prefix_root_matches_materialized_row() {
         let zeros = zero_roots(7);
-        let values = (0..73)
+        let values = (0..128)
             .map(|index| Field192::from((3 * index + 5) as u64))
             .collect::<Vec<_>>();
         let scale = Field192::from(17_u64);
@@ -280,9 +409,11 @@ mod tests {
             .iter()
             .map(|value| scale * *value)
             .collect::<Vec<_>>();
-        assert_eq!(
-            scaled_prefix_root(&values, scale, 128, &zeros),
-            sequential_prefix_root(&scaled, 128, &zeros)
-        );
+        for length in [73, 128] {
+            assert_eq!(
+                scaled_prefix_root(&values[..length], scale, 128, &zeros),
+                sequential_prefix_root(&scaled[..length], 128, &zeros)
+            );
+        }
     }
 }
