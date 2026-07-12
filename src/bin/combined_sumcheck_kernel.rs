@@ -390,11 +390,59 @@ fn fold_rank_one_coefficients(
     half
 }
 
+fn finish_rank_one_tensor_product_relation(
+    coefficient: Field192,
+    mut alpha: Vec<Field192>,
+    mut right: Vec<Field192>,
+    width: usize,
+    roots: Vec<Digest>,
+    claimed_sum: Field192,
+    mut pairs: Vec<(Field192, Field192)>,
+    mut claim: Field192,
+    row_variables: usize,
+    variables: usize,
+    fields: usize,
+) -> TensorProductProof {
+    alpha.par_iter_mut().for_each(|value| *value *= coefficient);
+    let left_ood_row = alpha;
+    let right_ood_row = right[..width].to_vec();
+    let mut left = left_ood_row.clone();
+    let mut active_lanes = width;
+    for _ in row_variables..variables {
+        let (constant, quadratic) =
+            compute_sumcheck_polynomial(&left[..active_lanes], &right[..active_lanes]);
+        pairs.push((constant, quadratic));
+        let challenge = transcript_challenge(fields, variables, &roots, claimed_sum, &pairs);
+        let linear = claim - constant.double() - quadratic;
+        let next_left = fold_active(&mut left, active_lanes, challenge);
+        let next_right = fold_active(&mut right, active_lanes, challenge);
+        assert_eq!(next_left, next_right);
+        active_lanes = next_left;
+        claim = (quadratic * challenge + linear) * challenge + constant;
+    }
+    assert_eq!(active_lanes, 1);
+    let proof = PackedSumcheckProof {
+        fields,
+        roots,
+        claimed_sum,
+        pairs,
+        terminal_left: left[0],
+        terminal_right: right[0],
+    };
+    assert!(proof.challenges().is_some());
+    TensorProductProof {
+        proof,
+        left_ood_row,
+        right_ood_row,
+    }
+}
+
 /// Tensor product sumcheck for a public rank-one left matrix
 /// `left[row,lane] = coefficients[row] * alpha[lane]`.  It emits exactly the
 /// same transcript as materializing `left` and calling
 /// [`prove_tensor_product_relation`], while storing and folding only the row
 /// coefficients and the final OOD row.
+#[cfg(test)]
 fn prove_rank_one_left_tensor_product_relation(
     mut coefficients: Vec<Field192>,
     alpha: Vec<Field192>,
@@ -442,42 +490,22 @@ fn prove_rank_one_left_tensor_product_relation(
         claim = (quadratic * challenge + linear) * challenge + constant;
     }
     assert_eq!(active_rows, 1);
-    let mut left_ood_row = alpha;
-    left_ood_row
-        .par_iter_mut()
-        .for_each(|value| *value *= coefficients[0]);
-    let right_ood_row = right[..width].to_vec();
-    let mut left = left_ood_row.clone();
-    let mut active_lanes = width;
-    for _ in row_variables..variables {
-        let (constant, quadratic) =
-            compute_sumcheck_polynomial(&left[..active_lanes], &right[..active_lanes]);
-        pairs.push((constant, quadratic));
-        let challenge = transcript_challenge(fields, variables, &roots, claimed_sum, &pairs);
-        let linear = claim - constant.double() - quadratic;
-        let next_left = fold_active(&mut left, active_lanes, challenge);
-        let next_right = fold_active(&mut right, active_lanes, challenge);
-        assert_eq!(next_left, next_right);
-        active_lanes = next_left;
-        claim = (quadratic * challenge + linear) * challenge + constant;
-    }
-    assert_eq!(active_lanes, 1);
-    let proof = PackedSumcheckProof {
-        fields,
+    finish_rank_one_tensor_product_relation(
+        coefficients[0],
+        alpha,
+        right,
+        width,
         roots,
         claimed_sum,
         pairs,
-        terminal_left: left[0],
-        terminal_right: right[0],
-    };
-    assert!(proof.challenges().is_some());
-    TensorProductProof {
-        proof,
-        left_ood_row,
-        right_ood_row,
-    }
+        claim,
+        row_variables,
+        variables,
+        fields,
+    )
 }
 
+#[cfg(test)]
 fn prove_rank_one_right_tensor_product_relation(
     left: Vec<Field192>,
     coefficients: Vec<Field192>,
@@ -495,6 +523,309 @@ fn prove_rank_one_right_tensor_product_relation(
     std::mem::swap(&mut result.left_ood_row, &mut result.right_ood_row);
     assert!(result.proof.challenges().is_some());
     result
+}
+
+#[cfg(test)]
+fn shared_rank_one_claims(
+    right: &[Field192],
+    membership_coefficients: &[Field192],
+    membership_alpha: &[Field192],
+    evaluation_coefficients: &[Field192],
+    evaluation_alpha: &[Field192],
+    width: usize,
+) -> (Field192, Field192) {
+    right
+        .par_chunks_exact(width)
+        .enumerate()
+        .map(|(row_index, row)| {
+            let mut membership_inner = Field192::ZERO;
+            let mut evaluation_inner = Field192::ZERO;
+            for lane in 0..width {
+                membership_inner += membership_alpha[lane] * row[lane];
+                evaluation_inner += evaluation_alpha[lane] * row[lane];
+            }
+            (
+                membership_coefficients[row_index] * membership_inner,
+                evaluation_coefficients[row_index] * evaluation_inner,
+            )
+        })
+        .reduce(
+            || (Field192::ZERO, Field192::ZERO),
+            |(membership_a, evaluation_a), (membership_b, evaluation_b)| {
+                (membership_a + membership_b, evaluation_a + evaluation_b)
+            },
+        )
+}
+
+fn shared_rank_one_row_round_polynomials(
+    membership_coefficients: &[Field192],
+    membership_alpha: &[Field192],
+    evaluation_coefficients: &[Field192],
+    evaluation_alpha: &[Field192],
+    right: &[Field192],
+    active_rows: usize,
+    width: usize,
+) -> ((Field192, Field192), (Field192, Field192)) {
+    assert!(active_rows.is_power_of_two());
+    let half = active_rows / 2;
+    (0..half)
+        .into_par_iter()
+        .map(|row| {
+            let low_start = row * width;
+            let high_start = (half + row) * width;
+            let mut membership_low = Field192::ZERO;
+            let mut membership_difference = Field192::ZERO;
+            let mut evaluation_low = Field192::ZERO;
+            let mut evaluation_difference = Field192::ZERO;
+            for lane in 0..width {
+                let low = right[low_start + lane];
+                let difference = right[high_start + lane] - low;
+                membership_low += membership_alpha[lane] * low;
+                membership_difference += membership_alpha[lane] * difference;
+                evaluation_low += evaluation_alpha[lane] * low;
+                evaluation_difference += evaluation_alpha[lane] * difference;
+            }
+            (
+                (
+                    membership_coefficients[row] * membership_low,
+                    (membership_coefficients[half + row] - membership_coefficients[row])
+                        * membership_difference,
+                ),
+                (
+                    evaluation_coefficients[row] * evaluation_low,
+                    (evaluation_coefficients[half + row] - evaluation_coefficients[row])
+                        * evaluation_difference,
+                ),
+            )
+        })
+        .reduce(
+            || {
+                (
+                    (Field192::ZERO, Field192::ZERO),
+                    (Field192::ZERO, Field192::ZERO),
+                )
+            },
+            |((mc_a, mq_a), (ec_a, eq_a)), ((mc_b, mq_b), (ec_b, eq_b))| {
+                ((mc_a + mc_b, mq_a + mq_b), (ec_a + ec_b, eq_a + eq_b))
+            },
+        )
+}
+
+fn fold_tensor_rows_to_vec(
+    values: &[Field192],
+    active_rows: usize,
+    width: usize,
+    challenge: Field192,
+) -> Vec<Field192> {
+    assert!(active_rows.is_power_of_two());
+    assert!(values.len() >= active_rows * width);
+    let half_fields = active_rows / 2 * width;
+    (0..half_fields)
+        .into_par_iter()
+        .map(|index| {
+            let low = values[index];
+            low + (values[half_fields + index] - low) * challenge
+        })
+        .collect()
+}
+
+/// Produce the membership and evaluation sumchecks from one shared codeword.
+/// The first row round scans the common matrix once. After both transcript
+/// challenges are known, the evaluation state branches into a half-size
+/// buffer while the membership state folds the original allocation in place.
+fn prove_dual_rank_one_tensor_product_relations(
+    mut membership_coefficients: Vec<Field192>,
+    membership_alpha: Vec<Field192>,
+    mut right: Vec<Field192>,
+    mut evaluation_coefficients: Vec<Field192>,
+    evaluation_alpha: Vec<Field192>,
+    rows: usize,
+    width: usize,
+    membership_roots: Vec<Digest>,
+    evaluation_roots: Vec<Digest>,
+    membership_claimed_sum: Field192,
+    evaluation_claimed_sum: Field192,
+) -> (TensorProductProof, TensorProductProof) {
+    assert!(
+        rows > 1
+            && width > 1
+            && rows.is_power_of_two()
+            && width.is_power_of_two()
+            && membership_coefficients.len() == rows
+            && membership_alpha.len() == width
+            && evaluation_coefficients.len() == rows
+            && evaluation_alpha.len() == width
+            && right.len() == rows * width
+    );
+    #[cfg(test)]
+    assert_eq!(
+        shared_rank_one_claims(
+            &right,
+            &membership_coefficients,
+            &membership_alpha,
+            &evaluation_coefficients,
+            &evaluation_alpha,
+            width,
+        ),
+        (membership_claimed_sum, evaluation_claimed_sum)
+    );
+    let fields = rows * width;
+    let variables = fields.trailing_zeros() as usize;
+    let row_variables = rows.trailing_zeros() as usize;
+    let mut membership_claim = membership_claimed_sum;
+    let mut evaluation_claim = evaluation_claimed_sum;
+    let mut membership_pairs = Vec::with_capacity(variables);
+    let mut evaluation_pairs = Vec::with_capacity(variables);
+
+    let ((membership_constant, membership_quadratic), (evaluation_constant, evaluation_quadratic)) =
+        shared_rank_one_row_round_polynomials(
+            &membership_coefficients,
+            &membership_alpha,
+            &evaluation_coefficients,
+            &evaluation_alpha,
+            &right,
+            rows,
+            width,
+        );
+    membership_pairs.push((membership_constant, membership_quadratic));
+    evaluation_pairs.push((evaluation_constant, evaluation_quadratic));
+    let membership_challenge = transcript_challenge(
+        fields,
+        variables,
+        &membership_roots,
+        membership_claimed_sum,
+        &membership_pairs,
+    );
+    let evaluation_challenge = transcript_challenge(
+        fields,
+        variables,
+        &evaluation_roots,
+        evaluation_claimed_sum,
+        &evaluation_pairs,
+    );
+    let membership_linear = membership_claim - membership_constant.double() - membership_quadratic;
+    let evaluation_linear = evaluation_claim - evaluation_constant.double() - evaluation_quadratic;
+    let mut evaluation_right = fold_tensor_rows_to_vec(&right, rows, width, evaluation_challenge);
+    let membership_rows =
+        fold_rank_one_coefficients(&mut membership_coefficients, rows, membership_challenge);
+    let evaluation_rows =
+        fold_rank_one_coefficients(&mut evaluation_coefficients, rows, evaluation_challenge);
+    assert_eq!(membership_rows, evaluation_rows);
+    assert_eq!(
+        fold_tensor_rows(&mut right, rows, width, membership_challenge),
+        membership_rows
+    );
+    membership_claim = (membership_quadratic * membership_challenge + membership_linear)
+        * membership_challenge
+        + membership_constant;
+    evaluation_claim = (evaluation_quadratic * evaluation_challenge + evaluation_linear)
+        * evaluation_challenge
+        + evaluation_constant;
+
+    let mut active_rows = membership_rows;
+    for _ in 1..row_variables {
+        let (membership_constant, membership_quadratic) = rank_one_left_row_round_polynomial(
+            &membership_coefficients,
+            &membership_alpha,
+            &right,
+            active_rows,
+            width,
+        );
+        let (evaluation_constant, evaluation_quadratic) = rank_one_left_row_round_polynomial(
+            &evaluation_coefficients,
+            &evaluation_alpha,
+            &evaluation_right,
+            active_rows,
+            width,
+        );
+        membership_pairs.push((membership_constant, membership_quadratic));
+        evaluation_pairs.push((evaluation_constant, evaluation_quadratic));
+        let membership_challenge = transcript_challenge(
+            fields,
+            variables,
+            &membership_roots,
+            membership_claimed_sum,
+            &membership_pairs,
+        );
+        let evaluation_challenge = transcript_challenge(
+            fields,
+            variables,
+            &evaluation_roots,
+            evaluation_claimed_sum,
+            &evaluation_pairs,
+        );
+        let membership_linear =
+            membership_claim - membership_constant.double() - membership_quadratic;
+        let evaluation_linear =
+            evaluation_claim - evaluation_constant.double() - evaluation_quadratic;
+        let next_membership_rows = fold_rank_one_coefficients(
+            &mut membership_coefficients,
+            active_rows,
+            membership_challenge,
+        );
+        let next_evaluation_rows = fold_rank_one_coefficients(
+            &mut evaluation_coefficients,
+            active_rows,
+            evaluation_challenge,
+        );
+        assert_eq!(next_membership_rows, next_evaluation_rows);
+        assert_eq!(
+            fold_tensor_rows(&mut right, active_rows, width, membership_challenge),
+            next_membership_rows
+        );
+        assert_eq!(
+            fold_tensor_rows(
+                &mut evaluation_right,
+                active_rows,
+                width,
+                evaluation_challenge,
+            ),
+            next_evaluation_rows
+        );
+        active_rows = next_membership_rows;
+        membership_claim = (membership_quadratic * membership_challenge + membership_linear)
+            * membership_challenge
+            + membership_constant;
+        evaluation_claim = (evaluation_quadratic * evaluation_challenge + evaluation_linear)
+            * evaluation_challenge
+            + evaluation_constant;
+    }
+    assert_eq!(active_rows, 1);
+
+    let membership = finish_rank_one_tensor_product_relation(
+        membership_coefficients[0],
+        membership_alpha,
+        right,
+        width,
+        membership_roots,
+        membership_claimed_sum,
+        membership_pairs,
+        membership_claim,
+        row_variables,
+        variables,
+        fields,
+    );
+    let mut evaluation = finish_rank_one_tensor_product_relation(
+        evaluation_coefficients[0],
+        evaluation_alpha,
+        evaluation_right,
+        width,
+        evaluation_roots,
+        evaluation_claimed_sum,
+        evaluation_pairs,
+        evaluation_claim,
+        row_variables,
+        variables,
+        fields,
+    );
+    std::mem::swap(
+        &mut evaluation.proof.terminal_left,
+        &mut evaluation.proof.terminal_right,
+    );
+    std::mem::swap(&mut evaluation.left_ood_row, &mut evaluation.right_ood_row);
+    assert!(membership.proof.challenges().is_some());
+    assert!(evaluation.proof.challenges().is_some());
+    (membership, evaluation)
 }
 
 fn local_relation_roots(relation: &[u8], level: usize, transcript_roots: &[Digest]) -> Vec<Digest> {
@@ -2390,26 +2721,23 @@ fn run_production_carryopen(verifier_repetitions: usize) -> CarryOpenMeasurement
     let encode_and_commit = start.elapsed();
 
     let start = Instant::now();
-    let membership_result = prove_rank_one_left_tensor_product_relation(
-        index_coefficients,
-        index_alpha,
-        proof_codeword.clone(),
-        CARRYOPEN_INVERSE_RATE * CARRYOPEN_ROWS,
-        CARRYOPEN_WIDTH,
-        local_relation_roots(b"CarryOpen-QA-membership", 10, &component_roots),
-    );
     let terminal_point = precarry.sumcheck.challenges().unwrap();
     let row_weights = equality_weights(&terminal_point[..16]);
     let column_weights = equality_weights(&terminal_point[16..]);
     let mut evaluation_coefficients = vec![Field192::ZERO; CARRYOPEN_INVERSE_RATE * CARRYOPEN_ROWS];
     evaluation_coefficients[..CARRYOPEN_ROWS].copy_from_slice(&row_weights);
-    let evaluation_result = prove_rank_one_right_tensor_product_relation(
+    let (membership_result, evaluation_result) = prove_dual_rank_one_tensor_product_relations(
+        index_coefficients,
+        index_alpha,
         proof_codeword,
         evaluation_coefficients,
         column_weights,
         CARRYOPEN_INVERSE_RATE * CARRYOPEN_ROWS,
         CARRYOPEN_WIDTH,
+        local_relation_roots(b"CarryOpen-QA-membership", 10, &component_roots),
         local_relation_roots(b"CarryOpen-evaluation", 10, &component_roots),
+        Field192::ZERO,
+        precarry.sumcheck.terminal_left,
     );
     assert_eq!(
         evaluation_result.proof.claimed_sum,
@@ -6844,6 +7172,82 @@ mod tests {
         assert_eq!(
             rank_one_right.right_ood_row,
             materialized_right.right_ood_row
+        );
+    }
+
+    #[test]
+    fn fused_dual_rank_one_sumchecks_match_independent_transcripts() {
+        let rows = 8;
+        let width = 4;
+        let membership_coefficients = (0..rows)
+            .map(|index| Field192::from((3 * index + 1) as u64))
+            .collect::<Vec<_>>();
+        let membership_alpha = (0..width)
+            .map(|index| Field192::from((5 * index + 2) as u64))
+            .collect::<Vec<_>>();
+        let evaluation_coefficients = (0..rows)
+            .map(|index| Field192::from((7 * index + 4) as u64))
+            .collect::<Vec<_>>();
+        let evaluation_alpha = (0..width)
+            .map(|index| Field192::from((11 * index + 6) as u64))
+            .collect::<Vec<_>>();
+        let shared = (0..rows * width).map(right_value).collect::<Vec<_>>();
+        let membership_roots = local_relation_roots(b"dual-membership", 0, &[[7_u8; 32]]);
+        let evaluation_roots = local_relation_roots(b"dual-evaluation", 0, &[[8_u8; 32]]);
+        let legacy_membership = prove_rank_one_left_tensor_product_relation(
+            membership_coefficients.clone(),
+            membership_alpha.clone(),
+            shared.clone(),
+            rows,
+            width,
+            membership_roots.clone(),
+        );
+        let legacy_evaluation = prove_rank_one_right_tensor_product_relation(
+            shared.clone(),
+            evaluation_coefficients.clone(),
+            evaluation_alpha.clone(),
+            rows,
+            width,
+            evaluation_roots.clone(),
+        );
+        let (fused_membership, fused_evaluation) = prove_dual_rank_one_tensor_product_relations(
+            membership_coefficients,
+            membership_alpha,
+            shared,
+            evaluation_coefficients,
+            evaluation_alpha,
+            rows,
+            width,
+            membership_roots,
+            evaluation_roots,
+            legacy_membership.proof.claimed_sum,
+            legacy_evaluation.proof.claimed_sum,
+        );
+        assert_eq!(fused_membership.proof, legacy_membership.proof);
+        assert_eq!(
+            fused_membership.proof.serialize(),
+            legacy_membership.proof.serialize()
+        );
+        assert_eq!(
+            fused_membership.left_ood_row,
+            legacy_membership.left_ood_row
+        );
+        assert_eq!(
+            fused_membership.right_ood_row,
+            legacy_membership.right_ood_row
+        );
+        assert_eq!(fused_evaluation.proof, legacy_evaluation.proof);
+        assert_eq!(
+            fused_evaluation.proof.serialize(),
+            legacy_evaluation.proof.serialize()
+        );
+        assert_eq!(
+            fused_evaluation.left_ood_row,
+            legacy_evaluation.left_ood_row
+        );
+        assert_eq!(
+            fused_evaluation.right_ood_row,
+            legacy_evaluation.right_ood_row
         );
     }
 
