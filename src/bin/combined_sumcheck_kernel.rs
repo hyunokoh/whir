@@ -3688,6 +3688,55 @@ fn populate_parity_from_systematic(
     spectra: &[Vec<Field192>],
     batch_lanes: usize,
 ) {
+    populate_parity_from_systematic_with_scatter_tile(
+        level,
+        proof_codeword,
+        spectra,
+        batch_lanes,
+        Some((64, 4)),
+    );
+}
+
+fn scatter_parity_block_blocked(
+    target: &mut [Field192],
+    width: usize,
+    lane_start: usize,
+    encoded: &[Vec<Vec<Field192>>],
+    parity_block: usize,
+    row_block: usize,
+    lane_tile: usize,
+) {
+    assert!(width > 0 && row_block > 0 && lane_tile > 0);
+    assert_eq!(target.len() % width, 0);
+    assert!(lane_start + encoded.len() <= width);
+    let rows = target.len() / width;
+    assert!(encoded.iter().all(|lane| lane
+        .get(parity_block)
+        .is_some_and(|values| values.len() == rows)));
+    target
+        .par_chunks_mut(width * row_block)
+        .enumerate()
+        .for_each(|(block, target_rows)| {
+            let row_start = block * row_block;
+            for offset_start in (0..encoded.len()).step_by(lane_tile) {
+                let offset_end = (offset_start + lane_tile).min(encoded.len());
+                for (local_row, target_row) in target_rows.chunks_exact_mut(width).enumerate() {
+                    let row = row_start + local_row;
+                    for offset in offset_start..offset_end {
+                        target_row[lane_start + offset] = encoded[offset][parity_block][row];
+                    }
+                }
+            }
+        });
+}
+
+fn populate_parity_from_systematic_with_scatter_tile(
+    level: Level,
+    proof_codeword: &mut [Field192],
+    spectra: &[Vec<Field192>],
+    batch_lanes: usize,
+    scatter_tile: Option<(usize, usize)>,
+) {
     assert_eq!(proof_codeword.len(), level.qa_fields());
     assert_eq!(spectra.len(), level.inverse_rate - 1);
     let systematic_fields = level.group * level.width;
@@ -3708,7 +3757,22 @@ fn populate_parity_from_systematic(
         };
         for parity_block in 0..level.inverse_rate - 1 {
             let start = (parity_block + 1) * systematic_fields;
-            proof_codeword[start..start + systematic_fields]
+            let target = &mut proof_codeword[start..start + systematic_fields];
+            if level.group == CARRYOPEN_ROWS {
+                if let Some((row_block, lane_tile)) = scatter_tile {
+                    scatter_parity_block_blocked(
+                        target,
+                        level.width,
+                        lane_start,
+                        &encoded,
+                        parity_block,
+                        row_block,
+                        lane_tile,
+                    );
+                    continue;
+                }
+            }
+            target
                 .par_chunks_mut(level.width)
                 .enumerate()
                 .for_each(|(row, target)| {
@@ -8214,6 +8278,45 @@ mod tests {
     }
 
     #[test]
+    fn blocked_parity_scatter_matches_row_scatter() {
+        let rows = 37;
+        let width = 13;
+        let lane_start = 3;
+        let lanes = 7;
+        let parity_blocks = 3;
+        let encoded = (0..lanes)
+            .map(|lane| {
+                (0..parity_blocks)
+                    .map(|parity| {
+                        (0..rows)
+                            .map(|row| Field192::from((1 + lane + 17 * parity + 101 * row) as u64))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for parity_block in 0..parity_blocks {
+            let mut expected = vec![Field192::ZERO; rows * width];
+            for row in 0..rows {
+                for (offset, lane) in encoded.iter().enumerate() {
+                    expected[row * width + lane_start + offset] = lane[parity_block][row];
+                }
+            }
+            let mut blocked = vec![Field192::ZERO; rows * width];
+            scatter_parity_block_blocked(
+                &mut blocked,
+                width,
+                lane_start,
+                &encoded,
+                parity_block,
+                8,
+                3,
+            );
+            assert_eq!(blocked, expected);
+        }
+    }
+
+    #[test]
     fn fixed_generator_preprocessing_matches_direct_spectra() {
         assert_eq!(canonical_verifier_fixed_generator_fields(), 252_160);
         for (level_index, level) in LEVELS
@@ -8485,6 +8588,193 @@ mod tests {
             "production-last-parity-reuse reused-ms={reused_ms:?} cloned-ms={cloned_ms:?} reused-median={:.3} cloned-median={:.3}",
             median(&reused_ms),
             median(&cloned_ms),
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale vertical lane-batch sweep"]
+    fn vertical_lane_batch_sweep() {
+        let level = carryopen_level();
+        let spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let mut codeword = Vec::with_capacity(level.qa_fields());
+        codeword.extend((0..CARRYOPEN_FIELDS).map(precarry_message_value));
+        codeword.resize(level.qa_fields(), Field192::ZERO);
+        let sample_step = CARRYOPEN_WIDTH * CARRYOPEN_ROWS / 64;
+        let batch_sizes = [8_usize, 10, 12, 16, 20, 24, 32, 48, 64, 96];
+        let mut measurements = BTreeMap::<usize, Vec<f64>>::new();
+        let mut expected_samples = None;
+        for order in [
+            batch_sizes.to_vec(),
+            batch_sizes.into_iter().rev().collect(),
+        ] {
+            for batch_lanes in order {
+                let start = Instant::now();
+                populate_parity_from_systematic(level, &mut codeword, &spectra, batch_lanes);
+                let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+                let samples = codeword
+                    .iter()
+                    .step_by(sample_step)
+                    .copied()
+                    .collect::<Vec<_>>();
+                if let Some(expected) = &expected_samples {
+                    assert_eq!(&samples, expected);
+                } else {
+                    expected_samples = Some(samples);
+                }
+                measurements.entry(batch_lanes).or_default().push(elapsed);
+            }
+        }
+        for (batch_lanes, samples) in measurements {
+            let mut sorted = samples.clone();
+            sorted.sort_by(f64::total_cmp);
+            let median = (sorted[0] + sorted[1]) / 2.0;
+            let live_mib = batch_lanes
+                * (CARRYOPEN_INVERSE_RATE - 1)
+                * CARRYOPEN_ROWS
+                * std::mem::size_of::<Field192>();
+            eprintln!(
+                "vertical-lane-batch lanes={batch_lanes} live-scratch-mib={:.1} samples-ms={samples:?} midpoint-ms={median:.3}",
+                live_mib as f64 / (1_u64 << 20) as f64,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "production-scale blocked vertical scatter sweep"]
+    fn blocked_vertical_scatter_sweep() {
+        let level = carryopen_level();
+        let spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let mut codeword = Vec::with_capacity(level.qa_fields());
+        codeword.extend((0..CARRYOPEN_FIELDS).map(precarry_message_value));
+        codeword.resize(level.qa_fields(), Field192::ZERO);
+        let sample_step = CARRYOPEN_WIDTH * CARRYOPEN_ROWS / 64;
+        let tiles = [
+            (0_usize, 0_usize),
+            (64, 4),
+            (64, 8),
+            (256, 4),
+            (256, 8),
+            (256, 16),
+            (1024, 8),
+        ];
+        let mut measurements = BTreeMap::<(usize, usize), Vec<f64>>::new();
+        let mut expected_samples = None;
+        for order in [tiles.to_vec(), tiles.into_iter().rev().collect()] {
+            for tile in order {
+                let scatter_tile = (tile != (0, 0)).then_some(tile);
+                let start = Instant::now();
+                populate_parity_from_systematic_with_scatter_tile(
+                    level,
+                    &mut codeword,
+                    &spectra,
+                    64,
+                    scatter_tile,
+                );
+                let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+                let samples = codeword
+                    .iter()
+                    .step_by(sample_step)
+                    .copied()
+                    .collect::<Vec<_>>();
+                if let Some(expected) = &expected_samples {
+                    assert_eq!(&samples, expected);
+                } else {
+                    expected_samples = Some(samples);
+                }
+                measurements.entry(tile).or_default().push(elapsed);
+            }
+        }
+        for (tile, samples) in measurements {
+            let mut sorted = samples.clone();
+            sorted.sort_by(f64::total_cmp);
+            let midpoint = (sorted[0] + sorted[1]) / 2.0;
+            eprintln!(
+                "vertical-scatter-tile rows={} lanes={} samples-ms={samples:?} midpoint-ms={midpoint:.3}",
+                tile.0, tile.1,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "production-scale 64-row four-lane blocked scatter crossed A/B"]
+    fn blocked_vertical_scatter_benchmarks_row_scatter() {
+        let level = carryopen_level();
+        let spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let mut codeword = Vec::with_capacity(level.qa_fields());
+        codeword.extend((0..CARRYOPEN_FIELDS).map(precarry_message_value));
+        codeword.resize(level.qa_fields(), Field192::ZERO);
+        let sample_step = CARRYOPEN_WIDTH * CARRYOPEN_ROWS / 64;
+        let mut blocked_ms = Vec::new();
+        let mut rows_ms = Vec::new();
+        let mut expected_samples = None;
+        populate_parity_from_systematic_with_scatter_tile(
+            level,
+            &mut codeword,
+            &spectra,
+            64,
+            Some((64, 4)),
+        );
+        let expected_codeword = codeword.clone();
+        populate_parity_from_systematic_with_scatter_tile(level, &mut codeword, &spectra, 64, None);
+        assert_eq!(codeword, expected_codeword);
+        drop(expected_codeword);
+        let mut run = |scatter_tile: Option<(usize, usize)>| {
+            let start = Instant::now();
+            populate_parity_from_systematic_with_scatter_tile(
+                level,
+                &mut codeword,
+                &spectra,
+                64,
+                scatter_tile,
+            );
+            let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+            let samples = codeword
+                .iter()
+                .step_by(sample_step)
+                .copied()
+                .collect::<Vec<_>>();
+            if let Some(expected) = &expected_samples {
+                assert_eq!(&samples, expected);
+            } else {
+                expected_samples = Some(samples);
+            }
+            elapsed
+        };
+        for trial in 0..9 {
+            if trial % 2 == 0 {
+                blocked_ms.push(run(Some((64, 4))));
+                rows_ms.push(run(None));
+                rows_ms.push(run(None));
+                blocked_ms.push(run(Some((64, 4))));
+            } else {
+                rows_ms.push(run(None));
+                blocked_ms.push(run(Some((64, 4))));
+                blocked_ms.push(run(Some((64, 4))));
+                rows_ms.push(run(None));
+            }
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        let trim_two = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[2..sorted.len() - 2].iter().sum::<f64>() / (sorted.len() - 4) as f64
+        };
+        eprintln!(
+            "blocked-vertical-scatter blocked-ms={blocked_ms:?} rows-ms={rows_ms:?} blocked-median={:.3} rows-median={:.3} blocked-trim2={:.3} rows-trim2={:.3}",
+            median(&blocked_ms),
+            median(&rows_ms),
+            trim_two(&blocked_ms),
+            trim_two(&rows_ms),
         );
     }
 
