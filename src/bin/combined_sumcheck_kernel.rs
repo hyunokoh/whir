@@ -1264,6 +1264,43 @@ fn equality_weights(point: &[Field192]) -> Vec<Field192> {
     weights
 }
 
+/// Return the canonical leading equality-table entries without expanding the
+/// unused suffix. The recursive order is identical to `equality_weights`:
+/// each coordinate's zero branch precedes its one branch.
+fn equality_weights_prefix(point: &[Field192], length: usize) -> Vec<Field192> {
+    let domain = 1usize << point.len();
+    assert!(length <= domain);
+    fn append_prefix(
+        point: &[Field192],
+        weight: Field192,
+        length: usize,
+        output: &mut Vec<Field192>,
+    ) {
+        if length == 0 {
+            return;
+        }
+        if point.is_empty() {
+            output.push(weight);
+            return;
+        }
+        let half = 1usize << (point.len() - 1);
+        let low = length.min(half);
+        append_prefix(
+            &point[1..],
+            weight * (Field192::ONE - point[0]),
+            low,
+            output,
+        );
+        if length > half {
+            append_prefix(&point[1..], weight * point[0], length - half, output);
+        }
+    }
+    let mut output = Vec::with_capacity(length);
+    append_prefix(point, Field192::ONE, length, &mut output);
+    assert_eq!(output.len(), length);
+    output
+}
+
 const CARRYOPEN_ROWS: usize = 1 << 16;
 const CARRYOPEN_WIDTH: usize = 1 << 8;
 const CARRYOPEN_FIELDS: usize = CARRYOPEN_ROWS * CARRYOPEN_WIDTH;
@@ -3710,11 +3747,59 @@ fn index_oracle_factors(
             .map(|index| semantic_challenge(b"qa-row", level_index, index, transcript_roots))
             .collect::<Vec<_>>(),
     );
-    let alpha = equality_weights(
-        &(0..level.group.trailing_zeros() as usize)
-            .map(|index| semantic_challenge(b"qa-lane", level_index, index, transcript_roots))
+    let alpha_point = (0..level.group.trailing_zeros() as usize)
+        .map(|index| semantic_challenge(b"qa-lane", level_index, index, transcript_roots))
+        .collect::<Vec<_>>();
+    let alpha = equality_weights_prefix(&alpha_point, level.width);
+    let transformed_parity = spectra
+        .par_iter()
+        .enumerate()
+        .map(|(block, spectrum)| {
+            let start = (block + 1) * level.group;
+            let mut transformed = beta[start..start + level.group].to_vec();
+            apply_encoder(&mut transformed, spectrum);
+            transformed
+        })
+        .collect::<Vec<_>>();
+    let mut message_weights = beta[..level.group].to_vec();
+    message_weights
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(row, target)| {
+            for transformed in &transformed_parity {
+                *target += transformed[row];
+            }
+        });
+    let coefficients = (0..codeword_rows)
+        .map(|row| {
+            if row < level.group {
+                beta[row] - message_weights[row]
+            } else {
+                beta[row]
+            }
+        })
+        .collect();
+    (coefficients, alpha)
+}
+
+#[cfg(test)]
+fn index_oracle_factors_sequential_parity_for_benchmark(
+    level_index: usize,
+    level: Level,
+    spectra: &[Vec<Field192>],
+    transcript_roots: &[Digest],
+) -> (Vec<Field192>, Vec<Field192>) {
+    let codeword_rows = level.inverse_rate * level.group;
+    let position_domain = codeword_rows.next_power_of_two();
+    let beta = equality_weights(
+        &(0..position_domain.trailing_zeros() as usize)
+            .map(|index| semantic_challenge(b"qa-row", level_index, index, transcript_roots))
             .collect::<Vec<_>>(),
     );
+    let alpha_point = (0..level.group.trailing_zeros() as usize)
+        .map(|index| semantic_challenge(b"qa-lane", level_index, index, transcript_roots))
+        .collect::<Vec<_>>();
+    let alpha = equality_weights_prefix(&alpha_point, level.width);
     let mut message_weights = beta[..level.group].to_vec();
     for (block, spectrum) in spectra.iter().enumerate() {
         let start = (block + 1) * level.group;
@@ -3734,7 +3819,7 @@ fn index_oracle_factors(
             }
         })
         .collect();
-    (coefficients, alpha[..level.width].to_vec())
+    (coefficients, alpha)
 }
 
 fn virtual_index_descriptor(
@@ -8012,6 +8097,82 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn equality_weight_prefix_matches_full_table() {
+        let point = (0..16)
+            .map(|index| fixed_challenge(b"equality-prefix-test", 0, index))
+            .collect::<Vec<_>>();
+        let full = equality_weights(&point);
+        for length in [0, 1, 7, 8, 255, 256, 583, 823, 1369, 2438, 65536] {
+            assert_eq!(equality_weights_prefix(&point, length), full[..length]);
+        }
+    }
+
+    #[test]
+    #[ignore = "production CarryOpen parallel-versus-sequential factor benchmark"]
+    fn parallel_parity_factors_benchmark_sequential_carryopen() {
+        let level = carryopen_level();
+        let spectra = fixed_generator_spectra(10, level);
+        let roots = (0..2 * level.inverse_rate)
+            .map(|index| {
+                *blake3::hash(
+                    &[
+                        b"LiLAC/factor-benchmark/v1".as_slice(),
+                        &index.to_le_bytes(),
+                    ]
+                    .concat(),
+                )
+                .as_bytes()
+            })
+            .collect::<Vec<_>>();
+        let parallel = || index_oracle_factors(10, level, spectra.as_ref(), &roots);
+        let sequential = || {
+            index_oracle_factors_sequential_parity_for_benchmark(
+                10,
+                level,
+                spectra.as_ref(),
+                &roots,
+            )
+        };
+        let expected = sequential();
+        assert_eq!(parallel(), expected);
+
+        let mut parallel_ms = Vec::with_capacity(8);
+        let mut sequential_ms = Vec::with_capacity(8);
+        for trial in 0..4 {
+            let order = if trial % 2 == 0 {
+                [true, false, false, true]
+            } else {
+                [false, true, true, false]
+            };
+            for is_parallel in order {
+                let start = Instant::now();
+                let factors = std::hint::black_box(if is_parallel {
+                    parallel()
+                } else {
+                    sequential()
+                });
+                let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+                assert_eq!(factors, expected);
+                if is_parallel {
+                    parallel_ms.push(elapsed);
+                } else {
+                    sequential_ms.push(elapsed);
+                }
+            }
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        eprintln!(
+            "carryopen-index-factors parallel-ms={parallel_ms:?} sequential-ms={sequential_ms:?} parallel-median={:.3} sequential-median={:.3}",
+            median(&parallel_ms),
+            median(&sequential_ms),
+        );
     }
 
     #[test]
