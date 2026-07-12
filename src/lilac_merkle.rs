@@ -9,11 +9,155 @@ pub type Digest = [u8; 32];
 const FIELD_LEAF_DOMAIN: &[u8; 19] = b"LiLAC/field-leaf/v1";
 const FIELD_NODE_DOMAIN: &[u8; 19] = b"LiLAC/field-node/v1";
 const BLAKE3_IV: [u32; 8] = [
-    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+    0x6A09_E667,
+    0xBB67_AE85,
+    0x3C6E_F372,
+    0xA54F_F53A,
+    0x510E_527F,
+    0x9B05_688C,
+    0x1F83_D9AB,
+    0x5BE0_CD19,
 ];
 const BLAKE3_CHUNK_START: u8 = 1 << 0;
 const BLAKE3_CHUNK_END: u8 = 1 << 1;
 const BLAKE3_ROOT: u8 = 1 << 3;
+const PARALLEL_MIN_FIELDS: usize = 1 << 18;
+const CHUNK_FIELDS: usize = 1 << 12;
+const BLAKE3_MSG_SCHEDULE: [[usize; 16]; 7] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+    [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+    [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+    [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+    [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+    [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+];
+
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::inline_always)] // Preserve one vectorized compression body in this hot path.
+mod neon4 {
+    use super::{Digest, BLAKE3_IV, BLAKE3_MSG_SCHEDULE};
+    use core::arch::aarch64::{
+        uint32x4_t, vaddq_u32, vdupq_n_u32, veorq_u32, vld1q_u32, vorrq_u32, vshlq_n_u32,
+        vshrq_n_u32, vst1q_u32,
+    };
+
+    #[inline(always)]
+    unsafe fn set4(a: u32, b: u32, c: u32, d: u32) -> uint32x4_t {
+        let words = [a, b, c, d];
+        unsafe { vld1q_u32(words.as_ptr()) }
+    }
+
+    #[inline(always)]
+    unsafe fn rotr16(value: uint32x4_t) -> uint32x4_t {
+        unsafe { vorrq_u32(vshrq_n_u32::<16>(value), vshlq_n_u32::<16>(value)) }
+    }
+
+    #[inline(always)]
+    unsafe fn rotr12(value: uint32x4_t) -> uint32x4_t {
+        unsafe { vorrq_u32(vshrq_n_u32::<12>(value), vshlq_n_u32::<20>(value)) }
+    }
+
+    #[inline(always)]
+    unsafe fn rotr8(value: uint32x4_t) -> uint32x4_t {
+        unsafe { vorrq_u32(vshrq_n_u32::<8>(value), vshlq_n_u32::<24>(value)) }
+    }
+
+    #[inline(always)]
+    unsafe fn rotr7(value: uint32x4_t) -> uint32x4_t {
+        unsafe { vorrq_u32(vshrq_n_u32::<7>(value), vshlq_n_u32::<25>(value)) }
+    }
+
+    #[inline(always)]
+    unsafe fn g(
+        state: &mut [uint32x4_t; 16],
+        a: usize,
+        b: usize,
+        c: usize,
+        d: usize,
+        x: uint32x4_t,
+        y: uint32x4_t,
+    ) {
+        let mut va = state[a];
+        let mut vb = state[b];
+        let mut vc = state[c];
+        let mut vd = state[d];
+        unsafe {
+            va = vaddq_u32(vaddq_u32(va, vb), x);
+            vd = rotr16(veorq_u32(vd, va));
+            vc = vaddq_u32(vc, vd);
+            vb = rotr12(veorq_u32(vb, vc));
+            va = vaddq_u32(vaddq_u32(va, vb), y);
+            vd = rotr8(veorq_u32(vd, va));
+            vc = vaddq_u32(vc, vd);
+            vb = rotr7(veorq_u32(vb, vc));
+        }
+        state[a] = va;
+        state[b] = vb;
+        state[c] = vc;
+        state[d] = vd;
+    }
+
+    #[inline(always)]
+    unsafe fn round(state: &mut [uint32x4_t; 16], message: &[uint32x4_t; 16], round: usize) {
+        let s = BLAKE3_MSG_SCHEDULE[round];
+        unsafe {
+            g(state, 0, 4, 8, 12, message[s[0]], message[s[1]]);
+            g(state, 1, 5, 9, 13, message[s[2]], message[s[3]]);
+            g(state, 2, 6, 10, 14, message[s[4]], message[s[5]]);
+            g(state, 3, 7, 11, 15, message[s[6]], message[s[7]]);
+            g(state, 0, 5, 10, 15, message[s[8]], message[s[9]]);
+            g(state, 1, 6, 11, 12, message[s[10]], message[s[11]]);
+            g(state, 2, 7, 8, 13, message[s[12]], message[s[13]]);
+            g(state, 3, 4, 9, 14, message[s[14]], message[s[15]]);
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_xof32(
+        cvs: &[[u32; 8]; 4],
+        blocks: &[[u8; 64]; 4],
+        block_len: u8,
+        flags: u8,
+    ) -> [Digest; 4] {
+        let mut message = [vdupq_n_u32(0); 16];
+        for (word, message_word) in message.iter_mut().enumerate() {
+            let offset = 4 * word;
+            *message_word = unsafe {
+                set4(
+                    u32::from_le_bytes(blocks[0][offset..offset + 4].try_into().unwrap()),
+                    u32::from_le_bytes(blocks[1][offset..offset + 4].try_into().unwrap()),
+                    u32::from_le_bytes(blocks[2][offset..offset + 4].try_into().unwrap()),
+                    u32::from_le_bytes(blocks[3][offset..offset + 4].try_into().unwrap()),
+                )
+            };
+        }
+        let mut state = [vdupq_n_u32(0); 16];
+        for word in 0..8 {
+            state[word] = unsafe { set4(cvs[0][word], cvs[1][word], cvs[2][word], cvs[3][word]) };
+        }
+        for word in 0..4 {
+            state[8 + word] = vdupq_n_u32(BLAKE3_IV[word]);
+        }
+        state[12] = vdupq_n_u32(0);
+        state[13] = vdupq_n_u32(0);
+        state[14] = vdupq_n_u32(u32::from(block_len));
+        state[15] = vdupq_n_u32(u32::from(flags));
+        for index in 0..7 {
+            unsafe { round(&mut state, &message, index) };
+        }
+        let mut output = [[0_u8; 32]; 4];
+        for word in 0..8 {
+            let value = veorq_u32(state[word], state[word + 8]);
+            let mut lanes = [0_u32; 4];
+            unsafe { vst1q_u32(lanes.as_mut_ptr(), value) };
+            for lane in 0..4 {
+                output[lane][4 * word..4 * word + 4].copy_from_slice(&lanes[lane].to_le_bytes());
+            }
+        }
+        output
+    }
+}
 
 fn blake3_platform() -> blake3::platform::Platform {
     // `platform` is a doc-hidden benchmark API. Cargo.toml pins Blake3 1.8.3,
@@ -21,6 +165,30 @@ fn blake3_platform() -> blake3::platform::Platform {
     // stable `blake3::hash` entry point over thousands of inputs.
     static PLATFORM: OnceLock<blake3::platform::Platform> = OnceLock::new();
     *PLATFORM.get_or_init(blake3::platform::Platform::detect)
+}
+
+#[inline]
+fn fixed_blake3_xof4(
+    cvs: &[[u32; 8]; 4],
+    blocks: &[[u8; 64]; 4],
+    block_len: u8,
+    flags: u8,
+) -> [Digest; 4] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is mandatory in AArch64. This implements four independent
+        // compression calls across vector lanes, including short final blocks
+        // that Blake3's public batch API does not expose.
+        unsafe { neon4::compress_xof32(cvs, blocks, block_len, flags) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let platform = blake3_platform();
+        std::array::from_fn(|index| {
+            let output = platform.compress_xof(&cvs[index], &blocks[index], block_len, 0, flags);
+            output[..32].try_into().unwrap()
+        })
+    }
 }
 
 fn fixed_blake3_hash_43(block: &[u8; 64]) -> Digest {
@@ -52,6 +220,17 @@ fn node_blocks(left: Digest, right: Digest) -> ([u8; 64], [u8; 64]) {
     (first, second)
 }
 
+fn field_leaf_block(value: Field192) -> [u8; 64] {
+    let mut input = [0_u8; 64];
+    input[..FIELD_LEAF_DOMAIN.len()].copy_from_slice(FIELD_LEAF_DOMAIN);
+    let bigint = value.into_bigint();
+    for (index, limb) in bigint.as_ref().iter().enumerate() {
+        let start = FIELD_LEAF_DOMAIN.len() + index * 8;
+        input[start..start + 8].copy_from_slice(&limb.to_le_bytes());
+    }
+    input
+}
+
 fn parent4(children: &[Digest; 8]) -> [Digest; 4] {
     let platform = blake3_platform();
     if platform.simd_degree() < 4 {
@@ -72,26 +251,18 @@ fn parent4(children: &[Digest; 8]) -> [Digest; 4] {
         0,
         &mut chaining_values,
     );
-    std::array::from_fn(|index| {
+    let cvs = std::array::from_fn(|index| {
         let bytes = &chaining_values[index * 32..(index + 1) * 32];
-        let cv = std::array::from_fn(|word| {
+        std::array::from_fn(|word| {
             u32::from_le_bytes(bytes[word * 4..(word + 1) * 4].try_into().unwrap())
-        });
-        let output =
-            platform.compress_xof(&cv, &blocks[index].1, 19, 0, BLAKE3_CHUNK_END | BLAKE3_ROOT);
-        output[..32].try_into().unwrap()
-    })
+        })
+    });
+    let final_blocks = std::array::from_fn(|index| blocks[index].1);
+    fixed_blake3_xof4(&cvs, &final_blocks, 19, BLAKE3_CHUNK_END | BLAKE3_ROOT)
 }
 
 pub fn field_leaf(value: Field192) -> Digest {
-    let mut input = [0_u8; 64];
-    input[..FIELD_LEAF_DOMAIN.len()].copy_from_slice(FIELD_LEAF_DOMAIN);
-    let bigint = value.into_bigint();
-    for (index, limb) in bigint.as_ref().iter().enumerate() {
-        let start = FIELD_LEAF_DOMAIN.len() + index * 8;
-        input[start..start + 8].copy_from_slice(&limb.to_le_bytes());
-    }
-    fixed_blake3_hash_43(&input)
+    fixed_blake3_hash_43(&field_leaf_block(value))
 }
 
 pub fn parent(left: Digest, right: Digest) -> Digest {
@@ -132,12 +303,35 @@ fn reduce_exact_digests(scratch: &mut [Digest]) -> Digest {
     scratch[0]
 }
 
+fn extend_field_leaves_batched<F>(values: &[Field192], scratch: &mut Vec<Digest>, transform: F)
+where
+    F: Fn(Field192) -> Field192,
+{
+    let mut chunks = values.chunks_exact(4);
+    for chunk in &mut chunks {
+        let blocks = std::array::from_fn(|index| field_leaf_block(transform(chunk[index])));
+        let hashes = fixed_blake3_xof4(
+            &[BLAKE3_IV; 4],
+            &blocks,
+            43,
+            BLAKE3_CHUNK_START | BLAKE3_CHUNK_END | BLAKE3_ROOT,
+        );
+        scratch.extend_from_slice(&hashes);
+    }
+    scratch.extend(
+        chunks
+            .remainder()
+            .iter()
+            .map(|value| field_leaf(transform(*value))),
+    );
+}
+
 fn exact_prefix_root_batched(values: &[Field192]) -> Digest {
     assert!(values.len() >= 8 && values.len().is_power_of_two());
     EXACT_ROOT_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
         scratch.clear();
-        scratch.extend(values.iter().map(|value| field_leaf(*value)));
+        extend_field_leaves_batched(values, &mut scratch, |value| value);
         reduce_exact_digests(&mut scratch)
     })
 }
@@ -147,7 +341,7 @@ fn exact_scaled_prefix_root_batched(values: &[Field192], scale: Field192) -> Dig
     EXACT_ROOT_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
         scratch.clear();
-        scratch.extend(values.iter().map(|value| field_leaf(scale * *value)));
+        extend_field_leaves_batched(values, &mut scratch, |value| scale * value);
         reduce_exact_digests(&mut scratch)
     })
 }
@@ -224,8 +418,6 @@ impl MerkleAccumulator {
 
 pub fn prefix_root(values: &[Field192], capacity: usize, zeros: &[Digest]) -> Digest {
     assert!(values.len() <= capacity && capacity.is_power_of_two());
-    const PARALLEL_MIN_FIELDS: usize = 1 << 18;
-    const CHUNK_FIELDS: usize = 1 << 12;
     if values.len() >= PARALLEL_MIN_FIELDS {
         return chunked_prefix_root(values, capacity, zeros, CHUNK_FIELDS);
     }
@@ -354,6 +546,58 @@ mod tests {
             let right = *blake3::hash(&right_input).as_bytes();
             assert_eq!(parent(left, right), legacy_parent(left, right));
         }
+    }
+
+    #[test]
+    fn four_way_short_compressions_match_scalar_blake3() {
+        let platform = blake3_platform();
+        for batch in 0..1024_u64 {
+            let cvs = std::array::from_fn(|lane| {
+                std::array::from_fn(|word| {
+                    (batch as u32)
+                        .wrapping_mul(0x9e37_79b9)
+                        .wrapping_add((lane as u32) << 16)
+                        .wrapping_add(word as u32)
+                })
+            });
+            let blocks = std::array::from_fn(|lane| {
+                std::array::from_fn(|byte| {
+                    batch
+                        .wrapping_mul(17)
+                        .wrapping_add((lane * 64 + byte) as u64) as u8
+                })
+            });
+            for (block_len, flags) in [
+                (19, BLAKE3_CHUNK_END | BLAKE3_ROOT),
+                (43, BLAKE3_CHUNK_START | BLAKE3_CHUNK_END | BLAKE3_ROOT),
+                (64, BLAKE3_CHUNK_START),
+            ] {
+                let batched = fixed_blake3_xof4(&cvs, &blocks, block_len, flags);
+                let scalar: [Digest; 4] = std::array::from_fn(|lane| {
+                    let output =
+                        platform.compress_xof(&cvs[lane], &blocks[lane], block_len, 0, flags);
+                    output[..32].try_into().unwrap()
+                });
+                assert_eq!(batched, scalar);
+            }
+        }
+    }
+
+    #[test]
+    fn batched_field_leaves_match_scalar_leaves() {
+        let values = (0..4099_u64)
+            .map(|index| {
+                let seed = blake3::hash(&index.to_le_bytes());
+                Field192::from_le_bytes_mod_order(seed.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        let mut batched = Vec::new();
+        extend_field_leaves_batched(&values, &mut batched, |value| value);
+        let scalar = values
+            .iter()
+            .map(|value| field_leaf(*value))
+            .collect::<Vec<_>>();
+        assert_eq!(batched, scalar);
     }
 
     #[test]
