@@ -3760,6 +3760,67 @@ fn virtual_index_descriptor(
 }
 
 type VirtualIndexFactors = Arc<(Vec<Field192>, Vec<Field192>)>;
+type FixedGeneratorSpectra = Arc<Vec<Vec<Field192>>>;
+type FixedGeneratorCache = Mutex<BTreeMap<(usize, usize, usize), FixedGeneratorSpectra>>;
+
+fn fixed_generator_spectra_cache() -> &'static FixedGeneratorCache {
+    static CACHE: OnceLock<FixedGeneratorCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Return fixed-code generator spectra from verifier preprocessing.  They do
+/// not depend on a statement or transcript and therefore belong in the public
+/// parameters rather than in the online verification path.
+fn fixed_generator_spectra(level_index: usize, level: Level) -> FixedGeneratorSpectra {
+    let key = (level_index, level.inverse_rate, level.group);
+    let cached = {
+        let cache = fixed_generator_spectra_cache()
+            .lock()
+            .expect("fixed-generator cache mutex must not be poisoned");
+        cache.get(&key).cloned()
+    };
+    if let Some(spectra) = cached {
+        return spectra;
+    }
+    let spectra = Arc::new(
+        (0..level.inverse_rate - 1)
+            .into_par_iter()
+            .map(|block| generator_spectrum(level_index, block, level.group))
+            .collect::<Vec<_>>(),
+    );
+    fixed_generator_spectra_cache()
+        .lock()
+        .expect("fixed-generator cache mutex must not be poisoned")
+        .insert(key, spectra.clone());
+    spectra
+}
+
+fn preprocess_canonical_verifier_generators() {
+    for (level_index, level) in LEVELS.iter().copied().enumerate() {
+        fixed_generator_spectra(level_index, level);
+    }
+    fixed_generator_spectra(10, carryopen_level());
+    for round in 0..STRONG_ROUNDS {
+        fixed_generator_spectra(
+            12 + round,
+            strong_round_level(round).expect("canonical strong round must have a level"),
+        );
+    }
+}
+
+fn canonical_verifier_fixed_generator_fields() -> usize {
+    LEVELS
+        .iter()
+        .map(|level| (level.inverse_rate - 1) * level.group)
+        .sum::<usize>()
+        + (CARRYOPEN_INVERSE_RATE - 1) * CARRYOPEN_ROWS
+        + (0..STRONG_ROUNDS)
+            .map(|round| {
+                let level = strong_round_level(round).unwrap();
+                (level.inverse_rate - 1) * level.group
+            })
+            .sum::<usize>()
+}
 
 fn virtual_index_factor_cache() -> &'static Mutex<BTreeMap<Digest, VirtualIndexFactors>> {
     static CACHE: OnceLock<Mutex<BTreeMap<Digest, VirtualIndexFactors>>> = OnceLock::new();
@@ -3777,21 +3838,20 @@ fn cached_virtual_index_factors(
     transcript_roots: &[Digest],
 ) -> VirtualIndexFactors {
     let descriptor = virtual_index_descriptor(level_index, level, transcript_roots);
-    if let Some(factors) = virtual_index_factor_cache()
-        .lock()
-        .expect("virtual-W cache mutex must not be poisoned")
-        .get(&descriptor)
-        .cloned()
-    {
+    let cached = {
+        let cache = virtual_index_factor_cache()
+            .lock()
+            .expect("virtual-W cache mutex must not be poisoned");
+        cache.get(&descriptor).cloned()
+    };
+    if let Some(factors) = cached {
         return factors;
     }
-    let spectra = (0..level.inverse_rate - 1)
-        .map(|block| generator_spectrum(level_index, block, level.group))
-        .collect::<Vec<_>>();
+    let spectra = fixed_generator_spectra(level_index, level);
     let factors = Arc::new(index_oracle_factors(
         level_index,
         level,
-        &spectra,
+        spectra.as_ref(),
         transcript_roots,
     ));
     virtual_index_factor_cache()
@@ -3839,6 +3899,14 @@ fn clear_virtual_index_factor_cache() {
     virtual_index_row_root_cache()
         .lock()
         .expect("virtual-W row-root cache mutex must not be poisoned")
+        .clear();
+}
+
+#[cfg(test)]
+fn clear_fixed_generator_spectra_cache() {
+    fixed_generator_spectra_cache()
+        .lock()
+        .expect("fixed-generator cache mutex must not be poisoned")
         .clear();
 }
 
@@ -5761,11 +5829,15 @@ fn verify_certificate_core(
     if transitions.len() != LEVELS.len() {
         return false;
     }
+    if !transitions
+        .par_iter()
+        .enumerate()
+        .all(|(level_index, transition)| transition.level == level_index && transition.verify())
+    {
+        return false;
+    }
     let mut transcript_roots = Vec::new();
     for (level_index, transition) in transitions.iter().enumerate() {
-        if transition.level != level_index || !transition.verify() {
-            return false;
-        }
         if level_index > 0
             && transitions[level_index - 1].next_source_root
                 != transition.component_roots[LEVELS[level_index].inverse_rate - 1]
@@ -6097,16 +6169,20 @@ impl RecursiveStrongEndToEndProof {
         {
             return false;
         }
-        for round in 0..self.strong.len() {
-            if self.strong[round].round != round || !self.strong[round].verify() {
-                return false;
-            }
-            if round > 0
-                && self.strong[round].source_root()
-                    != Some(self.strong[round - 1].terminal_source_root)
-            {
-                return false;
-            }
+        if !self
+            .strong
+            .par_iter()
+            .enumerate()
+            .all(|(round, proof)| proof.round == round && proof.verify())
+        {
+            return false;
+        }
+        if self
+            .strong
+            .windows(2)
+            .any(|pair| pair[1].source_root() != Some(pair[0].terminal_source_root))
+        {
+            return false;
         }
         self.base.verify(self.strong.last().unwrap())
             && self.carryopen.verify(self.carryopen.terminal_source_root)
@@ -6829,6 +6905,11 @@ fn main() {
     assert!(!args.direct_whir_tail || args.semantic);
     assert!(!args.relation_whir || args.semantic);
     assert!(!args.final_only || (args.semantic && args.carryopen && args.direct_whir_tail));
+    let verifier_preprocessing_start = Instant::now();
+    if args.semantic {
+        preprocess_canonical_verifier_generators();
+    }
+    let verifier_preprocessing = verifier_preprocessing_start.elapsed();
     let variables = args.fields.next_power_of_two().trailing_zeros() as usize;
     if args.fields == PRODUCTION_FIELDS {
         assert_eq!(variables, PRODUCTION_VARIABLES);
@@ -7293,6 +7374,11 @@ fn main() {
         println!("- CarryOpen verifier checks the actual M root, pre-Carry claim, QA membership/evaluation, authenticated F rows, public virtual-W rows, Phi link, and recursive terminal restoration; claim mutation rejected");
     }
     if args.semantic {
+        println!(
+            "- one-time canonical verifier fixed-G preprocessing: {:.3} ms, {:.3} MiB (excluded from online verification)",
+            verifier_preprocessing.as_secs_f64() * 1_000.0,
+            canonical_verifier_fixed_generator_fields() as f64 * 24.0 / (1_u64 << 20) as f64,
+        );
         println!(
             "- fixed-G preprocessing median/p95: {:.3}/{:.3} ms",
             percentile(&generator_ms, 0.5),
@@ -7900,6 +7986,32 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(shared, independent);
+    }
+
+    #[test]
+    fn fixed_generator_preprocessing_matches_direct_spectra() {
+        assert_eq!(canonical_verifier_fixed_generator_fields(), 252_160);
+        for (level_index, level) in LEVELS
+            .iter()
+            .copied()
+            .enumerate()
+            .chain(std::iter::once((10, carryopen_level())))
+            .chain((0..STRONG_ROUNDS).map(|round| {
+                (
+                    12 + round,
+                    strong_round_level(round).expect("strong round must have a level"),
+                )
+            }))
+        {
+            let cached = fixed_generator_spectra(level_index, level);
+            assert_eq!(cached.len(), level.inverse_rate - 1);
+            for (block, spectrum) in cached.iter().enumerate() {
+                assert_eq!(
+                    spectrum,
+                    &generator_spectrum(level_index, block, level.group),
+                );
+            }
+        }
     }
 
     #[test]
@@ -9013,6 +9125,7 @@ mod tests {
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
         assert_eq!(payload.len(), 301_740);
+
         let breakdown = proof.byte_breakdown(payload.len());
         assert_eq!(breakdown.total, payload.len());
         assert_eq!(breakdown.base_total, 12_300);
@@ -9134,6 +9247,176 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "production canonical verifier stage profile"]
+    fn canonical_verifier_reports_stage_profile() {
+        let carry = run_production_carryopen(1, false);
+        let certificate = run_semantic_certificate_only(64, false);
+        let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
+        let payload = proof.serialize();
+        assert_eq!(payload.len(), 301_740);
+
+        clear_fixed_generator_spectra_cache();
+        let preprocessing_start = Instant::now();
+        preprocess_canonical_verifier_generators();
+        let preprocessing_ms = preprocessing_start.elapsed().as_secs_f64() * 1_000.0;
+
+        let repetitions = 6;
+        let mut parse_ms = Vec::with_capacity(repetitions);
+        let mut linkage_ms = Vec::with_capacity(repetitions);
+        let mut strong_ms = vec![Vec::with_capacity(repetitions); STRONG_ROUNDS];
+        let mut base_ms = Vec::with_capacity(repetitions);
+        let mut carry_ms = Vec::with_capacity(repetitions);
+        let mut certificate_ms = Vec::with_capacity(repetitions);
+        let mut total_ms = Vec::with_capacity(repetitions);
+
+        for _ in 0..repetitions {
+            clear_virtual_index_factor_cache();
+            let total_start = Instant::now();
+
+            let start = Instant::now();
+            let parsed = RecursiveStrongEndToEndProof::deserialize_unchecked(&payload).unwrap();
+            parse_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
+
+            let start = Instant::now();
+            let certificate_root = parsed.certificate.last().unwrap().next_source_root;
+            let linked = parsed.strong.len() == STRONG_ROUNDS
+                && parsed.certificate.len() == LEVELS.len()
+                && parsed.strong[0].source_root()
+                    == Some(parent(
+                        certificate_root,
+                        parsed.carryopen.terminal_source_root,
+                    ));
+            linkage_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
+            assert!(linked);
+
+            for round in 0..STRONG_ROUNDS {
+                let start = Instant::now();
+                let valid = parsed.strong[round].round == round
+                    && parsed.strong[round].verify()
+                    && (round == 0
+                        || parsed.strong[round].source_root()
+                            == Some(parsed.strong[round - 1].terminal_source_root));
+                strong_ms[round].push(start.elapsed().as_secs_f64() * 1_000.0);
+                assert!(valid);
+            }
+
+            let start = Instant::now();
+            assert!(parsed.base.verify(parsed.strong.last().unwrap()));
+            base_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
+
+            let start = Instant::now();
+            assert!(parsed
+                .carryopen
+                .verify(parsed.carryopen.terminal_source_root));
+            carry_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
+
+            let start = Instant::now();
+            assert!(verify_certificate_core(
+                &parsed.certificate,
+                certificate_root,
+            ));
+            certificate_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
+            total_ms.push(total_start.elapsed().as_secs_f64() * 1_000.0);
+        }
+
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        let strong_medians = strong_ms
+            .iter()
+            .map(|samples| median(samples))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "canonical-verifier-stage-profile repetitions={repetitions} proof={} B parse-ms={parse_ms:?} linkage-ms={linkage_ms:?} strong-ms={strong_ms:?} base-ms={base_ms:?} carry-ms={carry_ms:?} certificate-ms={certificate_ms:?} total-ms={total_ms:?}",
+            payload.len(),
+        );
+        eprintln!(
+            "canonical-verifier-stage-medians preprocessing={preprocessing_ms:.3} parse={:.3} linkage={:.3} strong={strong_medians:?} strong-total={:.3} base={:.3} carry={:.3} certificate={:.3} total={:.3} ms",
+            median(&parse_ms),
+            median(&linkage_ms),
+            strong_medians.iter().sum::<f64>(),
+            median(&base_ms),
+            median(&carry_ms),
+            median(&certificate_ms),
+            median(&total_ms),
+        );
+
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let start = Instant::now();
+        assert!(proof.carryopen.precarry.verify());
+        let precarry_ms = start.elapsed().as_secs_f64() * 1_000.0;
+
+        let start = Instant::now();
+        let spectra = (0..level.inverse_rate - 1)
+            .map(|block| generator_spectrum(10, block, level.group))
+            .collect::<Vec<_>>();
+        let generator_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        let start = Instant::now();
+        let factors = index_oracle_factors(
+            10,
+            level,
+            &spectra,
+            &proof.carryopen.component_roots[..2 * level.inverse_rate],
+        );
+        let factor_math_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        assert_eq!(factors.0.len(), level.inverse_rate * level.group);
+
+        clear_virtual_index_factor_cache();
+        let start = Instant::now();
+        assert!(
+            validated_virtual_index_factors(10, level, &proof.carryopen.component_roots,).is_some()
+        );
+        let factor_total_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        let start = Instant::now();
+        assert!(virtual_index_selected_roots(
+            10,
+            level,
+            &proof.carryopen.component_roots,
+            &proof.carryopen.selected_front.selected,
+            CARRYOPEN_WIDTH,
+            &zeros,
+        )
+        .is_some());
+        let selected_roots_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        let start = Instant::now();
+        assert!(proof.carryopen.selected_front.verify(
+            10,
+            level,
+            &proof.carryopen.component_roots,
+            CARRYOPEN_WIDTH,
+            &zeros,
+        ));
+        let cached_front_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        let start = Instant::now();
+        assert_eq!(
+            derived_carry_terminal_root(
+                &proof.carryopen.component_roots,
+                &proof.carryopen.selected_front,
+                proof.carryopen.membership_ood_root,
+                proof.carryopen.evaluation_ood_root,
+                &zeros,
+            ),
+            Some(proof.carryopen.terminal_source_root),
+        );
+        let cached_derived_ms = start.elapsed().as_secs_f64() * 1_000.0;
+        eprintln!(
+            "carry-substages precarry={precarry_ms:.3} generator={generator_ms:.3} factor-math={factor_math_ms:.3} factor-total-cold={factor_total_ms:.3} selected-roots-after-factor={selected_roots_ms:.3} cached-front={cached_front_ms:.3} cached-derived={cached_derived_ms:.3} ms"
+        );
+
+        clear_virtual_index_factor_cache();
+        let mut transition_ms = Vec::with_capacity(LEVELS.len());
+        for transition in &proof.certificate {
+            let start = Instant::now();
+            assert!(transition.verify());
+            transition_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
+        }
+        eprintln!("certificate-transition-ms={transition_ms:?}");
+    }
+
+    #[test]
     #[ignore = "production terminal-cutoff byte audit"]
     fn terminal_cutoff_byte_audit() {
         let carry = run_production_carryopen(1, false);
@@ -9178,6 +9461,19 @@ mod tests {
                 "cutoff-round={round} terminal-fields={terminal_fields} direct-base-bytes={direct_base} projected-total-bytes={projected_total} backend-budget={backend_budget} brakedown-best=({brakedown_rows},{brakedown_row_width}) brakedown-bare-fields={brakedown_fields} brakedown-bare-bytes={brakedown_bare_bytes}"
             );
         }
+
+        let context = *blake3::hash(b"LiLAC/terminal-backend-size-audit/v1").as_bytes();
+        let whir = run_direct_whir_tail(proof.base.private_f_rows.clone(), context, 1);
+        eprintln!(
+            "terminal-backend-whir-optimistic semantic-fields={} padded-fields={} raw-proof-bytes={} framed-artifact-bytes={} commit-ms={:.3} prove-ms={:.3} verify-ms={:.3}",
+            whir.semantic_fields,
+            whir.padded_fields,
+            whir.proof_bytes,
+            whir.artifact.serialize().len(),
+            whir.commit.as_secs_f64() * 1_000.0,
+            whir.prove.as_secs_f64() * 1_000.0,
+            whir.verify.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]
