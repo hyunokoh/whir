@@ -28,6 +28,9 @@ use whir::{
     utils::workload_size,
 };
 
+#[cfg(test)]
+use whir::lilac_merkle::prefix_root_platform_first_for_benchmark;
+
 #[derive(Debug, Parser)]
 struct Args {
     #[arg(long, default_value_t = PRODUCTION_FIELDS)]
@@ -1839,6 +1842,71 @@ fn tensor_row_commitments_materialized(
                 prefix_root(&encoded, CARRYOPEN_TENSOR_WIDTH, zeros)
             }
         })
+        .collect::<Vec<_>>();
+    row_roots
+        .chunks_exact(CARRYOPEN_ROWS)
+        .map(|roots| MatrixCommitment {
+            root: combine_equal_subtrees(roots),
+            row_roots: roots.to_vec(),
+            row_domain: CARRYOPEN_ROWS,
+            zero_row_root: zeros[CARRYOPEN_TENSOR_WIDTH.trailing_zeros() as usize],
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn tensor_row_commitments_platform_first(
+    vertical_codeword: &[Field192],
+    message_row_roots: &[Digest],
+    horizontal_spectra: &[Vec<Field192>],
+    zeros: &[Digest],
+) -> Vec<MatrixCommitment> {
+    let row_roots = vertical_codeword
+        .par_chunks_exact(CARRYOPEN_WIDTH)
+        .enumerate()
+        .map_init(
+            || {
+                (
+                    vec![Field192::ZERO; CARRYOPEN_WIDTH],
+                    vec![Field192::ZERO; CARRYOPEN_TENSOR_WIDTH],
+                )
+            },
+            |(transformed, encoded), (index, row)| {
+                transformed.copy_from_slice(row);
+                wht(transformed);
+                if index < CARRYOPEN_ROWS {
+                    let mut roots = [message_row_roots[index]; CARRYOPEN_INVERSE_RATE];
+                    for (root, spectrum) in roots[1..].iter_mut().zip(horizontal_spectra) {
+                        let parity = &mut encoded[..CARRYOPEN_WIDTH];
+                        parity.copy_from_slice(transformed);
+                        parity
+                            .iter_mut()
+                            .zip(spectrum)
+                            .for_each(|(value, multiplier)| *value *= multiplier);
+                        wht(parity);
+                        *root = prefix_root_platform_first_for_benchmark(
+                            parity,
+                            CARRYOPEN_WIDTH,
+                            zeros,
+                        );
+                    }
+                    combine_equal_subtrees(&roots)
+                } else {
+                    encoded[..CARRYOPEN_WIDTH].copy_from_slice(row);
+                    for (block, spectrum) in horizontal_spectra.iter().enumerate() {
+                        let start = (block + 1) * CARRYOPEN_WIDTH;
+                        let parity = &mut encoded[start..start + CARRYOPEN_WIDTH];
+                        parity.copy_from_slice(transformed);
+                        parity
+                            .iter_mut()
+                            .zip(spectrum)
+                            .for_each(|(value, multiplier)| *value *= multiplier);
+                        wht(parity);
+                    }
+                    prefix_root_platform_first_for_benchmark(encoded, CARRYOPEN_TENSOR_WIDTH, zeros)
+                }
+            },
+        )
         .collect::<Vec<_>>();
     row_roots
         .chunks_exact(CARRYOPEN_ROWS)
@@ -7671,6 +7739,129 @@ mod tests {
             scratch_second_time.as_secs_f64() * 1_000.0,
             materialized_first_time.as_secs_f64() * 1_000.0,
             materialized_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale tensor encoding/hash split diagnostic"]
+    fn tensor_commitment_reports_encoding_hash_split() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let (_, message_row_roots) =
+            exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
+        let vertical_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(11, block, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &message, &mut proof_codeword, &vertical_spectra, 64);
+
+        let encode_only = || {
+            proof_codeword
+                .par_chunks_exact(CARRYOPEN_WIDTH)
+                .enumerate()
+                .map_init(
+                    || {
+                        (
+                            vec![Field192::ZERO; CARRYOPEN_WIDTH],
+                            vec![Field192::ZERO; CARRYOPEN_TENSOR_WIDTH],
+                        )
+                    },
+                    |(transformed, encoded), (index, row)| {
+                        transformed.copy_from_slice(row);
+                        wht(transformed);
+                        let mut checksum = if index < CARRYOPEN_ROWS {
+                            Field192::ZERO
+                        } else {
+                            encoded[..CARRYOPEN_WIDTH].copy_from_slice(row);
+                            std::hint::black_box(&encoded[..CARRYOPEN_WIDTH]);
+                            encoded[0]
+                        };
+                        for (block, spectrum) in horizontal_spectra.iter().enumerate() {
+                            let start = if index < CARRYOPEN_ROWS {
+                                0
+                            } else {
+                                (block + 1) * CARRYOPEN_WIDTH
+                            };
+                            let parity = &mut encoded[start..start + CARRYOPEN_WIDTH];
+                            parity.copy_from_slice(transformed);
+                            parity
+                                .iter_mut()
+                                .zip(spectrum)
+                                .for_each(|(value, multiplier)| *value *= multiplier);
+                            wht(parity);
+                            std::hint::black_box(&*parity);
+                            checksum += parity[0];
+                        }
+                        checksum
+                    },
+                )
+                .sum::<Field192>()
+        };
+
+        let start = Instant::now();
+        let encoding_first = encode_only();
+        let encoding_first_time = start.elapsed();
+        let start = Instant::now();
+        let platform_first = tensor_row_commitments_platform_first(
+            &proof_codeword,
+            &message_row_roots,
+            &horizontal_spectra,
+            &zeros,
+        );
+        let platform_first_time = start.elapsed();
+        let start = Instant::now();
+        let optimized_first = tensor_row_commitments(
+            &proof_codeword,
+            &message_row_roots,
+            &horizontal_spectra,
+            &zeros,
+        );
+        let optimized_first_time = start.elapsed();
+        let start = Instant::now();
+        let optimized_second = tensor_row_commitments(
+            &proof_codeword,
+            &message_row_roots,
+            &horizontal_spectra,
+            &zeros,
+        );
+        let optimized_second_time = start.elapsed();
+        let start = Instant::now();
+        let platform_second = tensor_row_commitments_platform_first(
+            &proof_codeword,
+            &message_row_roots,
+            &horizontal_spectra,
+            &zeros,
+        );
+        let platform_second_time = start.elapsed();
+        let start = Instant::now();
+        let encoding_second = encode_only();
+        let encoding_second_time = start.elapsed();
+
+        assert_eq!(encoding_first, encoding_second);
+        assert_ne!(encoding_first, Field192::ZERO);
+        for candidate in [&platform_first, &platform_second, &optimized_second] {
+            assert_eq!(candidate.len(), optimized_first.len());
+            for (candidate, expected) in candidate.iter().zip(&optimized_first) {
+                assert_eq!(candidate.root, expected.root);
+                assert_eq!(candidate.row_roots, expected.row_roots);
+            }
+        }
+        eprintln!(
+            "rows={} encoding_only={:.3}/{:.3} ms fixed_first={:.3}/{:.3} ms platform_hash_many={:.3}/{:.3} ms",
+            proof_codeword.len() / CARRYOPEN_WIDTH,
+            encoding_first_time.as_secs_f64() * 1_000.0,
+            encoding_second_time.as_secs_f64() * 1_000.0,
+            optimized_first_time.as_secs_f64() * 1_000.0,
+            optimized_second_time.as_secs_f64() * 1_000.0,
+            platform_first_time.as_secs_f64() * 1_000.0,
+            platform_second_time.as_secs_f64() * 1_000.0,
         );
     }
 

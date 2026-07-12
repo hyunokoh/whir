@@ -450,6 +450,51 @@ fn parent8(children: &[Digest; 16]) -> [Digest; 8] {
     let blocks = std::array::from_fn::<_, 8, _>(|index| {
         node_blocks(children[2 * index], children[2 * index + 1])
     });
+    #[cfg(target_arch = "aarch64")]
+    let cvs = {
+        let first_blocks = std::array::from_fn(|index| blocks[index].0);
+        let chaining_bytes =
+            fixed_blake3_xof8(&[BLAKE3_IV; 8], &first_blocks, 64, BLAKE3_CHUNK_START);
+        std::array::from_fn(|index| {
+            std::array::from_fn(|word| {
+                u32::from_le_bytes(
+                    chaining_bytes[index][word * 4..(word + 1) * 4]
+                        .try_into()
+                        .unwrap(),
+                )
+            })
+        })
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let cvs = {
+        let first: [&[u8; 64]; 8] = std::array::from_fn(|index| &blocks[index].0);
+        let mut chaining_values = [0_u8; 8 * 32];
+        platform.hash_many(
+            &first,
+            &BLAKE3_IV,
+            0,
+            blake3::IncrementCounter::No,
+            0,
+            BLAKE3_CHUNK_START,
+            0,
+            &mut chaining_values,
+        );
+        std::array::from_fn(|index| {
+            let bytes = &chaining_values[index * 32..(index + 1) * 32];
+            std::array::from_fn(|word| {
+                u32::from_le_bytes(bytes[word * 4..(word + 1) * 4].try_into().unwrap())
+            })
+        })
+    };
+    let final_blocks = std::array::from_fn(|index| blocks[index].1);
+    fixed_blake3_xof8(&cvs, &final_blocks, 19, BLAKE3_CHUNK_END | BLAKE3_ROOT)
+}
+
+fn parent8_platform_first_compression(children: &[Digest; 16]) -> [Digest; 8] {
+    let platform = blake3_platform();
+    let blocks = std::array::from_fn::<_, 8, _>(|index| {
+        node_blocks(children[2 * index], children[2 * index + 1])
+    });
     let first: [&[u8; 64]; 8] = std::array::from_fn(|index| &blocks[index].0);
     let mut chaining_values = [0_u8; 8 * 32];
     platform.hash_many(
@@ -521,6 +566,33 @@ fn reduce_exact_digests(scratch: &mut [Digest]) -> Digest {
     scratch[0]
 }
 
+fn reduce_exact_digests_platform_first(scratch: &mut [Digest]) -> Digest {
+    assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
+    let mut active = scratch.len();
+    while active > 1 {
+        let pairs = active / 2;
+        let batched8 = pairs / 8 * 8;
+        for pair in (0..batched8).step_by(8) {
+            let child = 2 * pair;
+            let children = std::array::from_fn(|index| scratch[child + index]);
+            let roots = parent8_platform_first_compression(&children);
+            scratch[pair..pair + 8].copy_from_slice(&roots);
+        }
+        let batched4 = batched8 + (pairs - batched8) / 4 * 4;
+        for pair in (batched8..batched4).step_by(4) {
+            let child = 2 * pair;
+            let children = std::array::from_fn(|index| scratch[child + index]);
+            let roots = parent4(&children);
+            scratch[pair..pair + 4].copy_from_slice(&roots);
+        }
+        for pair in batched4..pairs {
+            scratch[pair] = parent(scratch[2 * pair], scratch[2 * pair + 1]);
+        }
+        active = pairs;
+    }
+    scratch[0]
+}
+
 fn extend_field_leaves_batched<F>(values: &[Field192], scratch: &mut Vec<Digest>, transform: F)
 where
     F: Fn(Field192) -> Field192,
@@ -563,6 +635,26 @@ fn exact_prefix_root_batched(values: &[Field192]) -> Digest {
         extend_field_leaves_batched(values, &mut scratch, |value| value);
         reduce_exact_digests(&mut scratch)
     })
+}
+
+/// Reproduce the pre-optimization AArch64 exact-root path for crossed
+/// artifact benchmarks. This is transcript-identical to [`prefix_root`].
+#[doc(hidden)]
+pub fn prefix_root_platform_first_for_benchmark(
+    values: &[Field192],
+    capacity: usize,
+    zeros: &[Digest],
+) -> Digest {
+    assert!(values.len() <= capacity && capacity.is_power_of_two());
+    if values.len() == capacity && values.len() >= 8 {
+        return EXACT_ROOT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.clear();
+            extend_field_leaves_batched(values, &mut scratch, |value| value);
+            reduce_exact_digests_platform_first(&mut scratch)
+        });
+    }
+    sequential_prefix_root(values, capacity, zeros)
 }
 
 fn exact_scaled_prefix_root_batched(values: &[Field192], scale: Field192) -> Digest {
@@ -893,6 +985,57 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fixed-length node-compression microbenchmark"]
+    fn fixed_first_compression_benchmarks_platform_hash_many() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let mut children = std::array::from_fn(|index| {
+            *blake3::hash(&(index as u64 + 1).to_le_bytes()).as_bytes()
+        });
+        assert_eq!(
+            parent8(&children),
+            parent8_platform_first_compression(&children)
+        );
+
+        let iterations = 1_000_000;
+        let start = Instant::now();
+        for iteration in 0..iterations {
+            let roots = parent8_platform_first_compression(black_box(&children));
+            children[iteration & 15] = roots[iteration & 7];
+        }
+        let platform_first = start.elapsed();
+        let start = Instant::now();
+        for iteration in 0..iterations {
+            let roots = parent8(black_box(&children));
+            children[iteration & 15] = roots[iteration & 7];
+        }
+        let fixed_first = start.elapsed();
+        let start = Instant::now();
+        for iteration in 0..iterations {
+            let roots = parent8(black_box(&children));
+            children[iteration & 15] = roots[iteration & 7];
+        }
+        let fixed_second = start.elapsed();
+        let start = Instant::now();
+        for iteration in 0..iterations {
+            let roots = parent8_platform_first_compression(black_box(&children));
+            children[iteration & 15] = roots[iteration & 7];
+        }
+        let platform_second = start.elapsed();
+
+        black_box(children);
+        eprintln!(
+            "parent8 iterations={} platform_hash_many={:.3}/{:.3} ms fixed_first={:.3}/{:.3} ms",
+            iterations,
+            platform_first.as_secs_f64() * 1_000.0,
+            platform_second.as_secs_f64() * 1_000.0,
+            fixed_first.as_secs_f64() * 1_000.0,
+            fixed_second.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
     fn exact_batched_roots_match_sequential_roots() {
         let zeros = zero_roots(12);
         let values = (0..4096)
@@ -904,6 +1047,64 @@ mod tests {
                 sequential_prefix_root(&values[..length], length, &zeros)
             );
         }
+    }
+
+    #[test]
+    #[ignore = "1,024-field exact-root reduction benchmark"]
+    fn fixed_first_compression_benchmarks_complete_exact_root() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let values = (0..1024_u64)
+            .map(|index| {
+                let seed = blake3::hash(&index.to_le_bytes());
+                Field192::from_le_bytes_mod_order(seed.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            exact_prefix_root_batched(&values),
+            prefix_root_platform_first_for_benchmark(&values, values.len(), &zero_roots(10))
+        );
+        let iterations = 10_000;
+        let mut scratch = Vec::with_capacity(values.len());
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            scratch.clear();
+            extend_field_leaves_batched(black_box(&values), &mut scratch, |value| value);
+            black_box(reduce_exact_digests_platform_first(&mut scratch));
+        }
+        let platform_first = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            scratch.clear();
+            extend_field_leaves_batched(black_box(&values), &mut scratch, |value| value);
+            black_box(reduce_exact_digests(&mut scratch));
+        }
+        let fixed_first = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            scratch.clear();
+            extend_field_leaves_batched(black_box(&values), &mut scratch, |value| value);
+            black_box(reduce_exact_digests(&mut scratch));
+        }
+        let fixed_second = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            scratch.clear();
+            extend_field_leaves_batched(black_box(&values), &mut scratch, |value| value);
+            black_box(reduce_exact_digests_platform_first(&mut scratch));
+        }
+        let platform_second = start.elapsed();
+
+        eprintln!(
+            "exact_root_1024 iterations={} platform_hash_many={:.3}/{:.3} ms fixed_first={:.3}/{:.3} ms",
+            iterations,
+            platform_first.as_secs_f64() * 1_000.0,
+            platform_second.as_secs_f64() * 1_000.0,
+            fixed_first.as_secs_f64() * 1_000.0,
+            fixed_second.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]
