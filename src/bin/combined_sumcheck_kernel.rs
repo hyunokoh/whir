@@ -3583,16 +3583,47 @@ fn run_strong_terminal_switch(
     }
 }
 
+#[inline(always)]
+fn wht_butterfly(left: &mut [Field192], right: &mut [Field192], index: usize) {
+    let old_left = left[index];
+    let old_right = right[index];
+    left[index] = old_left + old_right;
+    right[index] = old_left - old_right;
+}
+
 fn wht(values: &mut [Field192]) {
     let mut half = 1;
     while half < values.len() {
         for block in values.chunks_exact_mut(2 * half) {
             let (left, right) = block.split_at_mut(half);
-            for (a, b) in left.iter_mut().zip(right) {
-                let old_a = *a;
-                let old_b = *b;
-                *a = old_a + old_b;
-                *b = old_a - old_b;
+            let mut index = 0;
+            while index + 4 <= half {
+                wht_butterfly(left, right, index);
+                wht_butterfly(left, right, index + 1);
+                wht_butterfly(left, right, index + 2);
+                wht_butterfly(left, right, index + 3);
+                index += 4;
+            }
+            while index < half {
+                wht_butterfly(left, right, index);
+                index += 1;
+            }
+        }
+        half *= 2;
+    }
+}
+
+#[cfg(test)]
+fn wht_iterator(values: &mut [Field192]) {
+    let mut half = 1;
+    while half < values.len() {
+        for block in values.chunks_exact_mut(2 * half) {
+            let (left, right) = block.split_at_mut(half);
+            for (left, right) in left.iter_mut().zip(right) {
+                let old_left = *left;
+                let old_right = *right;
+                *left = old_left + old_right;
+                *right = old_left - old_right;
             }
         }
         half *= 2;
@@ -3680,6 +3711,34 @@ fn encode_parity_blocks_cloned_forward(
             parity
         })
         .collect()
+}
+
+#[cfg(test)]
+fn encode_parity_blocks_iterator_wht(
+    mut message: Vec<Field192>,
+    spectra: &[Vec<Field192>],
+) -> Vec<Vec<Field192>> {
+    wht_iterator(&mut message);
+    let Some((last, prefix)) = spectra.split_last() else {
+        return Vec::new();
+    };
+    let mut parity_blocks = Vec::with_capacity(spectra.len());
+    parity_blocks.extend(prefix.iter().map(|spectrum| {
+        let mut parity = message.clone();
+        parity
+            .iter_mut()
+            .zip(spectrum)
+            .for_each(|(value, multiplier)| *value *= multiplier);
+        wht_iterator(&mut parity);
+        parity
+    }));
+    message
+        .iter_mut()
+        .zip(last)
+        .for_each(|(value, multiplier)| *value *= multiplier);
+    wht_iterator(&mut message);
+    parity_blocks.push(message);
+    parity_blocks
 }
 
 fn populate_parity_from_systematic(
@@ -3819,6 +3878,47 @@ fn populate_parity_from_systematic_cloned_forward(
                         target[lane_start + offset] = lane[parity_block][row];
                     }
                 });
+        }
+    }
+}
+
+#[cfg(test)]
+fn populate_parity_from_systematic_iterator_wht(
+    level: Level,
+    proof_codeword: &mut [Field192],
+    spectra: &[Vec<Field192>],
+    batch_lanes: usize,
+) {
+    assert_eq!(proof_codeword.len(), level.qa_fields());
+    assert_eq!(spectra.len(), level.inverse_rate - 1);
+    let systematic_fields = level.group * level.width;
+    for lane_start in (0..level.width).step_by(batch_lanes) {
+        let lane_end = (lane_start + batch_lanes).min(level.width);
+        let encoded = {
+            let systematic = &proof_codeword[..systematic_fields];
+            (lane_start..lane_end)
+                .into_par_iter()
+                .map(|lane| {
+                    let message = systematic
+                        .chunks_exact(level.width)
+                        .map(|row| row[lane])
+                        .collect::<Vec<_>>();
+                    encode_parity_blocks_iterator_wht(message, spectra)
+                })
+                .collect::<Vec<_>>()
+        };
+        for parity_block in 0..level.inverse_rate - 1 {
+            let start = (parity_block + 1) * systematic_fields;
+            let target = &mut proof_codeword[start..start + systematic_fields];
+            scatter_parity_block_blocked(
+                target,
+                level.width,
+                lane_start,
+                &encoded,
+                parity_block,
+                64,
+                4,
+            );
         }
     }
 }
@@ -8275,6 +8375,125 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(shared, independent);
+    }
+
+    #[test]
+    fn interleaved_wht_matches_iterator_wht() {
+        let mut interleaved = (0..1024).map(left_value).collect::<Vec<_>>();
+        let mut iterator = interleaved.clone();
+        wht(&mut interleaved);
+        wht_iterator(&mut iterator);
+        assert_eq!(interleaved, iterator);
+    }
+
+    #[test]
+    #[ignore = "full-column four-way interleaved WHT A/B benchmark"]
+    fn interleaved_wht_benchmarks_iterator_wht() {
+        let input = (0..CARRYOPEN_ROWS).map(left_value).collect::<Vec<_>>();
+        let mut expected = input.clone();
+        wht_iterator(&mut expected);
+        let mut interleaved_ms = Vec::new();
+        let mut iterator_ms = Vec::new();
+        for trial in 0..12 {
+            let run_interleaved = || {
+                let mut values = input.clone();
+                let start = Instant::now();
+                wht(std::hint::black_box(&mut values));
+                let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+                assert_eq!(values, expected);
+                elapsed
+            };
+            let run_iterator = || {
+                let mut values = input.clone();
+                let start = Instant::now();
+                wht_iterator(std::hint::black_box(&mut values));
+                let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+                assert_eq!(values, expected);
+                elapsed
+            };
+            if trial % 2 == 0 {
+                interleaved_ms.push(run_interleaved());
+                iterator_ms.push(run_iterator());
+            } else {
+                iterator_ms.push(run_iterator());
+                interleaved_ms.push(run_interleaved());
+            }
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        eprintln!(
+            "interleaved-wht interleaved-ms={interleaved_ms:?} iterator-ms={iterator_ms:?} interleaved-median={:.3} iterator-median={:.3}",
+            median(&interleaved_ms),
+            median(&iterator_ms),
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale interleaved versus iterator WHT crossed A/B"]
+    fn interleaved_wht_benchmarks_production_vertical() {
+        let level = carryopen_level();
+        let spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let mut codeword = Vec::with_capacity(level.qa_fields());
+        codeword.extend((0..CARRYOPEN_FIELDS).map(precarry_message_value));
+        codeword.resize(level.qa_fields(), Field192::ZERO);
+        populate_parity_from_systematic(level, &mut codeword, &spectra, 64);
+        let expected_codeword = codeword.clone();
+        populate_parity_from_systematic_iterator_wht(level, &mut codeword, &spectra, 64);
+        assert_eq!(codeword, expected_codeword);
+        drop(expected_codeword);
+
+        let sample_step = CARRYOPEN_WIDTH * CARRYOPEN_ROWS / 64;
+        let mut interleaved_ms = Vec::new();
+        let mut iterator_ms = Vec::new();
+        let mut expected_samples = None;
+        let mut run = |interleaved: bool| {
+            let start = Instant::now();
+            if interleaved {
+                populate_parity_from_systematic(level, &mut codeword, &spectra, 64);
+            } else {
+                populate_parity_from_systematic_iterator_wht(level, &mut codeword, &spectra, 64);
+            }
+            let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+            let samples = codeword
+                .iter()
+                .step_by(sample_step)
+                .copied()
+                .collect::<Vec<_>>();
+            if let Some(expected) = &expected_samples {
+                assert_eq!(&samples, expected);
+            } else {
+                expected_samples = Some(samples);
+            }
+            elapsed
+        };
+        for trial in 0..9 {
+            if trial % 2 == 0 {
+                interleaved_ms.push(run(true));
+                iterator_ms.push(run(false));
+                iterator_ms.push(run(false));
+                interleaved_ms.push(run(true));
+            } else {
+                iterator_ms.push(run(false));
+                interleaved_ms.push(run(true));
+                interleaved_ms.push(run(true));
+                iterator_ms.push(run(false));
+            }
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        eprintln!(
+            "production-interleaved-wht interleaved-ms={interleaved_ms:?} iterator-ms={iterator_ms:?} interleaved-median={:.3} iterator-median={:.3}",
+            median(&interleaved_ms),
+            median(&iterator_ms),
+        );
     }
 
     #[test]
