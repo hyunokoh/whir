@@ -411,6 +411,75 @@ mod neon4 {
     }
 
     #[inline(always)]
+    unsafe fn load_contiguous_digest_words8(children: &[Digest; 8]) -> [Packed8; 8] {
+        let zero = Packed8([vdupq_n_u32(0), vdupq_n_u32(0)]);
+        let mut output = [zero; 8];
+        for group in 0..2 {
+            for word_block in 0..2 {
+                let rows = std::array::from_fn(|lane| unsafe {
+                    vld1q_u32(
+                        children[4 * group + lane]
+                            .as_ptr()
+                            .add(16 * word_block)
+                            .cast(),
+                    )
+                });
+                let words = unsafe { transpose4x4(rows) };
+                for word in 0..4 {
+                    output[4 * word_block + word].0[group] = words[word];
+                }
+            }
+        }
+        output
+    }
+
+    #[inline(always)]
+    unsafe fn load_word_major_group8(storage: &[Digest; 8]) -> [Packed8; 8] {
+        let base = storage.as_ptr().cast::<u32>();
+        std::array::from_fn(|word| unsafe {
+            Packed8([
+                vld1q_u32(base.add(8 * word)),
+                vld1q_u32(base.add(8 * word + 4)),
+            ])
+        })
+    }
+
+    #[inline(always)]
+    unsafe fn store_word_major_group8(storage: &mut [Digest; 8], words: &[Packed8; 8]) {
+        let base = storage.as_mut_ptr().cast::<u32>();
+        for (word, value) in words.iter().enumerate() {
+            unsafe {
+                vst1q_u32(base.add(8 * word), value.0[0]);
+                vst1q_u32(base.add(8 * word + 4), value.0[1]);
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn store_lane_major_digests8(storage: &mut [Digest; 8], words: &[Packed8; 8]) {
+        for group in 0..2 {
+            for word_block in 0..2 {
+                let lanes = unsafe {
+                    transpose4x4(std::array::from_fn(|word| {
+                        words[4 * word_block + word].0[group]
+                    }))
+                };
+                for (lane, value) in lanes.into_iter().enumerate() {
+                    unsafe {
+                        vst1q_u32(
+                            storage[4 * group + lane]
+                                .as_mut_ptr()
+                                .add(16 * word_block)
+                                .cast(),
+                            value,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
     unsafe fn compress_message_xof32_8_packed<const TRANSPOSED_OUTPUT: bool>(
         cvs: &[Packed8; 8],
         message: &[Packed8; 16],
@@ -893,6 +962,45 @@ mod neon4 {
         unsafe { compress_parent_v2_digests8(&left, &right) }
     }
 
+    #[target_feature(enable = "neon")]
+    pub unsafe fn reduce_word_major_parent_groups_v2(scratch: &mut [Digest]) {
+        assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
+        assert_eq!(scratch.len() % 8, 0);
+        for chunk in scratch.chunks_exact_mut(8) {
+            let chunk: &mut [Digest; 8] = chunk.try_into().unwrap();
+            let words = unsafe { load_contiguous_digest_words8(chunk) };
+            unsafe { store_word_major_group8(chunk, &words) };
+        }
+        let mut groups = scratch.len() / 8;
+        while groups > 1 {
+            for output in 0..groups / 2 {
+                let first_start = 16 * output;
+                let second_start = first_start + 8;
+                let parents = {
+                    let first: &[Digest; 8] =
+                        scratch[first_start..first_start + 8].try_into().unwrap();
+                    let second: &[Digest; 8] =
+                        scratch[second_start..second_start + 8].try_into().unwrap();
+                    let first = unsafe { load_word_major_group8(first) };
+                    let second = unsafe { load_word_major_group8(second) };
+                    let (left, right) = unsafe { pair_child_words8(&first, &second) };
+                    unsafe { compress_parent_v2_words8(&left, &right) }
+                };
+                let output_group: &mut [Digest; 8] = (&mut scratch[8 * output..8 * output + 8])
+                    .try_into()
+                    .unwrap();
+                unsafe { store_word_major_group8(output_group, &parents) };
+            }
+            groups /= 2;
+        }
+        let words = {
+            let final_group: &[Digest; 8] = scratch[..8].try_into().unwrap();
+            unsafe { load_word_major_group8(final_group) }
+        };
+        let final_group: &mut [Digest; 8] = (&mut scratch[..8]).try_into().unwrap();
+        unsafe { store_lane_major_digests8(final_group, &words) };
+    }
+
     #[inline(always)]
     unsafe fn compress_parent_words8(left: &[Packed8; 8], right: &[Packed8; 8]) -> [Packed8; 8] {
         let (first_block, final_block) = unsafe { parent_messages8_from_words(left, right) };
@@ -1313,6 +1421,7 @@ fn parent4(children: &[Digest; 8]) -> [Digest; 4] {
     parent4_one_block_v2(children)
 }
 
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn parent8_materialized_fixed_first_compression(children: &[Digest; 16]) -> [Digest; 8] {
     let platform = blake3_platform();
     if platform.simd_degree() < 4 {
@@ -1531,6 +1640,16 @@ fn parent8_one_block_v2(children: &[Digest; 16]) -> [Digest; 8] {
             parent_one_block_v2(children[2 * index], children[2 * index + 1])
         })
     }
+}
+
+fn parent8_materialized_one_block_v2(children: &[Digest; 16]) -> [Digest; 8] {
+    let blocks = std::array::from_fn(|index| {
+        let mut block = [0_u8; 64];
+        block[..32].copy_from_slice(&children[2 * index]);
+        block[32..].copy_from_slice(&children[2 * index + 1]);
+        block
+    });
+    fixed_blake3_xof8(&[BLAKE3_IV; 8], &blocks, 64, BLAKE3_PARENT | BLAKE3_ROOT)
 }
 
 fn field_level1_one_block_v2(values: &[Field192; 16]) -> [Digest; 8] {
@@ -1886,6 +2005,7 @@ fn reduce_exact_digests_platform_first(scratch: &mut [Digest]) -> Digest {
     scratch[0]
 }
 
+#[cfg(test)]
 fn reduce_exact_digests_materialized_fixed_first(scratch: &mut [Digest]) -> Digest {
     assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
     let mut active = scratch.len();
@@ -1911,6 +2031,52 @@ fn reduce_exact_digests_materialized_fixed_first(scratch: &mut [Digest]) -> Dige
         active = pairs;
     }
     scratch[0]
+}
+
+fn reduce_exact_digests_materialized_blocks_v2(scratch: &mut [Digest]) -> Digest {
+    assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
+    let mut active = scratch.len();
+    while active > 1 {
+        let pairs = active / 2;
+        let batched8 = pairs / 8 * 8;
+        for pair in (0..batched8).step_by(8) {
+            let child = 2 * pair;
+            let roots = {
+                let children: &[Digest; 16] = scratch[child..child + 16].try_into().unwrap();
+                parent8_materialized_one_block_v2(children)
+            };
+            scratch[pair..pair + 8].copy_from_slice(&roots);
+        }
+        let batched4 = batched8 + (pairs - batched8) / 4 * 4;
+        for pair in (batched8..batched4).step_by(4) {
+            let child = 2 * pair;
+            let roots = {
+                let children: &[Digest; 8] = scratch[child..child + 8].try_into().unwrap();
+                parent4_one_block_v2(children)
+            };
+            scratch[pair..pair + 4].copy_from_slice(&roots);
+        }
+        for pair in batched4..pairs {
+            scratch[pair] = parent_one_block_v2(scratch[2 * pair], scratch[2 * pair + 1]);
+        }
+        active = pairs;
+    }
+    scratch[0]
+}
+
+fn reduce_exact_digests_word_major_v2(scratch: &mut [Digest]) -> Digest {
+    assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: the function is compiled with NEON enabled and AArch64
+        // guarantees NEON support.
+        unsafe { neon4::reduce_word_major_parent_groups_v2(scratch) };
+        reduce_exact_digests_unfused_parent_levels(&mut scratch[..8])
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        reduce_exact_digests(scratch)
+    }
 }
 
 fn extend_field_leaves_batched<F>(values: &[Field192], scratch: &mut Vec<Digest>, transform: F)
@@ -2068,12 +2234,14 @@ pub fn exact_prefix_root_with_scratch(values: &[Field192], scratch: &mut Vec<Dig
     scratch.clear();
     if values.len() >= 32 {
         extend_field_level2_batched_v2(values, scratch);
+        reduce_exact_digests_word_major_v2(scratch)
     } else if values.len() >= 16 {
         extend_field_level1_batched(values, scratch);
+        reduce_exact_digests(scratch)
     } else {
         extend_field_leaves_batched(values, scratch, |value| value);
+        reduce_exact_digests(scratch)
     }
-    reduce_exact_digests(scratch)
 }
 
 /// Reproduce the former field-level-1 schedule for the production v2 layout.
@@ -2098,8 +2266,8 @@ pub fn prefix_root_one_block_nodes_v2_for_benchmark(
     })
 }
 
-/// Reproduce the production schedule that fuses field leaves with the first
-/// two v2 parent levels, halving the initial digest scratch.
+/// Reproduce the former lane-major upper reducer after fusing field leaves
+/// with the first two v2 parent levels.
 #[doc(hidden)]
 pub fn prefix_root_fused_field_level2_v2_for_benchmark(
     values: &[Field192],
@@ -2119,6 +2287,24 @@ pub fn prefix_root_fused_field_level2_v2_for_benchmark(
             extend_field_leaves_batched(values, &mut scratch, |value| value);
         }
         reduce_exact_digests(&mut scratch)
+    })
+}
+
+/// Reproduce the production upper reducer that keeps Merkle levels in
+/// word-major eight-digest groups between compressions.
+#[doc(hidden)]
+pub fn prefix_root_word_major_upper_v2_for_benchmark(
+    values: &[Field192],
+    capacity: usize,
+    _zeros: &[Digest],
+) -> Digest {
+    assert_eq!(values.len(), capacity);
+    assert!(capacity >= 32 && capacity.is_power_of_two());
+    EXACT_ROOT_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        scratch.clear();
+        extend_field_level2_batched_v2(values, &mut scratch);
+        reduce_exact_digests_word_major_v2(&mut scratch)
     })
 }
 
@@ -2364,7 +2550,7 @@ pub fn prefix_root_materialized_parents_for_benchmark(
             let mut scratch = scratch.borrow_mut();
             scratch.clear();
             extend_field_leaves_batched(values, &mut scratch, |value| value);
-            reduce_exact_digests_materialized_fixed_first(&mut scratch)
+            reduce_exact_digests_materialized_blocks_v2(&mut scratch)
         });
     }
     sequential_prefix_root(values, capacity, zeros)
@@ -2384,7 +2570,7 @@ pub fn prefix_root_materialized_blocks_for_benchmark(
             let mut scratch = scratch.borrow_mut();
             scratch.clear();
             extend_field_leaves_batched_materialized(values, &mut scratch, |value| value);
-            reduce_exact_digests_materialized_fixed_first(&mut scratch)
+            reduce_exact_digests_materialized_blocks_v2(&mut scratch)
         });
     }
     sequential_prefix_root(values, capacity, zeros)
@@ -2940,6 +3126,24 @@ mod tests {
                 candidate,
                 prefix_root_fused_field_level2_v2_for_benchmark(&values[..size], size, &zeros)
             );
+            assert_eq!(
+                candidate,
+                prefix_root_materialized_leaves_for_benchmark(&values[..size], size, &zeros)
+            );
+            assert_eq!(
+                candidate,
+                prefix_root_materialized_parents_for_benchmark(&values[..size], size, &zeros)
+            );
+            assert_eq!(
+                candidate,
+                prefix_root_materialized_blocks_for_benchmark(&values[..size], size, &zeros)
+            );
+            if size >= 32 {
+                assert_eq!(
+                    candidate,
+                    prefix_root_word_major_upper_v2_for_benchmark(&values[..size], size, &zeros,)
+                );
+            }
             assert_ne!(
                 candidate,
                 prefix_root_two_block_nodes_v1_for_benchmark(
@@ -2949,6 +3153,40 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    #[ignore = "word-major versus lane-major upper v2 exact-root benchmark"]
+    fn word_major_upper_v2_benchmarks_lane_major() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let values = (0..1024_u64)
+            .map(|index| {
+                let seed = blake3::hash(&(index + 997).to_le_bytes());
+                Field192::from_le_bytes_mod_order(seed.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        let zeros = zero_roots(10);
+        let iterations = 20_000;
+        let run = |root: fn(&[Field192], usize, &[Digest]) -> Digest| {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(root(black_box(&values), values.len(), &zeros));
+            }
+            start.elapsed()
+        };
+        let lane_first = run(prefix_root_fused_field_level2_v2_for_benchmark);
+        let word_first = run(prefix_root_word_major_upper_v2_for_benchmark);
+        let word_second = run(prefix_root_word_major_upper_v2_for_benchmark);
+        let lane_second = run(prefix_root_fused_field_level2_v2_for_benchmark);
+        eprintln!(
+            "word-major-upper-v2 exact_root_1024 iterations={iterations} lane={:.3}/{:.3} ms word={:.3}/{:.3} ms",
+            lane_first.as_secs_f64() * 1_000.0,
+            lane_second.as_secs_f64() * 1_000.0,
+            word_first.as_secs_f64() * 1_000.0,
+            word_second.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]

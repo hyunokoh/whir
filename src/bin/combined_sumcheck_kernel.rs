@@ -40,8 +40,8 @@ use whir::lilac_merkle::{
     prefix_root_scalar_parent_messages_for_benchmark, prefix_root_scatter_for_benchmark,
     prefix_root_two_block_nodes_v1_for_benchmark, prefix_root_unfused_for_benchmark,
     prefix_root_unfused_leaf_parent_io_for_benchmark,
-    prefix_root_unfused_parent_levels_for_benchmark, scaled_prefix_root_sequential_for_benchmark,
-    zero_roots_one_block_nodes_v2_for_benchmark,
+    prefix_root_unfused_parent_levels_for_benchmark, prefix_root_word_major_upper_v2_for_benchmark,
+    scaled_prefix_root_sequential_for_benchmark, zero_roots_one_block_nodes_v2_for_benchmark,
 };
 
 #[derive(Debug, Parser)]
@@ -10527,6 +10527,64 @@ mod tests {
             level1_second.1.as_secs_f64() * 1_000.0,
             level2_first.1.as_secs_f64() * 1_000.0,
             level2_second.1.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale word-major versus lane-major upper v2 tensor roots"]
+    fn word_major_upper_v2_benchmarks_lane_major_tensor_roots() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let message_row_roots = message
+            .par_chunks_exact(CARRYOPEN_WIDTH)
+            .map(|row| prefix_root(row, CARRYOPEN_WIDTH, &zeros))
+            .collect::<Vec<_>>();
+        let vertical_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(10, component, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(11, component, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &message, &mut proof_codeword, &vertical_spectra, 64);
+        let run = |row_root: fn(&[Field192], usize, &[Digest]) -> Digest| {
+            let start = Instant::now();
+            let commitments = tensor_row_commitments_with_root(
+                &proof_codeword,
+                &message_row_roots,
+                &horizontal_spectra,
+                &zeros,
+                row_root,
+                combine_equal_subtrees,
+            );
+            (commitments, start.elapsed())
+        };
+        let lane_first = run(prefix_root_fused_field_level2_v2_for_benchmark);
+        let word_first = run(prefix_root_word_major_upper_v2_for_benchmark);
+        let word_second = run(prefix_root_word_major_upper_v2_for_benchmark);
+        let lane_second = run(prefix_root_fused_field_level2_v2_for_benchmark);
+        let assert_same = |candidate: &[MatrixCommitment], expected: &[MatrixCommitment]| {
+            assert_eq!(candidate.len(), expected.len());
+            for (candidate, expected) in candidate.iter().zip(expected) {
+                assert_eq!(candidate.root, expected.root);
+                assert_eq!(candidate.row_roots, expected.row_roots);
+                assert_eq!(candidate.row_domain, expected.row_domain);
+                assert_eq!(candidate.zero_row_root, expected.zero_row_root);
+            }
+        };
+        assert_same(&lane_first.0, &word_first.0);
+        assert_same(&lane_first.0, &word_second.0);
+        assert_same(&lane_first.0, &lane_second.0);
+        eprintln!(
+            "word-major-upper-v2 tensor-roots lane={:.3}/{:.3} ms word={:.3}/{:.3} ms",
+            lane_first.1.as_secs_f64() * 1_000.0,
+            lane_second.1.as_secs_f64() * 1_000.0,
+            word_first.1.as_secs_f64() * 1_000.0,
+            word_second.1.as_secs_f64() * 1_000.0,
         );
     }
 
