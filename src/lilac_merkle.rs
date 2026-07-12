@@ -1128,6 +1128,16 @@ pub fn scaled_prefix_root(
 
 pub fn combine_equal_subtrees(roots: &[Digest]) -> Digest {
     assert!(!roots.is_empty() && roots.len().is_power_of_two());
+    match roots {
+        [root] => return *root,
+        [left, right] => return parent(*left, *right),
+        [a, b, c, d] => return parent(parent(*a, *b), parent(*c, *d)),
+        _ => {}
+    }
+    combine_equal_subtrees_parallel(roots)
+}
+
+fn combine_equal_subtrees_parallel(roots: &[Digest]) -> Digest {
     let mut level = roots.to_vec();
     while level.len() > 1 {
         level = level
@@ -1136,6 +1146,14 @@ pub fn combine_equal_subtrees(roots: &[Digest]) -> Digest {
             .collect();
     }
     level[0]
+}
+
+/// Reproduce the allocation-heavy parallel reducer for crossed artifact
+/// benchmarks. This is transcript-identical to [`combine_equal_subtrees`].
+#[doc(hidden)]
+pub fn combine_equal_subtrees_parallel_for_benchmark(roots: &[Digest]) -> Digest {
+    assert!(!roots.is_empty() && roots.len().is_power_of_two());
+    combine_equal_subtrees_parallel(roots)
 }
 
 #[cfg(test)]
@@ -1150,6 +1168,19 @@ mod tests {
             hasher.update(&limb.to_le_bytes());
         }
         *hasher.finalize().as_bytes()
+    }
+
+    #[test]
+    fn small_equal_subtree_fast_paths_match_parallel_reduction() {
+        let roots = (0..64)
+            .map(|index| field_leaf(Field192::from(index as u64)))
+            .collect::<Vec<_>>();
+        for size in [1, 2, 4, 8, 16, 64] {
+            assert_eq!(
+                combine_equal_subtrees(&roots[..size]),
+                combine_equal_subtrees_parallel(&roots[..size])
+            );
+        }
     }
 
     fn legacy_parent(left: Digest, right: Digest) -> Digest {

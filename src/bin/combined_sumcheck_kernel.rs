@@ -30,8 +30,8 @@ use whir::{
 
 #[cfg(test)]
 use whir::lilac_merkle::{
-    prefix_root_materialized_blocks_for_benchmark, prefix_root_materialized_leaves_for_benchmark,
-    prefix_root_materialized_parents_for_benchmark,
+    combine_equal_subtrees_parallel_for_benchmark, prefix_root_materialized_blocks_for_benchmark,
+    prefix_root_materialized_leaves_for_benchmark, prefix_root_materialized_parents_for_benchmark,
 };
 
 #[derive(Debug, Parser)]
@@ -1864,6 +1864,7 @@ fn tensor_row_commitments_with_root(
     horizontal_spectra: &[Vec<Field192>],
     zeros: &[Digest],
     row_root: fn(&[Field192], usize, &[Digest]) -> Digest,
+    combine_roots: fn(&[Digest]) -> Digest,
 ) -> Vec<MatrixCommitment> {
     let row_roots = vertical_codeword
         .par_chunks_exact(CARRYOPEN_WIDTH)
@@ -1890,7 +1891,7 @@ fn tensor_row_commitments_with_root(
                         wht(parity);
                         *root = row_root(parity, CARRYOPEN_WIDTH, zeros);
                     }
-                    combine_equal_subtrees(&roots)
+                    combine_roots(&roots)
                 } else {
                     encoded[..CARRYOPEN_WIDTH].copy_from_slice(row);
                     for (block, spectrum) in horizontal_spectra.iter().enumerate() {
@@ -1911,7 +1912,7 @@ fn tensor_row_commitments_with_root(
     row_roots
         .chunks_exact(CARRYOPEN_ROWS)
         .map(|roots| MatrixCommitment {
-            root: combine_equal_subtrees(roots),
+            root: combine_roots(roots),
             row_roots: roots.to_vec(),
             row_domain: CARRYOPEN_ROWS,
             zero_row_root: zeros[CARRYOPEN_TENSOR_WIDTH.trailing_zeros() as usize],
@@ -7809,6 +7810,7 @@ mod tests {
                     &horizontal_spectra,
                     &zeros,
                     row_root,
+                    combine_equal_subtrees,
                 )
             } else {
                 tensor_row_commitments(
@@ -7875,6 +7877,62 @@ mod tests {
             parent_second_time.as_secs_f64() * 1_000.0,
             baseline_first_time.as_secs_f64() * 1_000.0,
             baseline_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale small-subtree reducer crossed A/B benchmark"]
+    fn small_subtree_fast_path_benchmarks_parallel_reducer() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let (_, message_row_roots) =
+            exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
+        let vertical_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(11, block, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &message, &mut proof_codeword, &vertical_spectra, 64);
+
+        type CombineRoots = fn(&[Digest]) -> Digest;
+        let run = |combine_roots: CombineRoots| {
+            let start = Instant::now();
+            let commitment = tensor_row_commitments_with_root(
+                &proof_codeword,
+                &message_row_roots,
+                &horizontal_spectra,
+                &zeros,
+                prefix_root,
+                combine_roots,
+            );
+            (commitment, start.elapsed())
+        };
+        let (fast_first, fast_first_time) = run(combine_equal_subtrees);
+        let (parallel_first, parallel_first_time) =
+            run(combine_equal_subtrees_parallel_for_benchmark);
+        let (parallel_second, parallel_second_time) =
+            run(combine_equal_subtrees_parallel_for_benchmark);
+        let (fast_second, fast_second_time) = run(combine_equal_subtrees);
+
+        for candidate in [&parallel_first, &parallel_second, &fast_second] {
+            assert_eq!(candidate.len(), fast_first.len());
+            for (candidate, expected) in candidate.iter().zip(&fast_first) {
+                assert_eq!(candidate.root, expected.root);
+                assert_eq!(candidate.row_roots, expected.row_roots);
+            }
+        }
+        eprintln!(
+            "small-fast={:.3}/{:.3} ms parallel-legacy={:.3}/{:.3} ms",
+            fast_first_time.as_secs_f64() * 1_000.0,
+            fast_second_time.as_secs_f64() * 1_000.0,
+            parallel_first_time.as_secs_f64() * 1_000.0,
+            parallel_second_time.as_secs_f64() * 1_000.0,
         );
     }
 
