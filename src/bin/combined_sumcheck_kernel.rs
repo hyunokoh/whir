@@ -623,28 +623,33 @@ fn shared_rank_one_row_round_polynomials(
         )
 }
 
-fn fold_tensor_rows_to_vec(
-    values: &[Field192],
+fn fold_tensor_rows_dual_in_place(
+    values: &mut [Field192],
     active_rows: usize,
     width: usize,
-    challenge: Field192,
-) -> Vec<Field192> {
+    first_challenge: Field192,
+    second_challenge: Field192,
+) -> usize {
     assert!(active_rows.is_power_of_two());
     assert!(values.len() >= active_rows * width);
     let half_fields = active_rows / 2 * width;
-    (0..half_fields)
-        .into_par_iter()
-        .map(|index| {
-            let low = values[index];
-            low + (values[half_fields + index] - low) * challenge
-        })
-        .collect()
+    let (low, high) = values[..2 * half_fields].split_at_mut(half_fields);
+    low.par_iter_mut()
+        .zip(high.par_iter_mut())
+        .for_each(|(low, high)| {
+            let low_value = *low;
+            let difference = *high - low_value;
+            *low = low_value + difference * first_challenge;
+            *high = low_value + difference * second_challenge;
+        });
+    active_rows / 2
 }
 
 /// Produce the membership and evaluation sumchecks from one shared codeword.
 /// The first row round scans the common matrix once. After both transcript
-/// challenges are known, the evaluation state branches into a half-size
-/// buffer while the membership state folds the original allocation in place.
+/// challenges are known, the two half-size states occupy the lower and upper
+/// halves of the original allocation. This avoids a separate half-codeword
+/// evaluation buffer.
 fn prove_dual_rank_one_tensor_product_relations(
     mut membership_coefficients: Vec<Field192>,
     membership_alpha: Vec<Field192>,
@@ -717,16 +722,22 @@ fn prove_dual_rank_one_tensor_product_relations(
     );
     let membership_linear = membership_claim - membership_constant.double() - membership_quadratic;
     let evaluation_linear = evaluation_claim - evaluation_constant.double() - evaluation_quadratic;
-    let mut evaluation_right = fold_tensor_rows_to_vec(&right, rows, width, evaluation_challenge);
     let membership_rows =
         fold_rank_one_coefficients(&mut membership_coefficients, rows, membership_challenge);
     let evaluation_rows =
         fold_rank_one_coefficients(&mut evaluation_coefficients, rows, evaluation_challenge);
     assert_eq!(membership_rows, evaluation_rows);
     assert_eq!(
-        fold_tensor_rows(&mut right, rows, width, membership_challenge),
+        fold_tensor_rows_dual_in_place(
+            &mut right,
+            rows,
+            width,
+            membership_challenge,
+            evaluation_challenge,
+        ),
         membership_rows
     );
+    let evaluation_offset = rows / 2 * width;
     membership_claim = (membership_quadratic * membership_challenge + membership_linear)
         * membership_challenge
         + membership_constant;
@@ -736,17 +747,19 @@ fn prove_dual_rank_one_tensor_product_relations(
 
     let mut active_rows = membership_rows;
     for _ in 1..row_variables {
+        let (membership_right, evaluation_storage) = right.split_at(evaluation_offset);
+        let evaluation_right = &evaluation_storage[..evaluation_offset];
         let (membership_constant, membership_quadratic) = rank_one_left_row_round_polynomial(
             &membership_coefficients,
             &membership_alpha,
-            &right,
+            membership_right,
             active_rows,
             width,
         );
         let (evaluation_constant, evaluation_quadratic) = rank_one_left_row_round_polynomial(
             &evaluation_coefficients,
             &evaluation_alpha,
-            &evaluation_right,
+            evaluation_right,
             active_rows,
             width,
         );
@@ -781,17 +794,14 @@ fn prove_dual_rank_one_tensor_product_relations(
             evaluation_challenge,
         );
         assert_eq!(next_membership_rows, next_evaluation_rows);
+        let (membership_right, evaluation_storage) = right.split_at_mut(evaluation_offset);
+        let evaluation_right = &mut evaluation_storage[..evaluation_offset];
         assert_eq!(
-            fold_tensor_rows(&mut right, active_rows, width, membership_challenge),
+            fold_tensor_rows(membership_right, active_rows, width, membership_challenge),
             next_membership_rows
         );
         assert_eq!(
-            fold_tensor_rows(
-                &mut evaluation_right,
-                active_rows,
-                width,
-                evaluation_challenge,
-            ),
+            fold_tensor_rows(evaluation_right, active_rows, width, evaluation_challenge),
             next_evaluation_rows
         );
         active_rows = next_membership_rows;
@@ -804,6 +814,7 @@ fn prove_dual_rank_one_tensor_product_relations(
     }
     assert_eq!(active_rows, 1);
 
+    let evaluation_right = right[evaluation_offset..evaluation_offset + width].to_vec();
     let membership = finish_rank_one_tensor_product_relation(
         membership_coefficients[0],
         membership_alpha,
@@ -8305,6 +8316,44 @@ mod tests {
             fused_evaluation.right_ood_row,
             legacy_evaluation.right_ood_row
         );
+    }
+
+    #[test]
+    fn dual_in_place_row_fold_matches_two_independent_folds() {
+        for rows in [2_usize, 4, 8, 16] {
+            for width in [2_usize, 4, 8] {
+                let original = (0..rows * width)
+                    .map(|index| Field192::from((17 * index + rows + width) as u64))
+                    .collect::<Vec<_>>();
+                let first_challenge = Field192::from((3 * rows + width + 1) as u64);
+                let second_challenge = Field192::from((rows + 5 * width + 2) as u64);
+                let mut first = original.clone();
+                let mut second = original.clone();
+                let expected_rows = fold_tensor_rows(&mut first, rows, width, first_challenge);
+                assert_eq!(
+                    fold_tensor_rows(&mut second, rows, width, second_challenge),
+                    expected_rows
+                );
+
+                let mut packed = original;
+                assert_eq!(
+                    fold_tensor_rows_dual_in_place(
+                        &mut packed,
+                        rows,
+                        width,
+                        first_challenge,
+                        second_challenge,
+                    ),
+                    expected_rows
+                );
+                let half_fields = expected_rows * width;
+                assert_eq!(&packed[..half_fields], &first[..half_fields]);
+                assert_eq!(
+                    &packed[half_fields..2 * half_fields],
+                    &second[..half_fields]
+                );
+            }
+        }
     }
 
     #[test]
