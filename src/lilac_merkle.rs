@@ -1,5 +1,6 @@
 use ark_ff::PrimeField;
 use rayon::prelude::*;
+use std::sync::OnceLock;
 
 use crate::algebra::fields::Field192;
 
@@ -7,24 +8,59 @@ pub type Digest = [u8; 32];
 
 const FIELD_LEAF_DOMAIN: &[u8; 19] = b"LiLAC/field-leaf/v1";
 const FIELD_NODE_DOMAIN: &[u8; 19] = b"LiLAC/field-node/v1";
+const BLAKE3_IV: [u32; 8] = [
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+];
+const BLAKE3_CHUNK_START: u8 = 1 << 0;
+const BLAKE3_CHUNK_END: u8 = 1 << 1;
+const BLAKE3_ROOT: u8 = 1 << 3;
+
+fn blake3_platform() -> blake3::platform::Platform {
+    // `platform` is a doc-hidden benchmark API. Cargo.toml pins Blake3 1.8.3,
+    // and the tests below compare both fixed transcript lengths against the
+    // stable `blake3::hash` entry point over thousands of inputs.
+    static PLATFORM: OnceLock<blake3::platform::Platform> = OnceLock::new();
+    *PLATFORM.get_or_init(blake3::platform::Platform::detect)
+}
+
+fn fixed_blake3_hash_43(block: &[u8; 64]) -> Digest {
+    let output = blake3_platform().compress_xof(
+        &BLAKE3_IV,
+        block,
+        43,
+        0,
+        BLAKE3_CHUNK_START | BLAKE3_CHUNK_END | BLAKE3_ROOT,
+    );
+    output[..32].try_into().unwrap()
+}
+
+fn fixed_blake3_hash_83(first: &[u8; 64], second: &[u8; 64]) -> Digest {
+    let platform = blake3_platform();
+    let mut cv = BLAKE3_IV;
+    platform.compress_in_place(&mut cv, first, 64, 0, BLAKE3_CHUNK_START);
+    let output = platform.compress_xof(&cv, second, 19, 0, BLAKE3_CHUNK_END | BLAKE3_ROOT);
+    output[..32].try_into().unwrap()
+}
 
 pub fn field_leaf(value: Field192) -> Digest {
-    let mut input = [0_u8; FIELD_LEAF_DOMAIN.len() + 24];
+    let mut input = [0_u8; 64];
     input[..FIELD_LEAF_DOMAIN.len()].copy_from_slice(FIELD_LEAF_DOMAIN);
     let bigint = value.into_bigint();
     for (index, limb) in bigint.as_ref().iter().enumerate() {
         let start = FIELD_LEAF_DOMAIN.len() + index * 8;
         input[start..start + 8].copy_from_slice(&limb.to_le_bytes());
     }
-    *blake3::hash(&input).as_bytes()
+    fixed_blake3_hash_43(&input)
 }
 
 pub fn parent(left: Digest, right: Digest) -> Digest {
-    let mut input = [0_u8; FIELD_NODE_DOMAIN.len() + 2 * 32];
-    input[..FIELD_NODE_DOMAIN.len()].copy_from_slice(FIELD_NODE_DOMAIN);
-    input[FIELD_NODE_DOMAIN.len()..FIELD_NODE_DOMAIN.len() + 32].copy_from_slice(&left);
-    input[FIELD_NODE_DOMAIN.len() + 32..].copy_from_slice(&right);
-    *blake3::hash(&input).as_bytes()
+    let mut first = [0_u8; 64];
+    first[..FIELD_NODE_DOMAIN.len()].copy_from_slice(FIELD_NODE_DOMAIN);
+    first[FIELD_NODE_DOMAIN.len()..FIELD_NODE_DOMAIN.len() + 32].copy_from_slice(&left);
+    first[FIELD_NODE_DOMAIN.len() + 32..].copy_from_slice(&right[..13]);
+    let mut second = [0_u8; 64];
+    second[..19].copy_from_slice(&right[13..]);
+    fixed_blake3_hash_83(&first, &second)
 }
 
 pub fn zero_roots(max_height: usize) -> Vec<Digest> {
@@ -198,6 +234,25 @@ mod tests {
         assert_eq!(field_leaf(Field192::from(17_u64)), left);
         assert_eq!(field_leaf(Field192::from(29_u64)), right);
         assert_eq!(parent(left, right), legacy_parent(left, right));
+    }
+
+    #[test]
+    fn fixed_length_hashes_match_blake3_over_many_inputs() {
+        for index in 0..4096_u64 {
+            let seed = blake3::hash(&index.to_le_bytes());
+            let value = Field192::from_le_bytes_mod_order(seed.as_bytes());
+            assert_eq!(field_leaf(value), legacy_field_leaf(value));
+
+            let mut left_input = [0_u8; 16];
+            left_input[..8].copy_from_slice(&index.to_le_bytes());
+            left_input[8..].copy_from_slice(&index.wrapping_mul(3).to_le_bytes());
+            let left = *blake3::hash(&left_input).as_bytes();
+            let mut right_input = [0_u8; 16];
+            right_input[..8].copy_from_slice(&index.wrapping_add(1).to_le_bytes());
+            right_input[8..].copy_from_slice(&index.wrapping_mul(7).to_le_bytes());
+            let right = *blake3::hash(&right_input).as_bytes();
+            assert_eq!(parent(left, right), legacy_parent(left, right));
+        }
     }
 
     #[test]

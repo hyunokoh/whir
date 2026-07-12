@@ -36,7 +36,9 @@ redundant_closure_for_method_calls = "allow"
 ark-std = { version = "0.5", features = ["std"] }
 ark-ff = { version = "0.5", features = ["asm", "std"] }
 ark-serialize = "0.5"
-blake3 = { version = "1.5", features = ["digest", "traits-preview"] }
+# LiLAC's fixed-length field-Merkle path uses the doc-hidden platform
+# compression API and is regression-tested byte-for-byte at this exact version.
+blake3 = { version = "=1.8.3", features = ["digest", "traits-preview"] }
 sha3 = { version = "0.10.7", features = ["asm", "oid"] }
 clap = { version = "4.4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
