@@ -1296,16 +1296,69 @@ fn encode_horizontal_row(row: &[Field192], spectra: &[Vec<Field192>]) -> Vec<Fie
     assert_eq!(spectra.len(), CARRYOPEN_INVERSE_RATE - 1);
     let mut encoded = Vec::with_capacity(CARRYOPEN_TENSOR_WIDTH);
     encoded.extend_from_slice(row);
+    let mut transformed = row.to_vec();
+    wht(&mut transformed);
     for spectrum in spectra {
-        let mut parity = row.to_vec();
-        apply_encoder(&mut parity, spectrum);
+        let mut parity = transformed.clone();
+        parity
+            .iter_mut()
+            .zip(spectrum)
+            .for_each(|(value, multiplier)| *value *= multiplier);
+        wht(&mut parity);
         encoded.extend(parity);
     }
     encoded
 }
 
+/// Return the ordinary flat Merkle root together with its exact `row_width`
+/// subtree roots.  Keeping these roots lets the tensor commitment reuse the
+/// already-hashed systematic quarter of its first matrix.
+fn exact_root_with_row_subtrees(
+    values: &[Field192],
+    row_width: usize,
+    zeros: &[Digest],
+) -> (Digest, Vec<Digest>) {
+    assert!(
+        !values.is_empty()
+            && values.len().is_power_of_two()
+            && row_width.is_power_of_two()
+            && row_width <= values.len()
+            && values.len() % row_width == 0
+    );
+    let row_roots = values
+        .par_chunks_exact(row_width)
+        .map(|row| prefix_root(row, row_width, zeros))
+        .collect::<Vec<_>>();
+    (combine_equal_subtrees(&row_roots), row_roots)
+}
+
+fn horizontal_row_root_with_systematic_subtree(
+    row: &[Field192],
+    systematic_root: Digest,
+    spectra: &[Vec<Field192>],
+    zeros: &[Digest],
+) -> Digest {
+    assert_eq!(row.len(), CARRYOPEN_WIDTH);
+    assert_eq!(spectra.len(), CARRYOPEN_INVERSE_RATE - 1);
+    let mut transformed = row.to_vec();
+    wht(&mut transformed);
+    let mut roots = Vec::with_capacity(CARRYOPEN_INVERSE_RATE);
+    roots.push(systematic_root);
+    for spectrum in spectra {
+        let mut parity = transformed.clone();
+        parity
+            .iter_mut()
+            .zip(spectrum)
+            .for_each(|(value, multiplier)| *value *= multiplier);
+        wht(&mut parity);
+        roots.push(prefix_root(&parity, CARRYOPEN_WIDTH, zeros));
+    }
+    combine_equal_subtrees(&roots)
+}
+
 fn tensor_row_commitments(
     vertical_codeword: &[Field192],
+    message_row_roots: &[Digest],
     horizontal_spectra: &[Vec<Field192>],
     zeros: &[Digest],
 ) -> Vec<MatrixCommitment> {
@@ -1313,11 +1366,22 @@ fn tensor_row_commitments(
         vertical_codeword.len(),
         CARRYOPEN_INVERSE_RATE * CARRYOPEN_FIELDS
     );
+    assert_eq!(message_row_roots.len(), CARRYOPEN_ROWS);
     let row_roots = vertical_codeword
         .par_chunks_exact(CARRYOPEN_WIDTH)
-        .map(|row| {
-            let encoded = encode_horizontal_row(row, horizontal_spectra);
-            prefix_root(&encoded, CARRYOPEN_TENSOR_WIDTH, zeros)
+        .enumerate()
+        .map(|(index, row)| {
+            if index < CARRYOPEN_ROWS {
+                horizontal_row_root_with_systematic_subtree(
+                    row,
+                    message_row_roots[index],
+                    horizontal_spectra,
+                    zeros,
+                )
+            } else {
+                let encoded = encode_horizontal_row(row, horizontal_spectra);
+                prefix_root(&encoded, CARRYOPEN_TENSOR_WIDTH, zeros)
+            }
         })
         .collect::<Vec<_>>();
     row_roots
@@ -2146,6 +2210,10 @@ struct CarryOpenMeasurement {
     message_commit: Duration,
     precarry: Duration,
     encode_and_commit: Duration,
+    generator_setup: Duration,
+    vertical_encoding: Duration,
+    tensor_commitment: Duration,
+    front_and_selected_rows: Duration,
     algebra: Duration,
     terminal: Duration,
 }
@@ -2158,7 +2226,8 @@ fn run_production_carryopen(verifier_repetitions: usize) -> CarryOpenMeasurement
         .map(precarry_message_value)
         .collect::<Vec<_>>();
     let start = Instant::now();
-    let message_root = prefix_root(&message, CARRYOPEN_FIELDS, &zeros);
+    let (message_root, message_row_roots) =
+        exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
     let message_commit = start.elapsed();
 
     let start = Instant::now();
@@ -2176,9 +2245,20 @@ fn run_production_carryopen(verifier_repetitions: usize) -> CarryOpenMeasurement
         .iter()
         .map(|spectrum| prefix_root(spectrum, CARRYOPEN_ROWS, &zeros))
         .collect::<Vec<_>>();
+    let generator_setup = start.elapsed();
+    let vertical_start = Instant::now();
     let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
     populate_proof_codeword(level, &message, &mut proof_codeword, &spectra, 64);
-    let proof_commitments = tensor_row_commitments(&proof_codeword, &horizontal_spectra, &zeros);
+    let vertical_encoding = vertical_start.elapsed();
+    let commitment_start = Instant::now();
+    let proof_commitments = tensor_row_commitments(
+        &proof_codeword,
+        &message_row_roots,
+        &horizontal_spectra,
+        &zeros,
+    );
+    let tensor_commitment = commitment_start.elapsed();
+    let front_start = Instant::now();
     let mut component_roots = generator_roots;
     component_roots.push(message_root);
     component_roots.extend(proof_commitments.iter().map(|commitment| commitment.root));
@@ -2200,6 +2280,7 @@ fn run_production_carryopen(verifier_repetitions: usize) -> CarryOpenMeasurement
         &horizontal_spectra,
         &selected,
     );
+    let front_and_selected_rows = front_start.elapsed();
     let encode_and_commit = start.elapsed();
 
     let start = Instant::now();
@@ -2288,6 +2369,10 @@ fn run_production_carryopen(verifier_repetitions: usize) -> CarryOpenMeasurement
         message_commit,
         precarry: precarry_time,
         encode_and_commit,
+        generator_setup,
+        vertical_encoding,
+        tensor_commitment,
+        front_and_selected_rows,
         algebra,
         terminal,
     }
@@ -6080,6 +6165,22 @@ fn main() {
             .iter()
             .map(|item| item.encode_and_commit.as_secs_f64() * 1_000.0)
             .collect::<Vec<_>>();
+        let generator_setup_ms = carryopen_measurements
+            .iter()
+            .map(|item| item.generator_setup.as_secs_f64() * 1_000.0)
+            .collect::<Vec<_>>();
+        let vertical_encoding_ms = carryopen_measurements
+            .iter()
+            .map(|item| item.vertical_encoding.as_secs_f64() * 1_000.0)
+            .collect::<Vec<_>>();
+        let tensor_commitment_ms = carryopen_measurements
+            .iter()
+            .map(|item| item.tensor_commitment.as_secs_f64() * 1_000.0)
+            .collect::<Vec<_>>();
+        let front_and_selected_rows_ms = carryopen_measurements
+            .iter()
+            .map(|item| item.front_and_selected_rows.as_secs_f64() * 1_000.0)
+            .collect::<Vec<_>>();
         let algebra_ms = carryopen_measurements
             .iter()
             .map(|item| item.algebra.as_secs_f64() * 1_000.0)
@@ -6099,6 +6200,13 @@ fn main() {
             percentile(&encode_ms, 0.5),
             percentile(&algebra_ms, 0.5),
             percentile(&terminal_ms, 0.5)
+        );
+        println!(
+            "- CarryOpen encode+commit detail (setup/vertical/tensor-root/front) medians: {:.3}/{:.3}/{:.3}/{:.3} ms",
+            percentile(&generator_setup_ms, 0.5),
+            percentile(&vertical_encoding_ms, 0.5),
+            percentile(&tensor_commitment_ms, 0.5),
+            percentile(&front_and_selected_rows_ms, 0.5)
         );
         println!(
             "- CarryOpen terminal fields/padded: {}/{}; serialized component proof: {} B",
@@ -6569,6 +6677,34 @@ mod tests {
         assert_eq!(
             rank_one_right.right_ood_row,
             materialized_right.right_ood_row
+        );
+    }
+
+    #[test]
+    fn cached_message_subtrees_preserve_horizontal_roots() {
+        let zeros = zero_roots(12);
+        let message = (0..4 * CARRYOPEN_WIDTH)
+            .map(|index| Field192::from((7 * index + 3) as u64))
+            .collect::<Vec<_>>();
+        let (root, row_roots) = exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
+        assert_eq!(root, prefix_root(&message, message.len(), &zeros));
+        assert_eq!(row_roots.len(), 4);
+
+        let spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(11, block, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let row = &message[..CARRYOPEN_WIDTH];
+        let mut legacy = row.to_vec();
+        for spectrum in &spectra {
+            let mut parity = row.to_vec();
+            apply_encoder(&mut parity, spectrum);
+            legacy.extend(parity);
+        }
+        let encoded = encode_horizontal_row(row, &spectra);
+        assert_eq!(encoded, legacy);
+        assert_eq!(
+            horizontal_row_root_with_systematic_subtree(row, row_roots[0], &spectra, &zeros,),
+            prefix_root(&encoded, CARRYOPEN_TENSOR_WIDTH, &zeros)
         );
     }
 
