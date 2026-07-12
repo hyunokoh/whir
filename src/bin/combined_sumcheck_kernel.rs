@@ -1310,6 +1310,33 @@ fn encode_horizontal_row(row: &[Field192], spectra: &[Vec<Field192>]) -> Vec<Fie
     encoded
 }
 
+fn horizontal_encoded_row_root_with_scratch(
+    row: &[Field192],
+    spectra: &[Vec<Field192>],
+    zeros: &[Digest],
+    transformed: &mut [Field192],
+    encoded: &mut [Field192],
+) -> Digest {
+    assert_eq!(row.len(), CARRYOPEN_WIDTH);
+    assert_eq!(spectra.len(), CARRYOPEN_INVERSE_RATE - 1);
+    assert_eq!(transformed.len(), CARRYOPEN_WIDTH);
+    assert_eq!(encoded.len(), CARRYOPEN_TENSOR_WIDTH);
+    encoded[..CARRYOPEN_WIDTH].copy_from_slice(row);
+    transformed.copy_from_slice(row);
+    wht(transformed);
+    for (block, spectrum) in spectra.iter().enumerate() {
+        let start = (block + 1) * CARRYOPEN_WIDTH;
+        let parity = &mut encoded[start..start + CARRYOPEN_WIDTH];
+        parity.copy_from_slice(transformed);
+        parity
+            .iter_mut()
+            .zip(spectrum)
+            .for_each(|(value, multiplier)| *value *= multiplier);
+        wht(parity);
+    }
+    prefix_root(encoded, CARRYOPEN_TENSOR_WIDTH, zeros)
+}
+
 /// Return the ordinary flat Merkle root together with its exact `row_width`
 /// subtree roots.  Keeping these roots lets the tensor commitment reuse the
 /// already-hashed systematic quarter of its first matrix.
@@ -1332,6 +1359,7 @@ fn exact_root_with_row_subtrees(
     (combine_equal_subtrees(&row_roots), row_roots)
 }
 
+#[cfg(test)]
 fn horizontal_row_root_with_systematic_subtree(
     row: &[Field192],
     systematic_root: Digest,
@@ -1356,6 +1384,34 @@ fn horizontal_row_root_with_systematic_subtree(
     combine_equal_subtrees(&roots)
 }
 
+fn horizontal_row_root_with_systematic_subtree_scratch(
+    row: &[Field192],
+    systematic_root: Digest,
+    spectra: &[Vec<Field192>],
+    zeros: &[Digest],
+    transformed: &mut [Field192],
+    parity: &mut [Field192],
+) -> Digest {
+    assert_eq!(row.len(), CARRYOPEN_WIDTH);
+    assert_eq!(spectra.len(), CARRYOPEN_INVERSE_RATE - 1);
+    assert_eq!(transformed.len(), CARRYOPEN_WIDTH);
+    assert!(parity.len() >= CARRYOPEN_WIDTH);
+    transformed.copy_from_slice(row);
+    wht(transformed);
+    let mut roots = [systematic_root; CARRYOPEN_INVERSE_RATE];
+    for (root, spectrum) in roots[1..].iter_mut().zip(spectra) {
+        let parity = &mut parity[..CARRYOPEN_WIDTH];
+        parity.copy_from_slice(transformed);
+        parity
+            .iter_mut()
+            .zip(spectrum)
+            .for_each(|(value, multiplier)| *value *= multiplier);
+        wht(parity);
+        *root = prefix_root(parity, CARRYOPEN_WIDTH, zeros);
+    }
+    combine_equal_subtrees(&roots)
+}
+
 fn tensor_row_commitments(
     vertical_codeword: &[Field192],
     message_row_roots: &[Digest],
@@ -1367,6 +1423,56 @@ fn tensor_row_commitments(
         CARRYOPEN_INVERSE_RATE * CARRYOPEN_FIELDS
     );
     assert_eq!(message_row_roots.len(), CARRYOPEN_ROWS);
+    let row_roots = vertical_codeword
+        .par_chunks_exact(CARRYOPEN_WIDTH)
+        .enumerate()
+        .map_init(
+            || {
+                (
+                    vec![Field192::ZERO; CARRYOPEN_WIDTH],
+                    vec![Field192::ZERO; CARRYOPEN_TENSOR_WIDTH],
+                )
+            },
+            |(transformed, encoded), (index, row)| {
+                if index < CARRYOPEN_ROWS {
+                    horizontal_row_root_with_systematic_subtree_scratch(
+                        row,
+                        message_row_roots[index],
+                        horizontal_spectra,
+                        zeros,
+                        transformed,
+                        encoded,
+                    )
+                } else {
+                    horizontal_encoded_row_root_with_scratch(
+                        row,
+                        horizontal_spectra,
+                        zeros,
+                        transformed,
+                        encoded,
+                    )
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+    row_roots
+        .chunks_exact(CARRYOPEN_ROWS)
+        .map(|roots| MatrixCommitment {
+            root: combine_equal_subtrees(roots),
+            row_roots: roots.to_vec(),
+            row_domain: CARRYOPEN_ROWS,
+            zero_row_root: zeros[CARRYOPEN_TENSOR_WIDTH.trailing_zeros() as usize],
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn tensor_row_commitments_materialized(
+    vertical_codeword: &[Field192],
+    message_row_roots: &[Digest],
+    horizontal_spectra: &[Vec<Field192>],
+    zeros: &[Digest],
+) -> Vec<MatrixCommitment> {
     let row_roots = vertical_codeword
         .par_chunks_exact(CARRYOPEN_WIDTH)
         .enumerate()
@@ -6763,9 +6869,101 @@ mod tests {
         }
         let encoded = encode_horizontal_row(row, &spectra);
         assert_eq!(encoded, legacy);
+        let mut transformed = vec![Field192::ZERO; CARRYOPEN_WIDTH];
+        let mut scratch_encoded = vec![Field192::ZERO; CARRYOPEN_TENSOR_WIDTH];
+        assert_eq!(
+            horizontal_encoded_row_root_with_scratch(
+                row,
+                &spectra,
+                &zeros,
+                &mut transformed,
+                &mut scratch_encoded,
+            ),
+            prefix_root(&encoded, CARRYOPEN_TENSOR_WIDTH, &zeros)
+        );
+        assert_eq!(
+            horizontal_row_root_with_systematic_subtree_scratch(
+                row,
+                row_roots[0],
+                &spectra,
+                &zeros,
+                &mut transformed,
+                &mut scratch_encoded,
+            ),
+            prefix_root(&encoded, CARRYOPEN_TENSOR_WIDTH, &zeros)
+        );
         assert_eq!(
             horizontal_row_root_with_systematic_subtree(row, row_roots[0], &spectra, &zeros,),
             prefix_root(&encoded, CARRYOPEN_TENSOR_WIDTH, &zeros)
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale tensor-commitment A/B benchmark"]
+    fn reusable_horizontal_scratch_matches_and_benchmarks_materialized_rows() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let (_, message_row_roots) =
+            exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
+        let spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(11, block, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &message, &mut proof_codeword, &spectra, 64);
+
+        let start = Instant::now();
+        let scratch_first = tensor_row_commitments(
+            &proof_codeword,
+            &message_row_roots,
+            &horizontal_spectra,
+            &zeros,
+        );
+        let scratch_first_time = start.elapsed();
+        let start = Instant::now();
+        let materialized_first = tensor_row_commitments_materialized(
+            &proof_codeword,
+            &message_row_roots,
+            &horizontal_spectra,
+            &zeros,
+        );
+        let materialized_first_time = start.elapsed();
+        let start = Instant::now();
+        let materialized_second = tensor_row_commitments_materialized(
+            &proof_codeword,
+            &message_row_roots,
+            &horizontal_spectra,
+            &zeros,
+        );
+        let materialized_second_time = start.elapsed();
+        let start = Instant::now();
+        let scratch_second = tensor_row_commitments(
+            &proof_codeword,
+            &message_row_roots,
+            &horizontal_spectra,
+            &zeros,
+        );
+        let scratch_second_time = start.elapsed();
+
+        for candidate in [&materialized_first, &materialized_second, &scratch_second] {
+            assert_eq!(candidate.len(), scratch_first.len());
+            for (candidate, expected) in candidate.iter().zip(&scratch_first) {
+                assert_eq!(candidate.root, expected.root);
+                assert_eq!(candidate.row_roots, expected.row_roots);
+            }
+        }
+        eprintln!(
+            "scratch={:.3}/{:.3} ms materialized={:.3}/{:.3} ms",
+            scratch_first_time.as_secs_f64() * 1_000.0,
+            scratch_second_time.as_secs_f64() * 1_000.0,
+            materialized_first_time.as_secs_f64() * 1_000.0,
+            materialized_second_time.as_secs_f64() * 1_000.0,
         );
     }
 
