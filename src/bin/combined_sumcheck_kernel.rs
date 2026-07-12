@@ -32,7 +32,7 @@ use whir::{
 use whir::lilac_merkle::{
     combine_equal_subtrees_parallel_for_benchmark, prefix_root_materialized_blocks_for_benchmark,
     prefix_root_materialized_leaves_for_benchmark, prefix_root_materialized_parents_for_benchmark,
-    prefix_root_unfused_for_benchmark,
+    prefix_root_scatter_for_benchmark, prefix_root_unfused_for_benchmark,
 };
 
 #[derive(Debug, Parser)]
@@ -8077,6 +8077,59 @@ mod tests {
             fused_second_time.as_secs_f64() * 1_000.0,
             unfused_first_time.as_secs_f64() * 1_000.0,
             unfused_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale NEON transposed-output versus scalar-scatter benchmark"]
+    fn transposed_output_benchmarks_scatter_tensor_roots() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let (_, message_row_roots) =
+            exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
+        let vertical_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(11, block, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &message, &mut proof_codeword, &vertical_spectra, 64);
+
+        let run = |row_root: fn(&[Field192], usize, &[Digest]) -> Digest| {
+            let start = Instant::now();
+            let commitment = tensor_row_commitments_with_root(
+                &proof_codeword,
+                &message_row_roots,
+                &horizontal_spectra,
+                &zeros,
+                row_root,
+                combine_equal_subtrees,
+            );
+            (commitment, start.elapsed())
+        };
+        let (transposed_first, transposed_first_time) = run(prefix_root);
+        let (scatter_first, scatter_first_time) = run(prefix_root_scatter_for_benchmark);
+        let (scatter_second, scatter_second_time) = run(prefix_root_scatter_for_benchmark);
+        let (transposed_second, transposed_second_time) = run(prefix_root);
+
+        for candidate in [&scatter_first, &scatter_second, &transposed_second] {
+            assert_eq!(candidate.len(), transposed_first.len());
+            for (candidate, expected) in candidate.iter().zip(&transposed_first) {
+                assert_eq!(candidate.root, expected.root);
+                assert_eq!(candidate.row_roots, expected.row_roots);
+            }
+        }
+        eprintln!(
+            "transposed-output={:.3}/{:.3} ms scalar-scatter={:.3}/{:.3} ms",
+            transposed_first_time.as_secs_f64() * 1_000.0,
+            transposed_second_time.as_secs_f64() * 1_000.0,
+            scatter_first_time.as_secs_f64() * 1_000.0,
+            scatter_second_time.as_secs_f64() * 1_000.0,
         );
     }
 

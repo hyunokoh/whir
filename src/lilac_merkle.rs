@@ -39,8 +39,9 @@ const BLAKE3_MSG_SCHEDULE: [[usize; 16]; 7] = [
 mod neon4 {
     use super::{Digest, BLAKE3_IV, BLAKE3_MSG_SCHEDULE};
     use core::arch::aarch64::{
-        uint32x4_t, vaddq_u32, vdupq_n_u32, veorq_u32, vld1q_u32, vorrq_u32, vshlq_n_u32,
-        vshrq_n_u32, vst1q_u32,
+        uint32x4_t, vaddq_u32, vdupq_n_u32, veorq_u32, vld1q_u32, vorrq_u32, vreinterpretq_u32_u64,
+        vreinterpretq_u64_u32, vshlq_n_u32, vshrq_n_u32, vst1q_u32, vtrn1q_u32, vtrn1q_u64,
+        vtrn2q_u32, vtrn2q_u64,
     };
 
     #[inline(always)]
@@ -244,7 +245,35 @@ mod neon4 {
     }
 
     #[inline(always)]
-    unsafe fn compress_message_xof32_8(
+    unsafe fn transpose4x4(rows: [uint32x4_t; 4]) -> [uint32x4_t; 4] {
+        let ab_even = unsafe { vtrn1q_u32(rows[0], rows[1]) };
+        let ab_odd = unsafe { vtrn2q_u32(rows[0], rows[1]) };
+        let cd_even = unsafe { vtrn1q_u32(rows[2], rows[3]) };
+        let cd_odd = unsafe { vtrn2q_u32(rows[2], rows[3]) };
+        unsafe {
+            [
+                vreinterpretq_u32_u64(vtrn1q_u64(
+                    vreinterpretq_u64_u32(ab_even),
+                    vreinterpretq_u64_u32(cd_even),
+                )),
+                vreinterpretq_u32_u64(vtrn1q_u64(
+                    vreinterpretq_u64_u32(ab_odd),
+                    vreinterpretq_u64_u32(cd_odd),
+                )),
+                vreinterpretq_u32_u64(vtrn2q_u64(
+                    vreinterpretq_u64_u32(ab_even),
+                    vreinterpretq_u64_u32(cd_even),
+                )),
+                vreinterpretq_u32_u64(vtrn2q_u64(
+                    vreinterpretq_u64_u32(ab_odd),
+                    vreinterpretq_u64_u32(cd_odd),
+                )),
+            ]
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn compress_message_xof32_8<const TRANSPOSED_OUTPUT: bool>(
         cvs: &[[u32; 8]; 8],
         message: &[Packed8; 16],
         block_len: u8,
@@ -252,14 +281,40 @@ mod neon4 {
     ) -> [Digest; 8] {
         let state = unsafe { compress_message_state8(cvs, message, block_len, flags) };
         let mut output = [[0_u8; 32]; 8];
-        for word in 0..8 {
-            let value = unsafe { xor8(state[word], state[word + 8]) };
+        if TRANSPOSED_OUTPUT && cfg!(target_endian = "little") {
+            let values = std::array::from_fn::<_, 8, _>(|word| unsafe {
+                xor8(state[word], state[word + 8])
+            });
             for group in 0..2 {
-                let mut lanes = [0_u32; 4];
-                unsafe { vst1q_u32(lanes.as_mut_ptr(), value.0[group]) };
-                for (lane, value) in lanes.iter().enumerate() {
-                    output[4 * group + lane][4 * word..4 * word + 4]
-                        .copy_from_slice(&value.to_le_bytes());
+                for word_block in 0..2 {
+                    let words = unsafe {
+                        transpose4x4(std::array::from_fn(|word| {
+                            values[4 * word_block + word].0[group]
+                        }))
+                    };
+                    for (lane, words) in words.into_iter().enumerate() {
+                        unsafe {
+                            vst1q_u32(
+                                output[4 * group + lane]
+                                    .as_mut_ptr()
+                                    .add(16 * word_block)
+                                    .cast(),
+                                words,
+                            );
+                        };
+                    }
+                }
+            }
+        } else {
+            for word in 0..8 {
+                let value = unsafe { xor8(state[word], state[word + 8]) };
+                for group in 0..2 {
+                    let mut lanes = [0_u32; 4];
+                    unsafe { vst1q_u32(lanes.as_mut_ptr(), value.0[group]) };
+                    for (lane, value) in lanes.iter().enumerate() {
+                        output[4 * group + lane][4 * word..4 * word + 4]
+                            .copy_from_slice(&value.to_le_bytes());
+                    }
                 }
             }
         }
@@ -267,7 +322,7 @@ mod neon4 {
     }
 
     #[inline(always)]
-    unsafe fn compress_message_cv32_8(
+    unsafe fn compress_message_cv32_8<const TRANSPOSED_OUTPUT: bool>(
         cvs: &[[u32; 8]; 8],
         message: &[Packed8; 16],
         block_len: u8,
@@ -275,13 +330,36 @@ mod neon4 {
     ) -> [[u32; 8]; 8] {
         let state = unsafe { compress_message_state8(cvs, message, block_len, flags) };
         let mut output = [[0_u32; 8]; 8];
-        for word in 0..8 {
-            let value = unsafe { xor8(state[word], state[word + 8]) };
+        if TRANSPOSED_OUTPUT && cfg!(target_endian = "little") {
+            let values = std::array::from_fn::<_, 8, _>(|word| unsafe {
+                xor8(state[word], state[word + 8])
+            });
             for group in 0..2 {
-                let mut lanes = [0_u32; 4];
-                unsafe { vst1q_u32(lanes.as_mut_ptr(), value.0[group]) };
-                for (lane, value) in lanes.into_iter().enumerate() {
-                    output[4 * group + lane][word] = value;
+                for word_block in 0..2 {
+                    let words = unsafe {
+                        transpose4x4(std::array::from_fn(|word| {
+                            values[4 * word_block + word].0[group]
+                        }))
+                    };
+                    for (lane, words) in words.into_iter().enumerate() {
+                        unsafe {
+                            vst1q_u32(
+                                output[4 * group + lane].as_mut_ptr().add(4 * word_block),
+                                words,
+                            );
+                        };
+                    }
+                }
+            }
+        } else {
+            for word in 0..8 {
+                let value = unsafe { xor8(state[word], state[word + 8]) };
+                for group in 0..2 {
+                    let mut lanes = [0_u32; 4];
+                    unsafe { vst1q_u32(lanes.as_mut_ptr(), value.0[group]) };
+                    for (lane, value) in lanes.into_iter().enumerate() {
+                        output[4 * group + lane][word] = value;
+                    }
                 }
             }
         }
@@ -304,7 +382,9 @@ mod neon4 {
     /// Hash eight canonical 192-bit field encodings without first writing and
     /// then reparsing eight zero-padded 64-byte blocks.
     #[target_feature(enable = "neon")]
-    pub unsafe fn compress_field_leaves8(canonical: &[[u64; 3]; 8]) -> [Digest; 8] {
+    unsafe fn compress_field_leaves8_impl<const TRANSPOSED_OUTPUT: bool>(
+        canonical: &[[u64; 3]; 8],
+    ) -> [Digest; 8] {
         let zero = Packed8([vdupq_n_u32(0), vdupq_n_u32(0)]);
         let mut message = [zero; 16];
         for (word, value) in [0x414c_694c, 0x6966_2f43, 0x2d64_6c65, 0x6661_656c]
@@ -326,13 +406,23 @@ mod neon4 {
             };
         }
         unsafe {
-            compress_message_xof32_8(
+            compress_message_xof32_8::<TRANSPOSED_OUTPUT>(
                 &[BLAKE3_IV; 8],
                 &message,
                 43,
                 super::BLAKE3_CHUNK_START | super::BLAKE3_CHUNK_END | super::BLAKE3_ROOT,
             )
         }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_field_leaves8(canonical: &[[u64; 3]; 8]) -> [Digest; 8] {
+        unsafe { compress_field_leaves8_impl::<true>(canonical) }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_field_leaves8_scatter(canonical: &[[u64; 3]; 8]) -> [Digest; 8] {
+        unsafe { compress_field_leaves8_impl::<false>(canonical) }
     }
 
     #[inline(always)]
@@ -343,7 +433,9 @@ mod neon4 {
     /// Hash eight 83-byte nodes directly from their child digests, avoiding
     /// sixteen temporary 64-byte blocks and their subsequent word parsing.
     #[target_feature(enable = "neon")]
-    pub unsafe fn compress_parents8(children: &[Digest; 16]) -> [Digest; 8] {
+    unsafe fn compress_parents8_impl<const TRANSPOSED_OUTPUT: bool>(
+        children: &[Digest; 16],
+    ) -> [Digest; 8] {
         let zero = Packed8([vdupq_n_u32(0), vdupq_n_u32(0)]);
         let mut first = [zero; 16];
         for (word, value) in [0x414c_694c, 0x6966_2f43, 0x2d64_6c65, 0x6564_6f6e]
@@ -381,7 +473,12 @@ mod neon4 {
         }
 
         let cvs = unsafe {
-            compress_message_cv32_8(&[BLAKE3_IV; 8], &first, 64, super::BLAKE3_CHUNK_START)
+            compress_message_cv32_8::<TRANSPOSED_OUTPUT>(
+                &[BLAKE3_IV; 8],
+                &first,
+                64,
+                super::BLAKE3_CHUNK_START,
+            )
         };
         let mut final_block = [zero; 16];
         for (word, byte_offset) in (0..=3).zip((13..=25).step_by(4)) {
@@ -399,13 +496,23 @@ mod neon4 {
             }))
         };
         unsafe {
-            compress_message_xof32_8(
+            compress_message_xof32_8::<TRANSPOSED_OUTPUT>(
                 &cvs,
                 &final_block,
                 19,
                 super::BLAKE3_CHUNK_END | super::BLAKE3_ROOT,
             )
         }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_parents8(children: &[Digest; 16]) -> [Digest; 8] {
+        unsafe { compress_parents8_impl::<true>(children) }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_parents8_scatter(children: &[Digest; 16]) -> [Digest; 8] {
+        unsafe { compress_parents8_impl::<false>(children) }
     }
 
     #[target_feature(enable = "neon")]
@@ -469,7 +576,7 @@ mod neon4 {
             });
             *message_word = unsafe { set8(words) };
         }
-        unsafe { compress_message_xof32_8(cvs, &message, block_len, flags) }
+        unsafe { compress_message_xof32_8::<true>(cvs, &message, block_len, flags) }
     }
 }
 
@@ -601,6 +708,18 @@ fn field_leaves8(values: &[Field192; 8]) -> [Digest; 8] {
     }
 }
 
+fn field_leaves8_scatter(values: &[Field192; 8]) -> [Digest; 8] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let canonical = std::array::from_fn(|index| values[index].into_bigint().0);
+        unsafe { neon4::compress_field_leaves8_scatter(&canonical) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        field_leaves8_materialized(values)
+    }
+}
+
 fn parent4(children: &[Digest; 8]) -> [Digest; 4] {
     let platform = blake3_platform();
     if platform.simd_degree() < 4 {
@@ -696,6 +815,17 @@ fn parent8(children: &[Digest; 16]) -> [Digest; 8] {
     }
 }
 
+fn parent8_scatter(children: &[Digest; 16]) -> [Digest; 8] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { neon4::compress_parents8_scatter(children) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        parent8_materialized_fixed_first_compression(children)
+    }
+}
+
 fn parent8_platform_first_compression(children: &[Digest; 16]) -> [Digest; 8] {
     let platform = blake3_platform();
     let blocks = std::array::from_fn::<_, 8, _>(|index| {
@@ -761,6 +891,33 @@ fn reduce_exact_digests(scratch: &mut [Digest]) -> Digest {
                 scratch[child + 6],
                 scratch[child + 7],
             ];
+            let roots = parent4(&children);
+            scratch[pair..pair + 4].copy_from_slice(&roots);
+        }
+        for pair in batched4..pairs {
+            scratch[pair] = parent(scratch[2 * pair], scratch[2 * pair + 1]);
+        }
+        active = pairs;
+    }
+    scratch[0]
+}
+
+fn reduce_exact_digests_scatter(scratch: &mut [Digest]) -> Digest {
+    assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
+    let mut active = scratch.len();
+    while active > 1 {
+        let pairs = active / 2;
+        let batched8 = pairs / 8 * 8;
+        for pair in (0..batched8).step_by(8) {
+            let child = 2 * pair;
+            let children = std::array::from_fn(|index| scratch[child + index]);
+            let roots = parent8_scatter(&children);
+            scratch[pair..pair + 8].copy_from_slice(&roots);
+        }
+        let batched4 = batched8 + (pairs - batched8) / 4 * 4;
+        for pair in (batched8..batched4).step_by(4) {
+            let child = 2 * pair;
+            let children = std::array::from_fn(|index| scratch[child + index]);
             let roots = parent4(&children);
             scratch[pair..pair + 4].copy_from_slice(&roots);
         }
@@ -873,6 +1030,24 @@ fn extend_field_level1_batched(values: &[Field192], scratch: &mut Vec<Digest>) {
     }
 }
 
+fn extend_field_level1_batched_scatter(values: &[Field192], scratch: &mut Vec<Digest>) {
+    assert!(values.len() >= 16 && values.len().is_power_of_two());
+    for chunk in values.chunks_exact(16) {
+        let left_values = std::array::from_fn(|index| chunk[index]);
+        let right_values = std::array::from_fn(|index| chunk[8 + index]);
+        let left = field_leaves8_scatter(&left_values);
+        let right = field_leaves8_scatter(&right_values);
+        let children = std::array::from_fn(|index| {
+            if index < 8 {
+                left[index]
+            } else {
+                right[index - 8]
+            }
+        });
+        scratch.extend_from_slice(&parent8_scatter(&children));
+    }
+}
+
 fn extend_field_leaves_batched_materialized<F>(
     values: &[Field192],
     scratch: &mut Vec<Digest>,
@@ -943,6 +1118,26 @@ pub fn prefix_root_unfused_for_benchmark(
         });
     }
     sequential_prefix_root(values, capacity, zeros)
+}
+
+/// Reproduce the pre-transpose AArch64 output-scatter schedule for crossed
+/// artifact benchmarks. Other architectures use the ordinary exact path.
+#[doc(hidden)]
+pub fn prefix_root_scatter_for_benchmark(
+    values: &[Field192],
+    capacity: usize,
+    zeros: &[Digest],
+) -> Digest {
+    assert!(values.len() <= capacity && capacity.is_power_of_two());
+    if values.len() == capacity && values.len() >= 16 {
+        return EXACT_ROOT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.clear();
+            extend_field_level1_batched_scatter(values, &mut scratch);
+            reduce_exact_digests_scatter(&mut scratch)
+        });
+    }
+    prefix_root(values, capacity, zeros)
 }
 
 /// Reproduce the pre-optimization AArch64 exact-root path for crossed
@@ -1260,6 +1455,59 @@ mod tests {
                 prefix_root_unfused_for_benchmark(&values[..size], size, &zeros)
             );
         }
+    }
+
+    #[test]
+    fn transposed_output_matches_scatter_exact_root() {
+        let zeros = zero_roots(12);
+        let values = (0..4096)
+            .map(|index| Field192::from((29 * index + 13) as u64))
+            .collect::<Vec<_>>();
+        for size in [8, 16, 64, 256, 1024, 4096] {
+            assert_eq!(
+                prefix_root(&values[..size], size, &zeros),
+                prefix_root_scatter_for_benchmark(&values[..size], size, &zeros)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "NEON transposed-output versus scalar-scatter exact-root benchmark"]
+    fn transposed_output_benchmarks_scatter_exact_root() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let values = (0..1024_u64)
+            .map(|index| {
+                let seed = blake3::hash(&(index + 73).to_le_bytes());
+                Field192::from_le_bytes_mod_order(seed.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        let zeros = zero_roots(10);
+        assert_eq!(
+            prefix_root(&values, values.len(), &zeros),
+            prefix_root_scatter_for_benchmark(&values, values.len(), &zeros)
+        );
+        let iterations = 10_000;
+        let run = |root: fn(&[Field192], usize, &[Digest]) -> Digest| {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(root(black_box(&values), values.len(), &zeros));
+            }
+            start.elapsed()
+        };
+        let transposed_first = run(prefix_root);
+        let scatter_first = run(prefix_root_scatter_for_benchmark);
+        let scatter_second = run(prefix_root_scatter_for_benchmark);
+        let transposed_second = run(prefix_root);
+        eprintln!(
+            "exact_root_1024 iterations={} transposed={:.3}/{:.3} ms scatter={:.3}/{:.3} ms",
+            iterations,
+            transposed_first.as_secs_f64() * 1_000.0,
+            transposed_second.as_secs_f64() * 1_000.0,
+            scatter_first.as_secs_f64() * 1_000.0,
+            scatter_second.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]
