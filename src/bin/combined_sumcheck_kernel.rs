@@ -3515,22 +3515,14 @@ fn run_strong_round(
         .iter()
         .map(|spectrum| prefix_root(spectrum, level.group, &zeros))
         .collect::<Vec<_>>();
-    let mut codeword = vec![Field192::ZERO; level.qa_fields()];
-    populate_proof_codeword(level, &source, &mut codeword, &spectra, 64);
+    let codeword = encode_full_systematic_codeword(level, &source, &spectra, 64);
     let (mut component_roots, proof_commitments) =
         level_commitment(level, &source, &codeword, &generator_roots, &zeros);
     assert_eq!(
         component_roots[STRONG_INVERSE_RATE - 1],
         expected_source_root
     );
-    let mut index_oracle = vec![Field192::ZERO; level.qa_fields()];
-    populate_index_oracle(
-        relation_level,
-        level,
-        &mut index_oracle,
-        &spectra,
-        &component_roots,
-    );
+    let index_oracle = materialize_index_oracle(relation_level, level, &spectra, &component_roots);
     let index_descriptor = virtual_index_descriptor(relation_level, level, &component_roots);
     component_roots.push(index_descriptor);
     let selected = selected_rows(
@@ -3696,16 +3688,14 @@ fn run_strong_terminal_switch(
         .iter()
         .map(|spectrum| prefix_root(spectrum, STRONG_GROUP, &zeros))
         .collect::<Vec<_>>();
-    let mut codeword = vec![Field192::ZERO; level.qa_fields()];
-    populate_proof_codeword(level, &source, &mut codeword, &spectra, 64);
+    let codeword = encode_full_systematic_codeword(level, &source, &spectra, 64);
     let (mut component_roots, proof_commitments) =
         level_commitment(level, &source, &codeword, &generator_roots, &zeros);
     assert_eq!(
         component_roots[STRONG_INVERSE_RATE - 1],
         expected_source_root
     );
-    let mut index_oracle = vec![Field192::ZERO; level.qa_fields()];
-    populate_index_oracle(12, level, &mut index_oracle, &spectra, &component_roots);
+    let index_oracle = materialize_index_oracle(12, level, &spectra, &component_roots);
     let index_descriptor = virtual_index_descriptor(12, level, &component_roots);
     component_roots.push(index_descriptor);
     let selected = selected_rows(
@@ -4131,6 +4121,29 @@ fn scatter_parity_block_blocked_uninit(
         });
 }
 
+fn scatter_parity_block_uninit(
+    target: &mut [MaybeUninit<Field192>],
+    width: usize,
+    lane_start: usize,
+    encoded: &[Vec<Vec<Field192>>],
+    parity_block: usize,
+) {
+    assert_eq!(target.len() % width, 0);
+    assert!(lane_start + encoded.len() <= width);
+    let rows = target.len() / width;
+    assert!(encoded.iter().all(|lane| lane
+        .get(parity_block)
+        .is_some_and(|values| values.len() == rows)));
+    target
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(row, target)| {
+            for (offset, lane) in encoded.iter().enumerate() {
+                target[lane_start + offset].write(lane[parity_block][row]);
+            }
+        });
+}
+
 fn scatter_final_parity_block_and_commit_uninit(
     target: &mut [MaybeUninit<Field192>],
     width: usize,
@@ -4344,6 +4357,72 @@ fn populate_parity_and_commit_in_spare_capacity(
     commitments
 }
 
+fn populate_parity_in_spare_capacity(
+    level: Level,
+    proof_codeword: &mut Vec<Field192>,
+    spectra: &[Vec<Field192>],
+    batch_lanes: usize,
+) {
+    let systematic_fields = level.group * level.width;
+    assert_eq!(proof_codeword.len(), systematic_fields);
+    assert!(proof_codeword.capacity() >= level.qa_fields());
+    assert_eq!(spectra.len(), level.inverse_rate - 1);
+    assert!(batch_lanes > 0);
+    assert!(!std::mem::needs_drop::<Field192>());
+    let parity_fields = level.qa_fields() - systematic_fields;
+    let systematic_ptr = proof_codeword.as_ptr();
+    {
+        let spare = proof_codeword.spare_capacity_mut();
+        assert!(spare.len() >= parity_fields);
+        let parity = &mut spare[..parity_fields];
+        for lane_start in (0..level.width).step_by(batch_lanes) {
+            let lane_end = (lane_start + batch_lanes).min(level.width);
+            let encoded = {
+                // The initialized prefix and spare output are disjoint and the
+                // pre-reserved allocation cannot move during this pass.
+                let systematic =
+                    unsafe { std::slice::from_raw_parts(systematic_ptr, systematic_fields) };
+                (lane_start..lane_end)
+                    .into_par_iter()
+                    .map(|lane| {
+                        let message = systematic
+                            .chunks_exact(level.width)
+                            .map(|row| row[lane])
+                            .collect::<Vec<_>>();
+                        encode_parity_blocks(message, spectra)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for parity_block in 0..level.inverse_rate - 1 {
+                let start = parity_block * systematic_fields;
+                scatter_parity_block_uninit(
+                    &mut parity[start..start + systematic_fields],
+                    level.width,
+                    lane_start,
+                    &encoded,
+                    parity_block,
+                );
+            }
+        }
+    }
+    // SAFETY: every spare cell is written once for each lane before the
+    // logical length is extended; a panic leaves the cells outside the Vec.
+    unsafe { proof_codeword.set_len(level.qa_fields()) };
+}
+
+fn encode_full_systematic_codeword(
+    level: Level,
+    source: &[Field192],
+    spectra: &[Vec<Field192>],
+    batch_lanes: usize,
+) -> Vec<Field192> {
+    assert_eq!(source.len(), level.group * level.width);
+    let mut codeword = Vec::with_capacity(level.qa_fields());
+    codeword.extend_from_slice(source);
+    populate_parity_in_spare_capacity(level, &mut codeword, spectra, batch_lanes);
+    codeword
+}
+
 #[cfg(test)]
 fn populate_parity_from_systematic_cloned_forward(
     level: Level,
@@ -4532,6 +4611,34 @@ fn populate_index_oracle(
                 .zip(&alpha)
                 .for_each(|(value, lane_weight)| *value = coefficients[row] * *lane_weight);
         });
+}
+
+fn materialize_index_oracle(
+    level_index: usize,
+    level: Level,
+    spectra: &[Vec<Field192>],
+    transcript_roots: &[Digest],
+) -> Vec<Field192> {
+    let (coefficients, alpha) = index_oracle_factors(level_index, level, spectra, transcript_roots);
+    let mut index_oracle = Vec::with_capacity(level.qa_fields());
+    {
+        let output = &mut index_oracle.spare_capacity_mut()[..level.qa_fields()];
+        output
+            .par_chunks_mut(level.width)
+            .enumerate()
+            .for_each(|(row, target)| {
+                target
+                    .iter_mut()
+                    .zip(&alpha)
+                    .for_each(|(value, lane_weight)| {
+                        value.write(coefficients[row] * *lane_weight);
+                    });
+            });
+    }
+    // SAFETY: the parallel row partition covers every output cell exactly
+    // once, and a panic leaves the spare cells outside the vector length.
+    unsafe { index_oracle.set_len(level.qa_fields()) };
+    index_oracle
 }
 
 /// Return the public rank-one factorization W[row,lane] = c[row] * alpha[lane].
@@ -9250,6 +9357,43 @@ mod tests {
     }
 
     #[test]
+    fn direct_codeword_and_index_initialization_match_zero_filled_paths() {
+        let level = Level {
+            raw: 32,
+            blocks: 1,
+            block_semantic: 32,
+            components: &[(32, 32)],
+            group: 8,
+            width: 4,
+            row_span: 8,
+            inverse_rate: 4,
+            next_blocks: 3,
+        };
+        let source = (0..level.raw)
+            .map(|index| Field192::from((7 * index + 3) as u64))
+            .collect::<Vec<_>>();
+        let spectra = (0..level.inverse_rate - 1)
+            .map(|block| generator_spectrum(21, block, level.group))
+            .collect::<Vec<_>>();
+        let mut initialized_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &source, &mut initialized_codeword, &spectra, 3);
+        assert_eq!(
+            encode_full_systematic_codeword(level, &source, &spectra, 3),
+            initialized_codeword
+        );
+
+        let roots = (0..2 * level.inverse_rate)
+            .map(|index| [index as u8; 32])
+            .collect::<Vec<_>>();
+        let mut initialized_index = vec![Field192::ZERO; level.qa_fields()];
+        populate_index_oracle(21, level, &mut initialized_index, &spectra, &roots);
+        assert_eq!(
+            materialize_index_oracle(21, level, &spectra, &roots),
+            initialized_index
+        );
+    }
+
+    #[test]
     fn shared_forward_wht_matches_independent_parity_encoders() {
         let message = (0..64).map(left_value).collect::<Vec<_>>();
         let spectra = (0..3)
@@ -10162,6 +10306,114 @@ mod tests {
             median(&spare_ms),
             mean(&initialized_ms),
             mean(&spare_ms),
+        );
+    }
+
+    #[test]
+    #[ignore = "production six-round strong codeword/index initialization A/B"]
+    fn strong_schedule_avoids_zero_filled_codeword_and_index() {
+        let inputs = (0..STRONG_ROUNDS)
+            .map(|round| {
+                let level = strong_round_level(round).unwrap();
+                let relation_level = 12 + round;
+                let source = (0..level.raw)
+                    .into_par_iter()
+                    .map(|index| semantic_value(relation_level, index))
+                    .collect::<Vec<_>>();
+                let spectra = (0..level.inverse_rate - 1)
+                    .map(|block| generator_spectrum(relation_level, block, level.group))
+                    .collect::<Vec<_>>();
+                let roots = (0..2 * level.inverse_rate)
+                    .map(|index| {
+                        *blake3::hash(
+                            &[
+                                b"LiLAC/strong-initialization-benchmark/v1".as_slice(),
+                                &round.to_le_bytes(),
+                                &index.to_le_bytes(),
+                            ]
+                            .concat(),
+                        )
+                        .as_bytes()
+                    })
+                    .collect::<Vec<_>>();
+                (level, relation_level, source, spectra, roots)
+            })
+            .collect::<Vec<_>>();
+        let run = |direct: bool| {
+            let start = Instant::now();
+            let output = inputs
+                .iter()
+                .map(|(level, relation_level, source, spectra, roots)| {
+                    let codeword = if direct {
+                        encode_full_systematic_codeword(*level, source, spectra, 64)
+                    } else {
+                        let mut codeword = vec![Field192::ZERO; level.qa_fields()];
+                        populate_proof_codeword(*level, source, &mut codeword, spectra, 64);
+                        codeword
+                    };
+                    let index_oracle = if direct {
+                        materialize_index_oracle(*relation_level, *level, spectra, roots)
+                    } else {
+                        let mut index_oracle = vec![Field192::ZERO; level.qa_fields()];
+                        populate_index_oracle(
+                            *relation_level,
+                            *level,
+                            &mut index_oracle,
+                            spectra,
+                            roots,
+                        );
+                        index_oracle
+                    };
+                    (codeword, index_oracle)
+                })
+                .collect::<Vec<_>>();
+            (output, start.elapsed().as_secs_f64() * 1_000.0)
+        };
+        let mut initialized_ms = Vec::with_capacity(16);
+        let mut direct_ms = Vec::with_capacity(16);
+        for trial in 0..8 {
+            let orders = if trial % 2 == 0 {
+                [[false, true], [true, false]]
+            } else {
+                [[true, false], [false, true]]
+            };
+            let mut trial_initialized = Vec::with_capacity(2);
+            let mut trial_direct = Vec::with_capacity(2);
+            for pair in orders {
+                let first = run(pair[0]);
+                let second = run(pair[1]);
+                assert_eq!(first.0, second.0);
+                for (direct, elapsed) in [(pair[0], first.1), (pair[1], second.1)] {
+                    if direct {
+                        direct_ms.push(elapsed);
+                        trial_direct.push(elapsed);
+                    } else {
+                        initialized_ms.push(elapsed);
+                        trial_initialized.push(elapsed);
+                    }
+                }
+            }
+            eprintln!(
+                "strong-initialization trial={} initialized={:.3}/{:.3} ms direct={:.3}/{:.3} ms",
+                trial + 1,
+                trial_initialized[0],
+                trial_initialized[1],
+                trial_direct[0],
+                trial_direct[1],
+            );
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        let mean = |samples: &[f64]| samples.iter().sum::<f64>() / samples.len() as f64;
+        eprintln!(
+            "strong-initialization initialized-ms={initialized_ms:?} direct-ms={direct_ms:?} initialized-median={:.3} direct-median={:.3} initialized-mean={:.3} direct-mean={:.3}",
+            median(&initialized_ms),
+            median(&direct_ms),
+            mean(&initialized_ms),
+            mean(&direct_ms),
         );
     }
 
