@@ -1952,6 +1952,65 @@ fn tensor_row_commitments(
         CARRYOPEN_INVERSE_RATE * CARRYOPEN_FIELDS
     );
     assert_eq!(message_row_roots.len(), CARRYOPEN_ROWS);
+    vertical_codeword
+        .chunks_exact(CARRYOPEN_FIELDS)
+        .enumerate()
+        .map(|(matrix, matrix_values)| {
+            let row_roots = matrix_values
+                .par_chunks_exact(CARRYOPEN_WIDTH)
+                .enumerate()
+                .map_init(
+                    || {
+                        (
+                            vec![Field192::ZERO; CARRYOPEN_WIDTH],
+                            vec![Field192::ZERO; CARRYOPEN_TENSOR_WIDTH],
+                            Vec::with_capacity(CARRYOPEN_TENSOR_WIDTH / 2),
+                        )
+                    },
+                    |(transformed, encoded, digest_scratch), (row_index, row)| {
+                        if matrix == 0 {
+                            horizontal_row_root_with_systematic_subtree_scratch(
+                                row,
+                                message_row_roots[row_index],
+                                horizontal_spectra,
+                                transformed,
+                                encoded,
+                                digest_scratch,
+                            )
+                        } else {
+                            horizontal_encoded_row_root_with_scratch(
+                                row,
+                                horizontal_spectra,
+                                transformed,
+                                encoded,
+                                digest_scratch,
+                            )
+                        }
+                    },
+                )
+                .collect::<Vec<_>>();
+            MatrixCommitment {
+                root: combine_equal_subtrees(&row_roots),
+                row_roots,
+                row_domain: CARRYOPEN_ROWS,
+                zero_row_root: zeros[CARRYOPEN_TENSOR_WIDTH.trailing_zeros() as usize],
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn tensor_row_commitments_flat_staging(
+    vertical_codeword: &[Field192],
+    message_row_roots: &[Digest],
+    horizontal_spectra: &[Vec<Field192>],
+    zeros: &[Digest],
+) -> Vec<MatrixCommitment> {
+    assert_eq!(
+        vertical_codeword.len(),
+        CARRYOPEN_INVERSE_RATE * CARRYOPEN_FIELDS
+    );
+    assert_eq!(message_row_roots.len(), CARRYOPEN_ROWS);
     let row_roots = vertical_codeword
         .par_chunks_exact(CARRYOPEN_WIDTH)
         .enumerate()
@@ -8354,6 +8413,65 @@ mod tests {
             borrowed_second_time.as_secs_f64() * 1_000.0,
             copied_first_time.as_secs_f64() * 1_000.0,
             copied_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale matrix-local versus flat row-root staging benchmark"]
+    fn matrix_local_row_roots_benchmark_flat_staging() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let (_, message_row_roots) =
+            exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
+        let vertical_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(0, component, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(1, component, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &message, &mut proof_codeword, &vertical_spectra, 64);
+        let run = |matrix_local: bool| {
+            let start = Instant::now();
+            let commitments = if matrix_local {
+                tensor_row_commitments(
+                    &proof_codeword,
+                    &message_row_roots,
+                    &horizontal_spectra,
+                    &zeros,
+                )
+            } else {
+                tensor_row_commitments_flat_staging(
+                    &proof_codeword,
+                    &message_row_roots,
+                    &horizontal_spectra,
+                    &zeros,
+                )
+            };
+            (commitments, start.elapsed())
+        };
+
+        let (matrix_first, matrix_first_time) = run(true);
+        let (flat_first, flat_first_time) = run(false);
+        let (flat_second, flat_second_time) = run(false);
+        let (matrix_second, matrix_second_time) = run(true);
+        for candidate in [&flat_first, &flat_second, &matrix_second] {
+            assert_eq!(candidate.len(), matrix_first.len());
+            for (candidate, expected) in candidate.iter().zip(&matrix_first) {
+                assert_eq!(candidate.root, expected.root);
+                assert_eq!(candidate.row_roots, expected.row_roots);
+            }
+        }
+        eprintln!(
+            "matrix-local-row-roots={:.3}/{:.3} ms flat-staging={:.3}/{:.3} ms",
+            matrix_first_time.as_secs_f64() * 1_000.0,
+            matrix_second_time.as_secs_f64() * 1_000.0,
+            flat_first_time.as_secs_f64() * 1_000.0,
+            flat_second_time.as_secs_f64() * 1_000.0,
         );
     }
 
