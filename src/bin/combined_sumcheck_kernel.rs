@@ -8503,15 +8503,34 @@ mod tests {
             .map(|core| 4 + core.serialize_unchecked().len())
             .collect::<Vec<_>>();
         let current_base = proof.base.serialize_unchecked().len();
+        let brakedown_distance = 0.95_f64;
+        let brakedown_target_bits = 131.162_f64;
+        let brakedown_columns =
+            (brakedown_target_bits / -(1.0 - brakedown_distance / 3.0).log2()).ceil() as usize;
+        assert_eq!(brakedown_columns, 239);
         eprintln!("strong-core-framed-bytes={strong_sizes:?}");
+        eprintln!(
+            "brakedown-equal-security-target={brakedown_target_bits:.3} bits distance={brakedown_distance:.2} columns={brakedown_columns}"
+        );
         for round in 0..STRONG_ROUNDS {
             let level = proof.strong[round].level().unwrap();
             let terminal_fields = level.next_blocks * level.width;
             let direct_base = 12 + terminal_fields * 24;
             let removed_later = strong_sizes[round + 1..].iter().sum::<usize>();
             let projected_total = payload.len() - removed_later - current_base + direct_base;
+            let retained_prefix = payload.len() - removed_later - current_base;
+            let backend_budget = payload.len() - retained_prefix;
+            let (brakedown_fields, brakedown_rows, brakedown_row_width) = (1..=terminal_fields)
+                .map(|rows| {
+                    let row_width = terminal_fields.div_ceil(rows);
+                    (2 * row_width + rows * brakedown_columns, rows, row_width)
+                })
+                .min()
+                .unwrap();
+            let brakedown_bare_bytes = brakedown_fields * 24;
+            assert!(brakedown_bare_bytes >= backend_budget);
             eprintln!(
-                "cutoff-round={round} terminal-fields={terminal_fields} direct-base-bytes={direct_base} projected-total-bytes={projected_total}"
+                "cutoff-round={round} terminal-fields={terminal_fields} direct-base-bytes={direct_base} projected-total-bytes={projected_total} backend-budget={backend_budget} brakedown-best=({brakedown_rows},{brakedown_row_width}) brakedown-bare-fields={brakedown_fields} brakedown-bare-bytes={brakedown_bare_bytes}"
             );
         }
     }
