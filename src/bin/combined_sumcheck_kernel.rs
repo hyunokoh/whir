@@ -1440,6 +1440,7 @@ fn precarry_coefficients(statement: &Digest, openings: usize) -> Vec<Field192> {
         .collect()
 }
 
+#[cfg(test)]
 fn fill_scaled_equality_weights(point: &[Field192], scale: Field192, target: &mut [Field192]) {
     assert_eq!(target.len(), 1_usize << point.len());
     target[0] = scale;
@@ -1454,6 +1455,42 @@ fn fill_scaled_equality_weights(point: &[Field192], scale: Field192, target: &mu
             .for_each(|(low, high)| *low -= *high);
         active *= 2;
     }
+}
+
+fn accumulate_scaled_equality_weights(
+    point: &[Field192],
+    scale: Field192,
+    scratch: &mut [Field192],
+    target: &mut [Field192],
+) {
+    assert!(!point.is_empty());
+    assert_eq!(scratch.len(), 1_usize << point.len());
+    assert_eq!(target.len(), scratch.len());
+    scratch[0] = scale;
+    let mut active = 1;
+    for coordinate in point[1..].iter().rev() {
+        let (low, high_and_tail) = scratch.split_at_mut(active);
+        let high = &mut high_and_tail[..active];
+        high.copy_from_slice(low);
+        high.par_iter_mut().for_each(|value| *value *= *coordinate);
+        low.par_iter_mut()
+            .zip(high.par_iter())
+            .for_each(|(low, high)| *low -= *high);
+        active *= 2;
+    }
+    assert_eq!(2 * active, scratch.len());
+    let source = &scratch[..active];
+    let (target_low, target_high) = target.split_at_mut(active);
+    let coordinate = point[0];
+    target_low
+        .par_iter_mut()
+        .zip(target_high.par_iter_mut())
+        .zip(source.par_iter())
+        .for_each(|((target_low, target_high), source)| {
+            let high = *source * coordinate;
+            *target_low += *source - high;
+            *target_high += high;
+        });
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1593,6 +1630,45 @@ impl ProductionPreCarryProof {
 }
 
 fn build_production_precarry(
+    message: &[Field192],
+    commitment_root: Digest,
+) -> ProductionPreCarryProof {
+    assert_eq!(message.len(), CARRYOPEN_FIELDS);
+    let points = precarry_opening_points(&commitment_root, 16);
+    let mut scratch = vec![Field192::ZERO; message.len()];
+    let claims = points
+        .iter()
+        .map(|point| evaluate_power_of_two_message_with_scratch(message, point, &mut scratch))
+        .collect::<Vec<_>>();
+    let statement = precarry_statement_root(&commitment_root, &points, &claims);
+    let coefficients = precarry_coefficients(&statement, claims.len());
+    let claimed = claims
+        .iter()
+        .zip(&coefficients)
+        .map(|(claim, coefficient)| *claim * coefficient)
+        .sum::<Field192>();
+    let mut combined_weight = vec![Field192::ZERO; message.len()];
+    for (point, coefficient) in points.iter().zip(coefficients) {
+        accumulate_scaled_equality_weights(point, coefficient, &mut scratch, &mut combined_weight);
+    }
+    drop(scratch);
+    let proof = ProductionPreCarryProof {
+        commitment_root,
+        points,
+        claims,
+        sumcheck: prove_local_product_relation_with_claim(
+            message.to_vec(),
+            combined_weight,
+            local_relation_roots(b"pre-Carry-batch", 0, &[commitment_root, statement]),
+            claimed,
+        ),
+    };
+    assert!(proof.verify());
+    proof
+}
+
+#[cfg(test)]
+fn build_production_precarry_separate_pass(
     message: &[Field192],
     commitment_root: Digest,
 ) -> ProductionPreCarryProof {
@@ -8154,6 +8230,93 @@ mod tests {
             .map(|weight| scale * weight)
             .collect::<Vec<_>>();
         assert_eq!(scratch, materialized);
+        let mut accumulated = vec![Field192::ZERO; materialized.len()];
+        accumulate_scaled_equality_weights(&point, scale, &mut scratch, &mut accumulated);
+        assert_eq!(accumulated, materialized);
+    }
+
+    #[test]
+    #[ignore = "production pre-Carry fused final equality-weight round benchmark"]
+    fn fused_equality_weight_accumulation_benchmarks_separate_pass() {
+        let points = precarry_opening_points(&[37_u8; 32], 16);
+        let coefficients = precarry_coefficients(&[91_u8; 32], points.len());
+        let run = |fused: bool| {
+            let start = Instant::now();
+            let mut scratch = vec![Field192::ZERO; CARRYOPEN_FIELDS];
+            let mut combined = vec![Field192::ZERO; CARRYOPEN_FIELDS];
+            for (point, coefficient) in points.iter().zip(&coefficients) {
+                if fused {
+                    accumulate_scaled_equality_weights(
+                        point,
+                        *coefficient,
+                        &mut scratch,
+                        &mut combined,
+                    );
+                } else {
+                    fill_scaled_equality_weights(point, *coefficient, &mut scratch);
+                    combined
+                        .par_iter_mut()
+                        .zip(scratch.par_iter())
+                        .for_each(|(target, weight)| *target += *weight);
+                }
+            }
+            (combined, start.elapsed())
+        };
+
+        let (fused_first, fused_first_time) = run(true);
+        let (separate_first, separate_first_time) = run(false);
+        assert_eq!(separate_first, fused_first);
+        drop(separate_first);
+        let (separate_second, separate_second_time) = run(false);
+        assert_eq!(separate_second, fused_first);
+        drop(separate_second);
+        let (fused_second, fused_second_time) = run(true);
+        assert_eq!(fused_second, fused_first);
+        eprintln!(
+            "fused-accumulation={:.3}/{:.3} ms separate-pass={:.3}/{:.3} ms",
+            fused_first_time.as_secs_f64() * 1_000.0,
+            fused_second_time.as_secs_f64() * 1_000.0,
+            separate_first_time.as_secs_f64() * 1_000.0,
+            separate_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production pre-Carry end-to-end fused-accumulation benchmark"]
+    fn fused_equality_weight_accumulation_benchmarks_full_precarry() {
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let commitment_root = prefix_root(
+            &message,
+            CARRYOPEN_FIELDS,
+            &zero_roots(CARRYOPEN_FIELDS.trailing_zeros() as usize),
+        );
+        let run = |fused: bool| {
+            let start = Instant::now();
+            let proof = if fused {
+                build_production_precarry(&message, commitment_root)
+            } else {
+                build_production_precarry_separate_pass(&message, commitment_root)
+            };
+            (proof, start.elapsed())
+        };
+
+        let (fused_first, fused_first_time) = run(true);
+        let (separate_first, separate_first_time) = run(false);
+        let (separate_second, separate_second_time) = run(false);
+        let (fused_second, fused_second_time) = run(true);
+        assert_eq!(separate_first, fused_first);
+        assert_eq!(separate_second, fused_first);
+        assert_eq!(fused_second, fused_first);
+        eprintln!(
+            "precarry-fused={:.3}/{:.3} ms precarry-separate={:.3}/{:.3} ms",
+            fused_first_time.as_secs_f64() * 1_000.0,
+            fused_second_time.as_secs_f64() * 1_000.0,
+            separate_first_time.as_secs_f64() * 1_000.0,
+            separate_second_time.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]
