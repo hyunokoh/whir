@@ -959,6 +959,11 @@ impl ProductionTransitionProof {
 
     fn serialize(&self) -> Vec<u8> {
         assert!(self.verify());
+        self.serialize_unchecked()
+    }
+
+    /// Serialize bytes after a verified aggregate has accepted this component.
+    fn serialize_unchecked(&self) -> Vec<u8> {
         let front = self.selected_front.serialize();
         let algebra = self.algebra.serialize();
         let mut output =
@@ -1499,8 +1504,14 @@ impl ProductionPreCarryProof {
         self.sumcheck.terminal_right == public_weight
     }
 
+    #[cfg(test)]
     fn serialize(&self) -> Vec<u8> {
         assert!(self.verify());
+        self.serialize_unchecked()
+    }
+
+    /// Serialize bytes after a verified CarryOpen aggregate has accepted this statement.
+    fn serialize_unchecked(&self) -> Vec<u8> {
         let variables = self.points[0].len();
         let sumcheck = self.sumcheck.serialize();
         let mut output = Vec::with_capacity(
@@ -2527,8 +2538,19 @@ impl CarryOpenCoreProof {
             && self.phi_link.challenges().is_some()
     }
 
+    #[cfg(test)]
     fn serialize(&self) -> Vec<u8> {
         let precarry = self.precarry.serialize();
+        self.serialize_with_precarry(precarry)
+    }
+
+    /// Serialize bytes after the containing proof has verified CarryOpen.
+    fn serialize_unchecked(&self) -> Vec<u8> {
+        let precarry = self.precarry.serialize_unchecked();
+        self.serialize_with_precarry(precarry)
+    }
+
+    fn serialize_with_precarry(&self, precarry: Vec<u8>) -> Vec<u8> {
         let front = self.selected_front.serialize();
         let membership = self.membership.serialize();
         let evaluation = self.evaluation.serialize();
@@ -4909,6 +4931,11 @@ impl StrongTerminalProof {
 
     fn serialize(&self) -> Vec<u8> {
         assert!(self.verify());
+        self.serialize_unchecked()
+    }
+
+    /// Serialize bytes after a verified aggregate has accepted this component.
+    fn serialize_unchecked(&self) -> Vec<u8> {
         let front = self.selected_front.serialize();
         let membership = self.membership.serialize();
         let tail = self.tail.serialize();
@@ -5090,8 +5117,14 @@ impl StrongTransitionCore {
             ) == Some(self.terminal_source_root)
     }
 
+    #[cfg(test)]
     fn serialize(&self) -> Vec<u8> {
         assert!(self.verify());
+        self.serialize_unchecked()
+    }
+
+    /// Serialize bytes after a verified recursive aggregate has accepted this transition.
+    fn serialize_unchecked(&self) -> Vec<u8> {
         let front = self.selected_front.serialize();
         let membership = self.membership.serialize();
         let mut output = Vec::with_capacity(
@@ -5202,8 +5235,14 @@ impl StrongBaseProof {
             && terminal_witness_matches_tail(&self.terminal_witness, &self.tail)
     }
 
+    #[cfg(test)]
     fn serialize(&self, core: &StrongTransitionCore) -> Vec<u8> {
         assert!(self.verify(core));
+        self.serialize_unchecked()
+    }
+
+    /// Serialize bytes after a verified aggregate has accepted this base proof.
+    fn serialize_unchecked(&self) -> Vec<u8> {
         let tail = self.tail.serialize();
         let mut output = Vec::with_capacity(24 + tail.len() + self.terminal_witness.len() * 24);
         output.extend_from_slice(Self::MAGIC);
@@ -5318,7 +5357,7 @@ impl ProductionCertificateProof {
         let transitions = self
             .transitions
             .iter()
-            .map(ProductionTransitionProof::serialize)
+            .map(ProductionTransitionProof::serialize_unchecked)
             .collect::<Vec<_>>();
         let tail = self.tail.serialize();
         let mut output = Vec::with_capacity(
@@ -5486,11 +5525,11 @@ impl ProductionEndToEndProof {
 
     fn serialize(&self) -> Vec<u8> {
         assert!(self.verify());
-        let carryopen = self.carryopen.serialize();
+        let carryopen = self.carryopen.serialize_unchecked();
         let certificate = self
             .certificate
             .iter()
-            .map(ProductionTransitionProof::serialize)
+            .map(ProductionTransitionProof::serialize_unchecked)
             .collect::<Vec<_>>();
         let tail = self.joint_tail.serialize();
         let mut output = Vec::with_capacity(
@@ -5600,13 +5639,13 @@ impl StrongEndToEndProof {
 
     fn serialize(&self) -> Vec<u8> {
         assert!(self.verify());
-        let carry = self.carryopen.serialize();
+        let carry = self.carryopen.serialize_unchecked();
         let certificate = self
             .certificate
             .iter()
-            .map(ProductionTransitionProof::serialize)
+            .map(ProductionTransitionProof::serialize_unchecked)
             .collect::<Vec<_>>();
-        let strong = self.strong.serialize();
+        let strong = self.strong.serialize_unchecked();
         let mut output = Vec::with_capacity(
             24 + carry.len()
                 + certificate
@@ -5728,6 +5767,34 @@ impl RecursiveStrongEndToEndProof {
     }
 
     fn serialize(&self) -> Vec<u8> {
+        // Construction verifies the aggregate before emission, and the remote
+        // acceptance boundary is `deserialize` plus its semantic pass. Keep a
+        // debug-build invariant without charging production serialization for
+        // a local verifier execution.
+        debug_assert!(self.verify());
+        self.serialize_unchecked()
+    }
+
+    /// Serialize the already-verified recursive aggregate without repeating
+    /// semantic checks in every nested component.
+    fn serialize_unchecked(&self) -> Vec<u8> {
+        let carry = self.carryopen.serialize_unchecked();
+        let certificate = self
+            .certificate
+            .iter()
+            .map(ProductionTransitionProof::serialize_unchecked)
+            .collect::<Vec<_>>();
+        let strong = self
+            .strong
+            .iter()
+            .map(StrongTransitionCore::serialize_unchecked)
+            .collect::<Vec<_>>();
+        let base = self.base.serialize_unchecked();
+        Self::assemble_serialized(carry, certificate, strong, base)
+    }
+
+    #[cfg(test)]
+    fn serialize_redundantly_verified(&self) -> Vec<u8> {
         assert!(self.verify());
         let carry = self.carryopen.serialize();
         let certificate = self
@@ -5741,6 +5808,15 @@ impl RecursiveStrongEndToEndProof {
             .map(StrongTransitionCore::serialize)
             .collect::<Vec<_>>();
         let base = self.base.serialize(self.strong.last().unwrap());
+        Self::assemble_serialized(carry, certificate, strong, base)
+    }
+
+    fn assemble_serialized(
+        carry: Vec<u8>,
+        certificate: Vec<Vec<u8>>,
+        strong: Vec<Vec<u8>>,
+        base: Vec<u8>,
+    ) -> Vec<u8> {
         let mut output = Vec::with_capacity(
             28 + carry.len()
                 + certificate
@@ -5767,7 +5843,30 @@ impl RecursiveStrongEndToEndProof {
         output
     }
 
-    fn byte_breakdown(&self) -> CanonicalProofByteBreakdown {
+    fn byte_breakdown(&self, serialized_len: usize) -> CanonicalProofByteBreakdown {
+        let carry_total = self.carryopen.serialize_unchecked().len();
+        let certificate_total = self
+            .certificate
+            .iter()
+            .map(|proof| 4 + proof.serialize_unchecked().len())
+            .sum::<usize>();
+        let strong_total = self
+            .strong
+            .iter()
+            .map(|proof| 4 + proof.serialize_unchecked().len())
+            .sum::<usize>();
+        let base_total = self.base.serialize_unchecked().len();
+        self.byte_breakdown_with_component_totals(
+            carry_total,
+            certificate_total,
+            strong_total,
+            base_total,
+            serialized_len,
+        )
+    }
+
+    #[cfg(test)]
+    fn byte_breakdown_redundantly_verified(&self) -> CanonicalProofByteBreakdown {
         let carry_total = self.carryopen.serialize().len();
         let certificate_total = self
             .certificate
@@ -5780,6 +5879,24 @@ impl RecursiveStrongEndToEndProof {
             .map(|proof| 4 + proof.serialize().len())
             .sum::<usize>();
         let base_total = self.base.serialize(self.strong.last().unwrap()).len();
+        let serialized_len = self.serialize_redundantly_verified().len();
+        self.byte_breakdown_with_component_totals(
+            carry_total,
+            certificate_total,
+            strong_total,
+            base_total,
+            serialized_len,
+        )
+    }
+
+    fn byte_breakdown_with_component_totals(
+        &self,
+        carry_total: usize,
+        certificate_total: usize,
+        strong_total: usize,
+        base_total: usize,
+        serialized_len: usize,
+    ) -> CanonicalProofByteBreakdown {
         let total = 28 + carry_total + certificate_total + strong_total + base_total;
 
         let mut proof_row_merkle = 0;
@@ -5844,7 +5961,7 @@ impl RecursiveStrongEndToEndProof {
             index_row_merkle_by_stage,
             selected_front_framing_by_stage,
         };
-        assert_eq!(breakdown.total, self.serialize().len());
+        assert_eq!(breakdown.total, serialized_len);
         breakdown
     }
 
@@ -6483,7 +6600,7 @@ fn main() {
                 );
                 let payload = proof.serialize();
                 recursive_strong_proof_bytes = payload.len();
-                canonical_byte_breakdown = Some(proof.byte_breakdown());
+                canonical_byte_breakdown = Some(proof.byte_breakdown(payload.len()));
                 recursive_strong_prover_ms.push(prover_start.elapsed().as_secs_f64() * 1_000.0);
                 final_total_prover_ms.push(iteration_start.elapsed().as_secs_f64() * 1_000.0);
                 clear_virtual_index_factor_cache();
@@ -6660,7 +6777,8 @@ fn main() {
                 assert!(recursive_proof.verify());
                 let recursive_payload = recursive_proof.serialize();
                 recursive_strong_proof_bytes = recursive_payload.len();
-                canonical_byte_breakdown = Some(recursive_proof.byte_breakdown());
+                canonical_byte_breakdown =
+                    Some(recursive_proof.byte_breakdown(recursive_payload.len()));
                 recursive_strong_prover_ms.push(recursive_start.elapsed().as_secs_f64() * 1_000.0);
                 let verify_start = Instant::now();
                 let parsed = RecursiveStrongEndToEndProof::deserialize(&recursive_payload)
@@ -7837,13 +7955,68 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "production canonical one-pass-vs-redundant verifier A/B benchmark"]
+    #[ignore = "production canonical single-pass serialization/verifier A/B benchmark"]
     fn canonical_verifier_benchmarks_single_semantic_pass() {
         let carry = run_production_carryopen(1);
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
         assert_eq!(payload.len(), 443_496);
+        assert_eq!(proof.byte_breakdown(payload.len()).total, payload.len());
+
+        clear_virtual_index_factor_cache();
+        let start = Instant::now();
+        let serialized_first = proof.serialize();
+        let serialized_first_time = start.elapsed();
+        clear_virtual_index_factor_cache();
+        let start = Instant::now();
+        let redundant_serialized_first = proof.serialize_redundantly_verified();
+        let redundant_serialized_first_time = start.elapsed();
+        clear_virtual_index_factor_cache();
+        let start = Instant::now();
+        let redundant_serialized_second = proof.serialize_redundantly_verified();
+        let redundant_serialized_second_time = start.elapsed();
+        clear_virtual_index_factor_cache();
+        let start = Instant::now();
+        let serialized_second = proof.serialize();
+        let serialized_second_time = start.elapsed();
+        assert_eq!(serialized_first, payload);
+        assert_eq!(redundant_serialized_first, payload);
+        assert_eq!(redundant_serialized_second, payload);
+        assert_eq!(serialized_second, payload);
+
+        clear_virtual_index_factor_cache();
+        let start = Instant::now();
+        let emitted_first = proof.serialize();
+        let breakdown_first = proof.byte_breakdown(emitted_first.len());
+        let emitted_first_time = start.elapsed();
+        clear_virtual_index_factor_cache();
+        let start = Instant::now();
+        let redundant_emitted_first = proof.serialize_redundantly_verified();
+        let redundant_breakdown_first = proof.byte_breakdown_redundantly_verified();
+        let redundant_emitted_first_time = start.elapsed();
+        clear_virtual_index_factor_cache();
+        let start = Instant::now();
+        let redundant_emitted_second = proof.serialize_redundantly_verified();
+        let redundant_breakdown_second = proof.byte_breakdown_redundantly_verified();
+        let redundant_emitted_second_time = start.elapsed();
+        clear_virtual_index_factor_cache();
+        let start = Instant::now();
+        let emitted_second = proof.serialize();
+        let breakdown_second = proof.byte_breakdown(emitted_second.len());
+        let emitted_second_time = start.elapsed();
+        assert_eq!(emitted_first, payload);
+        assert_eq!(redundant_emitted_first, payload);
+        assert_eq!(redundant_emitted_second, payload);
+        assert_eq!(emitted_second, payload);
+        for breakdown in [
+            breakdown_first,
+            redundant_breakdown_first,
+            redundant_breakdown_second,
+            breakdown_second,
+        ] {
+            assert_eq!(breakdown.total, payload.len());
+        }
         let carry_offset = 8 + 5 * 4;
         let precarry_size = u32::from_le_bytes(
             payload[carry_offset + 8..carry_offset + 12]
@@ -7884,7 +8057,15 @@ mod tests {
         assert_eq!(single_second, proof);
 
         eprintln!(
-            "single-pass={:.3}/{:.3} ms redundant={:.3}/{:.3} ms proof={} B",
+            "serialize-single={:.3}/{:.3} ms serialize-redundant={:.3}/{:.3} ms emit-and-account-single={:.3}/{:.3} ms emit-and-account-redundant={:.3}/{:.3} ms verifier-single={:.3}/{:.3} ms verifier-redundant={:.3}/{:.3} ms proof={} B",
+            serialized_first_time.as_secs_f64() * 1_000.0,
+            serialized_second_time.as_secs_f64() * 1_000.0,
+            redundant_serialized_first_time.as_secs_f64() * 1_000.0,
+            redundant_serialized_second_time.as_secs_f64() * 1_000.0,
+            emitted_first_time.as_secs_f64() * 1_000.0,
+            emitted_second_time.as_secs_f64() * 1_000.0,
+            redundant_emitted_first_time.as_secs_f64() * 1_000.0,
+            redundant_emitted_second_time.as_secs_f64() * 1_000.0,
             single_first_time.as_secs_f64() * 1_000.0,
             single_second_time.as_secs_f64() * 1_000.0,
             redundant_first_time.as_secs_f64() * 1_000.0,
