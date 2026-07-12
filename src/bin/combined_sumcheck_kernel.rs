@@ -2019,6 +2019,7 @@ fn horizontal_encoded_row_root_with_scratch(
 /// Return the ordinary flat Merkle root together with its exact `row_width`
 /// subtree roots.  Keeping these roots lets the tensor commitment reuse the
 /// already-hashed systematic quarter of its first matrix.
+#[cfg(test)]
 fn exact_root_with_row_subtrees(
     values: &[Field192],
     row_width: usize,
@@ -2091,6 +2092,53 @@ fn horizontal_row_root_with_systematic_subtree_scratch(
     combine_equal_subtrees(&roots)
 }
 
+fn message_and_systematic_tensor_commitment(
+    message: &[Field192],
+    horizontal_spectra: &[Vec<Field192>],
+    zeros: &[Digest],
+) -> (Digest, Vec<Digest>, MatrixCommitment) {
+    assert_eq!(message.len(), CARRYOPEN_FIELDS);
+    assert_eq!(horizontal_spectra.len(), CARRYOPEN_INVERSE_RATE - 1);
+    let row_roots = message
+        .par_chunks_exact(CARRYOPEN_WIDTH)
+        .map_init(
+            || {
+                (
+                    vec![Field192::ZERO; 2 * CARRYOPEN_WIDTH],
+                    Vec::with_capacity(CARRYOPEN_WIDTH / 4),
+                )
+            },
+            |(field_scratch, digest_scratch), row| {
+                let systematic_root = exact_prefix_root_with_scratch(row, digest_scratch);
+                let (transformed, parity) = field_scratch.split_at_mut(CARRYOPEN_WIDTH);
+                let tensor_root = horizontal_row_root_with_systematic_subtree_scratch(
+                    row,
+                    systematic_root,
+                    horizontal_spectra,
+                    transformed,
+                    parity,
+                    digest_scratch,
+                );
+                (systematic_root, tensor_root)
+            },
+        )
+        .collect::<Vec<_>>();
+    let mut message_row_roots = Vec::with_capacity(CARRYOPEN_ROWS);
+    let mut tensor_row_roots = Vec::with_capacity(CARRYOPEN_ROWS);
+    for (message_root, tensor_root) in row_roots {
+        message_row_roots.push(message_root);
+        tensor_row_roots.push(tensor_root);
+    }
+    let message_root = combine_equal_subtrees(&message_row_roots);
+    let commitment = MatrixCommitment {
+        root: combine_equal_subtrees(&tensor_row_roots),
+        row_roots: tensor_row_roots,
+        row_domain: CARRYOPEN_ROWS,
+        zero_row_root: zeros[CARRYOPEN_TENSOR_WIDTH.trailing_zeros() as usize],
+    };
+    (message_root, message_row_roots, commitment)
+}
+
 #[cfg(test)]
 fn tensor_row_commitments(
     vertical_codeword: &[Field192],
@@ -2158,18 +2206,16 @@ fn tensor_row_commitments(
         .collect()
 }
 
+#[cfg(test)]
 fn systematic_tensor_row_commitment(
-    vertical_codeword: &[Field192],
+    systematic_values: &[Field192],
     message_row_roots: &[Digest],
     horizontal_spectra: &[Vec<Field192>],
     zeros: &[Digest],
 ) -> MatrixCommitment {
-    assert_eq!(
-        vertical_codeword.len(),
-        CARRYOPEN_INVERSE_RATE * CARRYOPEN_FIELDS
-    );
+    assert_eq!(systematic_values.len(), CARRYOPEN_FIELDS);
     assert_eq!(message_row_roots.len(), CARRYOPEN_ROWS);
-    let row_roots = vertical_codeword[..CARRYOPEN_FIELDS]
+    let row_roots = systematic_values
         .par_chunks_exact(CARRYOPEN_WIDTH)
         .enumerate()
         .map_init(
@@ -3232,12 +3278,11 @@ impl CarryOpenCoreProof {
 struct CarryOpenMeasurement {
     proof: ProductionCarryOpenProof,
     terminal_source: Vec<Field192>,
-    message_commit: Duration,
+    message_and_systematic_commitment: Duration,
     precarry: Duration,
     encode_and_commit: Duration,
     generator_setup: Duration,
     vertical_and_parity_commitment: Duration,
-    systematic_commitment: Duration,
     front_and_selected_rows: Duration,
     algebra: Duration,
     terminal: Duration,
@@ -3258,10 +3303,15 @@ fn run_production_carryopen(
         .par_iter_mut()
         .enumerate()
         .for_each(|(index, value)| *value = precarry_message_value(index));
+    let horizontal_setup_start = Instant::now();
+    let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+        .map(|block| generator_spectrum(11, block, CARRYOPEN_WIDTH))
+        .collect::<Vec<_>>();
+    let horizontal_setup = horizontal_setup_start.elapsed();
     let start = Instant::now();
-    let (message_root, message_row_roots) =
-        exact_root_with_row_subtrees(&proof_codeword, CARRYOPEN_WIDTH, &zeros);
-    let message_commit = start.elapsed();
+    let (message_root, message_row_roots, systematic_matrix_commitment) =
+        message_and_systematic_tensor_commitment(&proof_codeword, &horizontal_spectra, &zeros);
+    let message_and_systematic_commitment = start.elapsed();
 
     let start = Instant::now();
     let precarry = build_production_precarry_in_codeword(&mut proof_codeword, message_root);
@@ -3271,14 +3321,11 @@ fn run_production_carryopen(
     let spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
         .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
         .collect::<Vec<_>>();
-    let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
-        .map(|block| generator_spectrum(11, block, CARRYOPEN_WIDTH))
-        .collect::<Vec<_>>();
     let generator_roots = spectra
         .iter()
         .map(|spectrum| prefix_root(spectrum, CARRYOPEN_ROWS, &zeros))
         .collect::<Vec<_>>();
-    let generator_setup = start.elapsed();
+    let generator_setup = horizontal_setup + start.elapsed();
     let vertical_start = Instant::now();
     assert!(proof_codeword.capacity() >= level.qa_fields());
     proof_codeword.resize(level.qa_fields(), Field192::ZERO);
@@ -3291,19 +3338,11 @@ fn run_production_carryopen(
         &zeros,
     );
     let vertical_and_parity_commitment = vertical_start.elapsed();
-    let commitment_start = Instant::now();
-    let systematic_matrix_commitment = systematic_tensor_row_commitment(
-        &proof_codeword,
-        &message_row_roots,
-        &horizontal_spectra,
-        &zeros,
-    );
     let proof_commitments = std::iter::once(systematic_matrix_commitment)
         .chain(parity_commitments)
         .collect::<Vec<_>>();
     // The final commitments own the row roots needed by the selected front.
     drop(message_row_roots);
-    let systematic_commitment = commitment_start.elapsed();
     let front_start = Instant::now();
     let mut component_roots = generator_roots;
     component_roots.push(message_root);
@@ -3425,12 +3464,11 @@ fn run_production_carryopen(
     CarryOpenMeasurement {
         proof,
         terminal_source,
-        message_commit,
+        message_and_systematic_commitment,
         precarry: precarry_time,
         encode_and_commit,
         generator_setup,
         vertical_and_parity_commitment,
-        systematic_commitment,
         front_and_selected_rows,
         algebra,
         terminal,
@@ -8259,9 +8297,9 @@ fn main() {
         );
     }
     if args.carryopen {
-        let message_ms = carryopen_measurements
+        let message_and_systematic_commitment_ms = carryopen_measurements
             .iter()
-            .map(|item| item.message_commit.as_secs_f64() * 1_000.0)
+            .map(|item| item.message_and_systematic_commitment.as_secs_f64() * 1_000.0)
             .collect::<Vec<_>>();
         let precarry_ms = carryopen_measurements
             .iter()
@@ -8278,10 +8316,6 @@ fn main() {
         let vertical_plus_parity_commitment_ms = carryopen_measurements
             .iter()
             .map(|item| item.vertical_and_parity_commitment.as_secs_f64() * 1_000.0)
-            .collect::<Vec<_>>();
-        let systematic_commitment_ms = carryopen_measurements
-            .iter()
-            .map(|item| item.systematic_commitment.as_secs_f64() * 1_000.0)
             .collect::<Vec<_>>();
         let front_and_selected_rows_ms = carryopen_measurements
             .iter()
@@ -8303,18 +8337,17 @@ fn main() {
             "- pre-Carry message/scratch/weight/sumcheck copy reuse the four quarters of the reserved 1.500-GiB codeword allocation"
         );
         println!(
-            "- CarryOpen M-root/pre-Carry/encode+commit/algebra/terminal medians: {:.3}/{:.3}/{:.3}/{:.3}/{:.3} ms",
-            percentile(&message_ms, 0.5),
+            "- CarryOpen M+systematic-root/pre-Carry/encode+commit/algebra/terminal medians: {:.3}/{:.3}/{:.3}/{:.3}/{:.3} ms",
+            percentile(&message_and_systematic_commitment_ms, 0.5),
             percentile(&precarry_ms, 0.5),
             percentile(&encode_ms, 0.5),
             percentile(&algebra_ms, 0.5),
             percentile(&terminal_ms, 0.5)
         );
         println!(
-            "- CarryOpen encode+commit detail (setup/vertical+parity-root/systematic-root/front) medians: {:.3}/{:.3}/{:.3}/{:.3} ms",
+            "- CarryOpen encode+commit detail (setup/vertical+parity-root/front) medians: {:.3}/{:.3}/{:.3} ms",
             percentile(&generator_setup_ms, 0.5),
             percentile(&vertical_plus_parity_commitment_ms, 0.5),
-            percentile(&systematic_commitment_ms, 0.5),
             percentile(&front_and_selected_rows_ms, 0.5)
         );
         println!(
@@ -9715,6 +9748,55 @@ mod tests {
             preallocated_second_time.as_secs_f64() * 1_000.0,
             separate_first_time.as_secs_f64() * 1_000.0,
             separate_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale fused message and systematic tensor commitment A/B"]
+    fn message_rows_fuse_systematic_tensor_commitment() {
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(11, block, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let run = |fused: bool| {
+            let start = Instant::now();
+            let result = if fused {
+                message_and_systematic_tensor_commitment(&message, &horizontal_spectra, &zeros)
+            } else {
+                let (message_root, message_row_roots) =
+                    exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
+                let commitment = systematic_tensor_row_commitment(
+                    &message,
+                    &message_row_roots,
+                    &horizontal_spectra,
+                    &zeros,
+                );
+                (message_root, message_row_roots, commitment)
+            };
+            (result, start.elapsed())
+        };
+        let retained_first = run(false);
+        let fused_first = run(true);
+        let fused_second = run(true);
+        let retained_second = run(false);
+        for candidate in [&fused_first.0, &fused_second.0, &retained_second.0] {
+            assert_eq!(candidate.0, retained_first.0 .0);
+            assert_eq!(candidate.1, retained_first.0 .1);
+            assert_eq!(candidate.2.root, retained_first.0 .2.root);
+            assert_eq!(candidate.2.row_roots, retained_first.0 .2.row_roots);
+            assert_eq!(candidate.2.row_domain, retained_first.0 .2.row_domain);
+            assert_eq!(candidate.2.zero_row_root, retained_first.0 .2.zero_row_root);
+        }
+        eprintln!(
+            "message-systematic-commit retained={:.3}/{:.3} ms fused={:.3}/{:.3} ms",
+            retained_first.1.as_secs_f64() * 1_000.0,
+            retained_second.1.as_secs_f64() * 1_000.0,
+            fused_first.1.as_secs_f64() * 1_000.0,
+            fused_second.1.as_secs_f64() * 1_000.0,
         );
     }
 
