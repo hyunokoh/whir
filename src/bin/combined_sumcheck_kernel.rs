@@ -2091,6 +2091,7 @@ fn horizontal_row_root_with_systematic_subtree_scratch(
     combine_equal_subtrees(&roots)
 }
 
+#[cfg(test)]
 fn tensor_row_commitments(
     vertical_codeword: &[Field192],
     message_row_roots: &[Digest],
@@ -2155,6 +2156,48 @@ fn tensor_row_commitments(
             }
         })
         .collect()
+}
+
+fn systematic_tensor_row_commitment(
+    vertical_codeword: &[Field192],
+    message_row_roots: &[Digest],
+    horizontal_spectra: &[Vec<Field192>],
+    zeros: &[Digest],
+) -> MatrixCommitment {
+    assert_eq!(
+        vertical_codeword.len(),
+        CARRYOPEN_INVERSE_RATE * CARRYOPEN_FIELDS
+    );
+    assert_eq!(message_row_roots.len(), CARRYOPEN_ROWS);
+    let row_roots = vertical_codeword[..CARRYOPEN_FIELDS]
+        .par_chunks_exact(CARRYOPEN_WIDTH)
+        .enumerate()
+        .map_init(
+            || {
+                (
+                    vec![Field192::ZERO; 2 * CARRYOPEN_WIDTH],
+                    Vec::with_capacity(CARRYOPEN_WIDTH / 4),
+                )
+            },
+            |(field_scratch, digest_scratch), (row_index, row)| {
+                let (transformed, encoded) = field_scratch.split_at_mut(CARRYOPEN_WIDTH);
+                horizontal_row_root_with_systematic_subtree_scratch(
+                    row,
+                    message_row_roots[row_index],
+                    horizontal_spectra,
+                    transformed,
+                    encoded,
+                    digest_scratch,
+                )
+            },
+        )
+        .collect::<Vec<_>>();
+    MatrixCommitment {
+        root: combine_equal_subtrees(&row_roots),
+        row_roots,
+        row_domain: CARRYOPEN_ROWS,
+        zero_row_root: zeros[CARRYOPEN_TENSOR_WIDTH.trailing_zeros() as usize],
+    }
 }
 
 #[cfg(test)]
@@ -3193,8 +3236,8 @@ struct CarryOpenMeasurement {
     precarry: Duration,
     encode_and_commit: Duration,
     generator_setup: Duration,
-    vertical_encoding: Duration,
-    tensor_commitment: Duration,
+    vertical_and_parity_commitment: Duration,
+    systematic_commitment: Duration,
     front_and_selected_rows: Duration,
     algebra: Duration,
     terminal: Duration,
@@ -3239,18 +3282,28 @@ fn run_production_carryopen(
     let vertical_start = Instant::now();
     assert!(proof_codeword.capacity() >= level.qa_fields());
     proof_codeword.resize(level.qa_fields(), Field192::ZERO);
-    populate_parity_from_systematic(level, &mut proof_codeword, &spectra, 64);
-    let vertical_encoding = vertical_start.elapsed();
+    let parity_commitments = populate_parity_and_commit_from_systematic(
+        level,
+        &mut proof_codeword,
+        &spectra,
+        &horizontal_spectra,
+        64,
+        &zeros,
+    );
+    let vertical_and_parity_commitment = vertical_start.elapsed();
     let commitment_start = Instant::now();
-    let proof_commitments = tensor_row_commitments(
+    let systematic_matrix_commitment = systematic_tensor_row_commitment(
         &proof_codeword,
         &message_row_roots,
         &horizontal_spectra,
         &zeros,
     );
+    let proof_commitments = std::iter::once(systematic_matrix_commitment)
+        .chain(parity_commitments)
+        .collect::<Vec<_>>();
     // The final commitments own the row roots needed by the selected front.
     drop(message_row_roots);
-    let tensor_commitment = commitment_start.elapsed();
+    let systematic_commitment = commitment_start.elapsed();
     let front_start = Instant::now();
     let mut component_roots = generator_roots;
     component_roots.push(message_root);
@@ -3376,8 +3429,8 @@ fn run_production_carryopen(
         precarry: precarry_time,
         encode_and_commit,
         generator_setup,
-        vertical_encoding,
-        tensor_commitment,
+        vertical_and_parity_commitment,
+        systematic_commitment,
         front_and_selected_rows,
         algebra,
         terminal,
@@ -3950,6 +4003,127 @@ fn populate_parity_from_systematic_with_scatter_tile(
                 });
         }
     }
+}
+
+fn scatter_final_parity_block_and_commit(
+    target: &mut [Field192],
+    width: usize,
+    lane_start: usize,
+    encoded: &[Vec<Vec<Field192>>],
+    parity_block: usize,
+    horizontal_spectra: &[Vec<Field192>],
+) -> Vec<Digest> {
+    const ROW_BLOCK: usize = 64;
+    const LANE_TILE: usize = 4;
+    assert_eq!(width, CARRYOPEN_WIDTH);
+    assert_eq!(target.len() % width, 0);
+    assert_eq!(lane_start + encoded.len(), width);
+    let rows = target.len() / width;
+    assert!(encoded.iter().all(|lane| lane
+        .get(parity_block)
+        .is_some_and(|values| values.len() == rows)));
+    let mut row_roots = vec![[0_u8; 32]; rows];
+    target
+        .par_chunks_mut(width * ROW_BLOCK)
+        .zip(row_roots.par_chunks_mut(ROW_BLOCK))
+        .enumerate()
+        .for_each_init(
+            || {
+                (
+                    vec![Field192::ZERO; CARRYOPEN_WIDTH + CARRYOPEN_TENSOR_WIDTH],
+                    Vec::with_capacity(CARRYOPEN_TENSOR_WIDTH / 4),
+                )
+            },
+            |(field_scratch, digest_scratch), (block, (target_rows, roots))| {
+                let row_start = block * ROW_BLOCK;
+                for offset_start in (0..encoded.len()).step_by(LANE_TILE) {
+                    let offset_end = (offset_start + LANE_TILE).min(encoded.len());
+                    for (local_row, target_row) in target_rows.chunks_exact_mut(width).enumerate() {
+                        let row = row_start + local_row;
+                        for offset in offset_start..offset_end {
+                            target_row[lane_start + offset] = encoded[offset][parity_block][row];
+                        }
+                    }
+                }
+                let (transformed, horizontal) = field_scratch.split_at_mut(CARRYOPEN_WIDTH);
+                for (row, root) in target_rows.chunks_exact(width).zip(roots) {
+                    *root = horizontal_encoded_row_root_with_scratch(
+                        row,
+                        horizontal_spectra,
+                        transformed,
+                        horizontal,
+                        digest_scratch,
+                    );
+                }
+            },
+        );
+    row_roots
+}
+
+fn populate_parity_and_commit_from_systematic(
+    level: Level,
+    proof_codeword: &mut [Field192],
+    spectra: &[Vec<Field192>],
+    horizontal_spectra: &[Vec<Field192>],
+    batch_lanes: usize,
+    zeros: &[Digest],
+) -> Vec<MatrixCommitment> {
+    assert_eq!(proof_codeword.len(), level.qa_fields());
+    assert_eq!(spectra.len(), level.inverse_rate - 1);
+    assert_eq!(horizontal_spectra.len(), level.inverse_rate - 1);
+    assert_eq!(level.group, CARRYOPEN_ROWS);
+    assert_eq!(level.width, CARRYOPEN_WIDTH);
+    assert_eq!(batch_lanes, 64);
+    let systematic_fields = level.group * level.width;
+    let mut commitments = Vec::with_capacity(level.inverse_rate - 1);
+    for lane_start in (0..level.width).step_by(batch_lanes) {
+        let lane_end = (lane_start + batch_lanes).min(level.width);
+        let encoded = {
+            let systematic = &proof_codeword[..systematic_fields];
+            (lane_start..lane_end)
+                .into_par_iter()
+                .map(|lane| {
+                    let message = systematic
+                        .chunks_exact(level.width)
+                        .map(|row| row[lane])
+                        .collect::<Vec<_>>();
+                    encode_parity_blocks(message, spectra)
+                })
+                .collect::<Vec<_>>()
+        };
+        for parity_block in 0..level.inverse_rate - 1 {
+            let start = (parity_block + 1) * systematic_fields;
+            let target = &mut proof_codeword[start..start + systematic_fields];
+            if lane_end == level.width {
+                let row_roots = scatter_final_parity_block_and_commit(
+                    target,
+                    level.width,
+                    lane_start,
+                    &encoded,
+                    parity_block,
+                    horizontal_spectra,
+                );
+                commitments.push(MatrixCommitment {
+                    root: combine_equal_subtrees(&row_roots),
+                    row_roots,
+                    row_domain: CARRYOPEN_ROWS,
+                    zero_row_root: zeros[CARRYOPEN_TENSOR_WIDTH.trailing_zeros() as usize],
+                });
+            } else {
+                scatter_parity_block_blocked(
+                    target,
+                    level.width,
+                    lane_start,
+                    &encoded,
+                    parity_block,
+                    64,
+                    4,
+                );
+            }
+        }
+    }
+    assert_eq!(commitments.len(), level.inverse_rate - 1);
+    commitments
 }
 
 #[cfg(test)]
@@ -8101,13 +8275,13 @@ fn main() {
             .iter()
             .map(|item| item.generator_setup.as_secs_f64() * 1_000.0)
             .collect::<Vec<_>>();
-        let vertical_encoding_ms = carryopen_measurements
+        let vertical_plus_parity_commitment_ms = carryopen_measurements
             .iter()
-            .map(|item| item.vertical_encoding.as_secs_f64() * 1_000.0)
+            .map(|item| item.vertical_and_parity_commitment.as_secs_f64() * 1_000.0)
             .collect::<Vec<_>>();
-        let tensor_commitment_ms = carryopen_measurements
+        let systematic_commitment_ms = carryopen_measurements
             .iter()
-            .map(|item| item.tensor_commitment.as_secs_f64() * 1_000.0)
+            .map(|item| item.systematic_commitment.as_secs_f64() * 1_000.0)
             .collect::<Vec<_>>();
         let front_and_selected_rows_ms = carryopen_measurements
             .iter()
@@ -8137,10 +8311,10 @@ fn main() {
             percentile(&terminal_ms, 0.5)
         );
         println!(
-            "- CarryOpen encode+commit detail (setup/vertical/tensor-root/front) medians: {:.3}/{:.3}/{:.3}/{:.3} ms",
+            "- CarryOpen encode+commit detail (setup/vertical+parity-root/systematic-root/front) medians: {:.3}/{:.3}/{:.3}/{:.3} ms",
             percentile(&generator_setup_ms, 0.5),
-            percentile(&vertical_encoding_ms, 0.5),
-            percentile(&tensor_commitment_ms, 0.5),
+            percentile(&vertical_plus_parity_commitment_ms, 0.5),
+            percentile(&systematic_commitment_ms, 0.5),
             percentile(&front_and_selected_rows_ms, 0.5)
         );
         println!(
@@ -9541,6 +9715,83 @@ mod tests {
             preallocated_second_time.as_secs_f64() * 1_000.0,
             separate_first_time.as_secs_f64() * 1_000.0,
             separate_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale final vertical scatter plus horizontal commitment A/B"]
+    fn final_vertical_scatter_fuses_parity_commitments() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let (_, message_row_roots) =
+            exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
+        let spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(11, block, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = Vec::with_capacity(level.qa_fields());
+        proof_codeword.extend_from_slice(&message);
+        proof_codeword.resize(level.qa_fields(), Field192::ZERO);
+
+        let run = |fused: bool, proof_codeword: &mut [Field192]| {
+            let start = Instant::now();
+            let commitments = if fused {
+                let parity = populate_parity_and_commit_from_systematic(
+                    level,
+                    proof_codeword,
+                    &spectra,
+                    &horizontal_spectra,
+                    64,
+                    &zeros,
+                );
+                let systematic = systematic_tensor_row_commitment(
+                    proof_codeword,
+                    &message_row_roots,
+                    &horizontal_spectra,
+                    &zeros,
+                );
+                std::iter::once(systematic)
+                    .chain(parity)
+                    .collect::<Vec<_>>()
+            } else {
+                populate_parity_from_systematic(level, proof_codeword, &spectra, 64);
+                tensor_row_commitments(
+                    proof_codeword,
+                    &message_row_roots,
+                    &horizontal_spectra,
+                    &zeros,
+                )
+            };
+            (commitments, start.elapsed())
+        };
+        let retained_first = run(false, &mut proof_codeword);
+        let fused_first = run(true, &mut proof_codeword);
+        let fused_second = run(true, &mut proof_codeword);
+        let retained_second = run(false, &mut proof_codeword);
+        let assert_same = |candidate: &[MatrixCommitment], expected: &[MatrixCommitment]| {
+            assert_eq!(candidate.len(), expected.len());
+            for (candidate, expected) in candidate.iter().zip(expected) {
+                assert_eq!(candidate.root, expected.root);
+                assert_eq!(candidate.row_roots, expected.row_roots);
+                assert_eq!(candidate.row_domain, expected.row_domain);
+                assert_eq!(candidate.zero_row_root, expected.zero_row_root);
+            }
+        };
+        assert_same(&retained_first.0, &fused_first.0);
+        assert_same(&retained_first.0, &fused_second.0);
+        assert_same(&retained_first.0, &retained_second.0);
+        eprintln!(
+            "final-scatter-commit retained={:.3}/{:.3} ms fused={:.3}/{:.3} ms",
+            retained_first.1.as_secs_f64() * 1_000.0,
+            retained_second.1.as_secs_f64() * 1_000.0,
+            fused_first.1.as_secs_f64() * 1_000.0,
+            fused_second.1.as_secs_f64() * 1_000.0,
         );
     }
 
