@@ -858,6 +858,30 @@ mod neon4 {
         unsafe { compress_parent_v2_digests8(&left, &right) }
     }
 
+    #[inline(always)]
+    unsafe fn compress_field_level1_v2_words8(
+        first: &[[u64; 3]; 8],
+        second: &[[u64; 3]; 8],
+    ) -> [Packed8; 8] {
+        let first_words = unsafe { field_digest_words8(first) };
+        let second_words = unsafe { field_digest_words8(second) };
+        let (left, right) = unsafe { pair_child_words8(&first_words, &second_words) };
+        unsafe { compress_parent_v2_words8(&left, &right) }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_field_level2_v2_8(
+        first: &[[u64; 3]; 8],
+        second: &[[u64; 3]; 8],
+        third: &[[u64; 3]; 8],
+        fourth: &[[u64; 3]; 8],
+    ) -> [Digest; 8] {
+        let first_parents = unsafe { compress_field_level1_v2_words8(first, second) };
+        let second_parents = unsafe { compress_field_level1_v2_words8(third, fourth) };
+        let (left, right) = unsafe { pair_child_words8(&first_parents, &second_parents) };
+        unsafe { compress_parent_v2_digests8(&left, &right) }
+    }
+
     #[target_feature(enable = "neon")]
     pub unsafe fn compress_parent_level2_v2_8(
         first: &[Digest; 16],
@@ -1525,6 +1549,34 @@ fn field_level1_one_block_v2(values: &[Field192; 16]) -> [Digest; 8] {
     }
 }
 
+fn field_level2_one_block_v2(values: &[Field192; 32]) -> [Digest; 8] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let first = std::array::from_fn(|index| values[index].into_bigint().0);
+        let second = std::array::from_fn(|index| values[8 + index].into_bigint().0);
+        let third = std::array::from_fn(|index| values[16 + index].into_bigint().0);
+        let fourth = std::array::from_fn(|index| values[24 + index].into_bigint().0);
+        // SAFETY: the function is compiled with NEON enabled and AArch64
+        // guarantees NEON support.
+        unsafe { neon4::compress_field_level2_v2_8(&first, &second, &third, &fourth) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let first: &[Field192; 16] = values[..16].try_into().unwrap();
+        let second: &[Field192; 16] = values[16..].try_into().unwrap();
+        let first = field_level1_one_block_v2(first);
+        let second = field_level1_one_block_v2(second);
+        let intermediate = std::array::from_fn(|index| {
+            if index < 8 {
+                first[index]
+            } else {
+                second[index - 8]
+            }
+        });
+        parent8_one_block_v2(&intermediate)
+    }
+}
+
 fn parent_level2_one_block_v2(children: &[Digest; 32]) -> [Digest; 8] {
     #[cfg(target_arch = "aarch64")]
     {
@@ -1898,6 +1950,14 @@ fn extend_field_level1_batched(values: &[Field192], scratch: &mut Vec<Digest>) {
     }
 }
 
+fn extend_field_level2_batched_v2(values: &[Field192], scratch: &mut Vec<Digest>) {
+    assert!(values.len() >= 32 && values.len().is_power_of_two());
+    for chunk in values.chunks_exact(32) {
+        let values: &[Field192; 32] = chunk.try_into().unwrap();
+        scratch.extend_from_slice(&field_level2_one_block_v2(values));
+    }
+}
+
 fn extend_field_level1_batched_one_block_v2(values: &[Field192], scratch: &mut Vec<Digest>) {
     assert!(values.len() >= 16 && values.len().is_power_of_two());
     for chunk in values.chunks_exact(16) {
@@ -2006,7 +2066,9 @@ fn exact_prefix_root_batched(values: &[Field192]) -> Digest {
 pub fn exact_prefix_root_with_scratch(values: &[Field192], scratch: &mut Vec<Digest>) -> Digest {
     assert!(values.len() >= 8 && values.len().is_power_of_two());
     scratch.clear();
-    if values.len() >= 16 {
+    if values.len() >= 32 {
+        extend_field_level2_batched_v2(values, scratch);
+    } else if values.len() >= 16 {
         extend_field_level1_batched(values, scratch);
     } else {
         extend_field_leaves_batched(values, scratch, |value| value);
@@ -2014,9 +2076,8 @@ pub fn exact_prefix_root_with_scratch(values: &[Field192], scratch: &mut Vec<Dig
     reduce_exact_digests(scratch)
 }
 
-/// Experimental exact root for a v2 layout whose internal nodes use one
-/// Blake3 compression with `PARENT | ROOT`. Leaves are unchanged. The third
-/// argument is retained so this function can be crossed against [`prefix_root`].
+/// Reproduce the former field-level-1 schedule for the production v2 layout.
+/// The root remains transcript-identical to [`prefix_root`].
 #[doc(hidden)]
 pub fn prefix_root_one_block_nodes_v2_for_benchmark(
     values: &[Field192],
@@ -2034,6 +2095,30 @@ pub fn prefix_root_one_block_nodes_v2_for_benchmark(
             extend_field_leaves_batched(values, &mut scratch, |value| value);
         }
         reduce_exact_digests_one_block_v2(&mut scratch)
+    })
+}
+
+/// Reproduce the production schedule that fuses field leaves with the first
+/// two v2 parent levels, halving the initial digest scratch.
+#[doc(hidden)]
+pub fn prefix_root_fused_field_level2_v2_for_benchmark(
+    values: &[Field192],
+    capacity: usize,
+    _zeros: &[Digest],
+) -> Digest {
+    assert_eq!(values.len(), capacity);
+    assert!(capacity >= 8 && capacity.is_power_of_two());
+    EXACT_ROOT_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        scratch.clear();
+        if values.len() >= 32 {
+            extend_field_level2_batched_v2(values, &mut scratch);
+        } else if values.len() >= 16 {
+            extend_field_level1_batched(values, &mut scratch);
+        } else {
+            extend_field_leaves_batched(values, &mut scratch, |value| value);
+        }
+        reduce_exact_digests(&mut scratch)
     })
 }
 
@@ -2851,6 +2936,10 @@ mod tests {
                 candidate,
                 prefix_root(&values[..size], size, &zero_roots(12))
             );
+            assert_eq!(
+                candidate,
+                prefix_root_fused_field_level2_v2_for_benchmark(&values[..size], size, &zeros)
+            );
             assert_ne!(
                 candidate,
                 prefix_root_two_block_nodes_v1_for_benchmark(
@@ -2860,6 +2949,40 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    #[ignore = "fused field-level-2 versus field-level-1 v2 exact-root benchmark"]
+    fn fused_field_level2_v2_benchmarks_field_level1() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let values = (0..1024_u64)
+            .map(|index| {
+                let seed = blake3::hash(&(index + 991).to_le_bytes());
+                Field192::from_le_bytes_mod_order(seed.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        let zeros = zero_roots(10);
+        let iterations = 20_000;
+        let run = |root: fn(&[Field192], usize, &[Digest]) -> Digest| {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(root(black_box(&values), values.len(), &zeros));
+            }
+            start.elapsed()
+        };
+        let level1_first = run(prefix_root_one_block_nodes_v2_for_benchmark);
+        let level2_first = run(prefix_root_fused_field_level2_v2_for_benchmark);
+        let level2_second = run(prefix_root_fused_field_level2_v2_for_benchmark);
+        let level1_second = run(prefix_root_one_block_nodes_v2_for_benchmark);
+        eprintln!(
+            "fused-field-level2-v2 exact_root_1024 iterations={iterations} level1={:.3}/{:.3} ms level2={:.3}/{:.3} ms",
+            level1_first.as_secs_f64() * 1_000.0,
+            level1_second.as_secs_f64() * 1_000.0,
+            level2_first.as_secs_f64() * 1_000.0,
+            level2_second.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]

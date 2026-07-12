@@ -33,10 +33,10 @@ use whir::lilac_merkle::{
     combine_equal_subtrees_one_block_nodes_v2_for_benchmark,
     combine_equal_subtrees_parallel_for_benchmark,
     combine_equal_subtrees_two_block_nodes_v1_for_benchmark,
-    prefix_root_copied_parents_for_benchmark, prefix_root_materialized_blocks_for_benchmark,
-    prefix_root_materialized_cv_for_benchmark, prefix_root_materialized_leaves_for_benchmark,
-    prefix_root_materialized_parents_for_benchmark, prefix_root_one_block_nodes_v2_for_benchmark,
-    prefix_root_scalar_leaf_messages_for_benchmark,
+    prefix_root_copied_parents_for_benchmark, prefix_root_fused_field_level2_v2_for_benchmark,
+    prefix_root_materialized_blocks_for_benchmark, prefix_root_materialized_cv_for_benchmark,
+    prefix_root_materialized_leaves_for_benchmark, prefix_root_materialized_parents_for_benchmark,
+    prefix_root_one_block_nodes_v2_for_benchmark, prefix_root_scalar_leaf_messages_for_benchmark,
     prefix_root_scalar_parent_messages_for_benchmark, prefix_root_scatter_for_benchmark,
     prefix_root_two_block_nodes_v1_for_benchmark, prefix_root_unfused_for_benchmark,
     prefix_root_unfused_leaf_parent_io_for_benchmark,
@@ -2121,7 +2121,7 @@ fn tensor_row_commitments(
                     || {
                         (
                             vec![Field192::ZERO; CARRYOPEN_WIDTH + encoded_fields],
-                            Vec::with_capacity(encoded_fields / 2),
+                            Vec::with_capacity(encoded_fields / 4),
                         )
                     },
                     |(field_scratch, digest_scratch), (row_index, row)| {
@@ -10469,6 +10469,64 @@ mod tests {
             v1_second.1.as_secs_f64() * 1_000.0,
             v2_first.1.as_secs_f64() * 1_000.0,
             v2_second.1.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale fused field-level-2 versus former field-level-1 v2 tensor roots"]
+    fn fused_field_level2_v2_benchmarks_field_level1_tensor_roots() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let message_row_roots = message
+            .par_chunks_exact(CARRYOPEN_WIDTH)
+            .map(|row| prefix_root(row, CARRYOPEN_WIDTH, &zeros))
+            .collect::<Vec<_>>();
+        let vertical_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(10, component, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(11, component, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &message, &mut proof_codeword, &vertical_spectra, 64);
+        let run = |row_root: fn(&[Field192], usize, &[Digest]) -> Digest| {
+            let start = Instant::now();
+            let commitments = tensor_row_commitments_with_root(
+                &proof_codeword,
+                &message_row_roots,
+                &horizontal_spectra,
+                &zeros,
+                row_root,
+                combine_equal_subtrees,
+            );
+            (commitments, start.elapsed())
+        };
+        let level1_first = run(prefix_root_one_block_nodes_v2_for_benchmark);
+        let level2_first = run(prefix_root_fused_field_level2_v2_for_benchmark);
+        let level2_second = run(prefix_root_fused_field_level2_v2_for_benchmark);
+        let level1_second = run(prefix_root_one_block_nodes_v2_for_benchmark);
+        let assert_same = |candidate: &[MatrixCommitment], expected: &[MatrixCommitment]| {
+            assert_eq!(candidate.len(), expected.len());
+            for (candidate, expected) in candidate.iter().zip(expected) {
+                assert_eq!(candidate.root, expected.root);
+                assert_eq!(candidate.row_roots, expected.row_roots);
+                assert_eq!(candidate.row_domain, expected.row_domain);
+                assert_eq!(candidate.zero_row_root, expected.zero_row_root);
+            }
+        };
+        assert_same(&level1_first.0, &level2_first.0);
+        assert_same(&level1_first.0, &level2_second.0);
+        assert_same(&level1_first.0, &level1_second.0);
+        eprintln!(
+            "fused-field-level2-v2 tensor-roots level1={:.3}/{:.3} ms level2={:.3}/{:.3} ms",
+            level1_first.1.as_secs_f64() * 1_000.0,
+            level1_second.1.as_secs_f64() * 1_000.0,
+            level2_first.1.as_secs_f64() * 1_000.0,
+            level2_second.1.as_secs_f64() * 1_000.0,
         );
     }
 
