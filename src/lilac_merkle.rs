@@ -215,6 +215,199 @@ mod neon4 {
         }
     }
 
+    #[inline(always)]
+    unsafe fn compress_message_state8(
+        cvs: &[[u32; 8]; 8],
+        message: &[Packed8; 16],
+        block_len: u8,
+        flags: u8,
+    ) -> [Packed8; 16] {
+        let zero = Packed8([vdupq_n_u32(0), vdupq_n_u32(0)]);
+        let mut state = [zero; 16];
+        for word in 0..8 {
+            state[word] = unsafe { set8(std::array::from_fn(|lane| cvs[lane][word])) };
+        }
+        for word in 0..4 {
+            state[8 + word] = Packed8([vdupq_n_u32(BLAKE3_IV[word]), vdupq_n_u32(BLAKE3_IV[word])]);
+        }
+        state[12] = zero;
+        state[13] = zero;
+        state[14] = Packed8([
+            vdupq_n_u32(u32::from(block_len)),
+            vdupq_n_u32(u32::from(block_len)),
+        ]);
+        state[15] = Packed8([vdupq_n_u32(u32::from(flags)), vdupq_n_u32(u32::from(flags))]);
+        for index in 0..7 {
+            unsafe { round8(&mut state, message, index) };
+        }
+        state
+    }
+
+    #[inline(always)]
+    unsafe fn compress_message_xof32_8(
+        cvs: &[[u32; 8]; 8],
+        message: &[Packed8; 16],
+        block_len: u8,
+        flags: u8,
+    ) -> [Digest; 8] {
+        let state = unsafe { compress_message_state8(cvs, message, block_len, flags) };
+        let mut output = [[0_u8; 32]; 8];
+        for word in 0..8 {
+            let value = unsafe { xor8(state[word], state[word + 8]) };
+            for group in 0..2 {
+                let mut lanes = [0_u32; 4];
+                unsafe { vst1q_u32(lanes.as_mut_ptr(), value.0[group]) };
+                for (lane, value) in lanes.iter().enumerate() {
+                    output[4 * group + lane][4 * word..4 * word + 4]
+                        .copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        output
+    }
+
+    #[inline(always)]
+    unsafe fn compress_message_cv32_8(
+        cvs: &[[u32; 8]; 8],
+        message: &[Packed8; 16],
+        block_len: u8,
+        flags: u8,
+    ) -> [[u32; 8]; 8] {
+        let state = unsafe { compress_message_state8(cvs, message, block_len, flags) };
+        let mut output = [[0_u32; 8]; 8];
+        for word in 0..8 {
+            let value = unsafe { xor8(state[word], state[word + 8]) };
+            for group in 0..2 {
+                let mut lanes = [0_u32; 4];
+                unsafe { vst1q_u32(lanes.as_mut_ptr(), value.0[group]) };
+                for (lane, value) in lanes.into_iter().enumerate() {
+                    output[4 * group + lane][word] = value;
+                }
+            }
+        }
+        output
+    }
+
+    #[inline(always)]
+    const fn canonical_word(limbs: &[u64; 3], byte_offset: usize) -> u32 {
+        let limb = byte_offset / 8;
+        let shift = 8 * (byte_offset % 8);
+        let low = limbs[limb] >> shift;
+        let high = if shift != 0 && limb + 1 < limbs.len() {
+            limbs[limb + 1] << (64 - shift)
+        } else {
+            0
+        };
+        (low | high) as u32
+    }
+
+    /// Hash eight canonical 192-bit field encodings without first writing and
+    /// then reparsing eight zero-padded 64-byte blocks.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_field_leaves8(canonical: &[[u64; 3]; 8]) -> [Digest; 8] {
+        let zero = Packed8([vdupq_n_u32(0), vdupq_n_u32(0)]);
+        let mut message = [zero; 16];
+        for (word, value) in [0x414c_694c, 0x6966_2f43, 0x2d64_6c65, 0x6661_656c]
+            .into_iter()
+            .enumerate()
+        {
+            message[word] = Packed8([vdupq_n_u32(value), vdupq_n_u32(value)]);
+        }
+        message[4] = unsafe {
+            set8(std::array::from_fn(|lane| {
+                0x0031_762f | ((canonical[lane][0] as u32 & 0xff) << 24)
+            }))
+        };
+        for (word, byte_offset) in (5..=10).zip((1..=21).step_by(4)) {
+            message[word] = unsafe {
+                set8(std::array::from_fn(|lane| {
+                    canonical_word(&canonical[lane], byte_offset)
+                }))
+            };
+        }
+        unsafe {
+            compress_message_xof32_8(
+                &[BLAKE3_IV; 8],
+                &message,
+                43,
+                super::BLAKE3_CHUNK_START | super::BLAKE3_CHUNK_END | super::BLAKE3_ROOT,
+            )
+        }
+    }
+
+    #[inline(always)]
+    fn digest_word(digest: &Digest, byte_offset: usize) -> u32 {
+        u32::from_le_bytes(digest[byte_offset..byte_offset + 4].try_into().unwrap())
+    }
+
+    /// Hash eight 83-byte nodes directly from their child digests, avoiding
+    /// sixteen temporary 64-byte blocks and their subsequent word parsing.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_parents8(children: &[Digest; 16]) -> [Digest; 8] {
+        let zero = Packed8([vdupq_n_u32(0), vdupq_n_u32(0)]);
+        let mut first = [zero; 16];
+        for (word, value) in [0x414c_694c, 0x6966_2f43, 0x2d64_6c65, 0x6564_6f6e]
+            .into_iter()
+            .enumerate()
+        {
+            first[word] = Packed8([vdupq_n_u32(value), vdupq_n_u32(value)]);
+        }
+        first[4] = unsafe {
+            set8(std::array::from_fn(|lane| {
+                0x0031_762f | (u32::from(children[2 * lane][0]) << 24)
+            }))
+        };
+        for (word, byte_offset) in (5..=11).zip((1..=25).step_by(4)) {
+            first[word] = unsafe {
+                set8(std::array::from_fn(|lane| {
+                    digest_word(&children[2 * lane], byte_offset)
+                }))
+            };
+        }
+        first[12] = unsafe {
+            set8(std::array::from_fn(|lane| {
+                u32::from(children[2 * lane][29])
+                    | (u32::from(children[2 * lane][30]) << 8)
+                    | (u32::from(children[2 * lane][31]) << 16)
+                    | (u32::from(children[2 * lane + 1][0]) << 24)
+            }))
+        };
+        for (word, byte_offset) in (13..=15).zip((1..=9).step_by(4)) {
+            first[word] = unsafe {
+                set8(std::array::from_fn(|lane| {
+                    digest_word(&children[2 * lane + 1], byte_offset)
+                }))
+            };
+        }
+
+        let cvs = unsafe {
+            compress_message_cv32_8(&[BLAKE3_IV; 8], &first, 64, super::BLAKE3_CHUNK_START)
+        };
+        let mut final_block = [zero; 16];
+        for (word, byte_offset) in (0..=3).zip((13..=25).step_by(4)) {
+            final_block[word] = unsafe {
+                set8(std::array::from_fn(|lane| {
+                    digest_word(&children[2 * lane + 1], byte_offset)
+                }))
+            };
+        }
+        final_block[4] = unsafe {
+            set8(std::array::from_fn(|lane| {
+                u32::from(children[2 * lane + 1][29])
+                    | (u32::from(children[2 * lane + 1][30]) << 8)
+                    | (u32::from(children[2 * lane + 1][31]) << 16)
+            }))
+        };
+        unsafe {
+            compress_message_xof32_8(
+                &cvs,
+                &final_block,
+                19,
+                super::BLAKE3_CHUNK_END | super::BLAKE3_ROOT,
+            )
+        }
+    }
+
     #[target_feature(enable = "neon")]
     pub unsafe fn compress_xof32(
         cvs: &[[u32; 8]; 4],
@@ -276,36 +469,7 @@ mod neon4 {
             });
             *message_word = unsafe { set8(words) };
         }
-        let mut state = [zero; 16];
-        for word in 0..8 {
-            state[word] = unsafe { set8(std::array::from_fn(|lane| cvs[lane][word])) };
-        }
-        for word in 0..4 {
-            state[8 + word] = Packed8([vdupq_n_u32(BLAKE3_IV[word]), vdupq_n_u32(BLAKE3_IV[word])]);
-        }
-        state[12] = zero;
-        state[13] = zero;
-        state[14] = Packed8([
-            vdupq_n_u32(u32::from(block_len)),
-            vdupq_n_u32(u32::from(block_len)),
-        ]);
-        state[15] = Packed8([vdupq_n_u32(u32::from(flags)), vdupq_n_u32(u32::from(flags))]);
-        for index in 0..7 {
-            unsafe { round8(&mut state, &message, index) };
-        }
-        let mut output = [[0_u8; 32]; 8];
-        for word in 0..8 {
-            let value = unsafe { xor8(state[word], state[word + 8]) };
-            for group in 0..2 {
-                let mut lanes = [0_u32; 4];
-                unsafe { vst1q_u32(lanes.as_mut_ptr(), value.0[group]) };
-                for (lane, value) in lanes.iter().enumerate() {
-                    output[4 * group + lane][4 * word..4 * word + 4]
-                        .copy_from_slice(&value.to_le_bytes());
-                }
-            }
-        }
-        output
+        unsafe { compress_message_xof32_8(cvs, &message, block_len, flags) }
     }
 }
 
@@ -412,6 +576,31 @@ fn field_leaf_block(value: Field192) -> [u8; 64] {
     input
 }
 
+fn field_leaves8_materialized(values: &[Field192; 8]) -> [Digest; 8] {
+    let blocks = std::array::from_fn(|index| field_leaf_block(values[index]));
+    fixed_blake3_xof8(
+        &[BLAKE3_IV; 8],
+        &blocks,
+        43,
+        BLAKE3_CHUNK_START | BLAKE3_CHUNK_END | BLAKE3_ROOT,
+    )
+}
+
+#[inline]
+fn field_leaves8(values: &[Field192; 8]) -> [Digest; 8] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let canonical = std::array::from_fn(|index| values[index].into_bigint().0);
+        // AArch64 requires NEON, and the specialized entry point preserves the
+        // exact 19-byte domain plus 24-byte canonical field encoding.
+        unsafe { neon4::compress_field_leaves8(&canonical) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        field_leaves8_materialized(values)
+    }
+}
+
 fn parent4(children: &[Digest; 8]) -> [Digest; 4] {
     let platform = blake3_platform();
     if platform.simd_degree() < 4 {
@@ -442,7 +631,7 @@ fn parent4(children: &[Digest; 8]) -> [Digest; 4] {
     fixed_blake3_xof4(&cvs, &final_blocks, 19, BLAKE3_CHUNK_END | BLAKE3_ROOT)
 }
 
-fn parent8(children: &[Digest; 16]) -> [Digest; 8] {
+fn parent8_materialized_fixed_first_compression(children: &[Digest; 16]) -> [Digest; 8] {
     let platform = blake3_platform();
     if platform.simd_degree() < 4 {
         return std::array::from_fn(|index| parent(children[2 * index], children[2 * index + 1]));
@@ -488,6 +677,23 @@ fn parent8(children: &[Digest; 16]) -> [Digest; 8] {
     };
     let final_blocks = std::array::from_fn(|index| blocks[index].1);
     fixed_blake3_xof8(&cvs, &final_blocks, 19, BLAKE3_CHUNK_END | BLAKE3_ROOT)
+}
+
+fn parent8(children: &[Digest; 16]) -> [Digest; 8] {
+    let platform = blake3_platform();
+    if platform.simd_degree() < 4 {
+        return std::array::from_fn(|index| parent(children[2 * index], children[2 * index + 1]));
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // AArch64 requires NEON. Construct the two fixed node blocks directly
+        // in vector words rather than materializing and reparsing byte arrays.
+        unsafe { neon4::compress_parents8(children) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        parent8_materialized_fixed_first_compression(children)
+    }
 }
 
 fn parent8_platform_first_compression(children: &[Digest; 16]) -> [Digest; 8] {
@@ -593,19 +799,41 @@ fn reduce_exact_digests_platform_first(scratch: &mut [Digest]) -> Digest {
     scratch[0]
 }
 
+fn reduce_exact_digests_materialized_fixed_first(scratch: &mut [Digest]) -> Digest {
+    assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
+    let mut active = scratch.len();
+    while active > 1 {
+        let pairs = active / 2;
+        let batched8 = pairs / 8 * 8;
+        for pair in (0..batched8).step_by(8) {
+            let child = 2 * pair;
+            let children = std::array::from_fn(|index| scratch[child + index]);
+            let roots = parent8_materialized_fixed_first_compression(&children);
+            scratch[pair..pair + 8].copy_from_slice(&roots);
+        }
+        let batched4 = batched8 + (pairs - batched8) / 4 * 4;
+        for pair in (batched8..batched4).step_by(4) {
+            let child = 2 * pair;
+            let children = std::array::from_fn(|index| scratch[child + index]);
+            let roots = parent4(&children);
+            scratch[pair..pair + 4].copy_from_slice(&roots);
+        }
+        for pair in batched4..pairs {
+            scratch[pair] = parent(scratch[2 * pair], scratch[2 * pair + 1]);
+        }
+        active = pairs;
+    }
+    scratch[0]
+}
+
 fn extend_field_leaves_batched<F>(values: &[Field192], scratch: &mut Vec<Digest>, transform: F)
 where
     F: Fn(Field192) -> Field192,
 {
     let mut chunks8 = values.chunks_exact(8);
     for chunk in &mut chunks8 {
-        let blocks = std::array::from_fn(|index| field_leaf_block(transform(chunk[index])));
-        let hashes = fixed_blake3_xof8(
-            &[BLAKE3_IV; 8],
-            &blocks,
-            43,
-            BLAKE3_CHUNK_START | BLAKE3_CHUNK_END | BLAKE3_ROOT,
-        );
+        let transformed = std::array::from_fn(|index| transform(chunk[index]));
+        let hashes = field_leaves8(&transformed);
         scratch.extend_from_slice(&hashes);
     }
     let mut chunks4 = chunks8.remainder().chunks_exact(4);
@@ -618,6 +846,36 @@ where
             BLAKE3_CHUNK_START | BLAKE3_CHUNK_END | BLAKE3_ROOT,
         );
         scratch.extend_from_slice(&hashes);
+    }
+    scratch.extend(
+        chunks4
+            .remainder()
+            .iter()
+            .map(|value| field_leaf(transform(*value))),
+    );
+}
+
+fn extend_field_leaves_batched_materialized<F>(
+    values: &[Field192],
+    scratch: &mut Vec<Digest>,
+    transform: F,
+) where
+    F: Fn(Field192) -> Field192,
+{
+    let mut chunks8 = values.chunks_exact(8);
+    for chunk in &mut chunks8 {
+        let transformed = std::array::from_fn(|index| transform(chunk[index]));
+        scratch.extend_from_slice(&field_leaves8_materialized(&transformed));
+    }
+    let mut chunks4 = chunks8.remainder().chunks_exact(4);
+    for chunk in &mut chunks4 {
+        let blocks = std::array::from_fn(|index| field_leaf_block(transform(chunk[index])));
+        scratch.extend_from_slice(&fixed_blake3_xof4(
+            &[BLAKE3_IV; 4],
+            &blocks,
+            43,
+            BLAKE3_CHUNK_START | BLAKE3_CHUNK_END | BLAKE3_ROOT,
+        ));
     }
     scratch.extend(
         chunks4
@@ -652,6 +910,67 @@ pub fn prefix_root_platform_first_for_benchmark(
             scratch.clear();
             extend_field_leaves_batched(values, &mut scratch, |value| value);
             reduce_exact_digests_platform_first(&mut scratch)
+        });
+    }
+    sequential_prefix_root(values, capacity, zeros)
+}
+
+/// Reproduce the pre-optimization AArch64 field-leaf block-materialization
+/// path while retaining the current parent compression for crossed artifact
+/// benchmarks. This is transcript-identical to [`prefix_root`].
+#[doc(hidden)]
+pub fn prefix_root_materialized_leaves_for_benchmark(
+    values: &[Field192],
+    capacity: usize,
+    zeros: &[Digest],
+) -> Digest {
+    assert!(values.len() <= capacity && capacity.is_power_of_two());
+    if values.len() == capacity && values.len() >= 8 {
+        return EXACT_ROOT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.clear();
+            extend_field_leaves_batched_materialized(values, &mut scratch, |value| value);
+            reduce_exact_digests(&mut scratch)
+        });
+    }
+    sequential_prefix_root(values, capacity, zeros)
+}
+
+/// Reproduce the byte-materialized parent path while retaining direct field
+/// leaves, for crossed artifact benchmarks.
+#[doc(hidden)]
+pub fn prefix_root_materialized_parents_for_benchmark(
+    values: &[Field192],
+    capacity: usize,
+    zeros: &[Digest],
+) -> Digest {
+    assert!(values.len() <= capacity && capacity.is_power_of_two());
+    if values.len() == capacity && values.len() >= 8 {
+        return EXACT_ROOT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.clear();
+            extend_field_leaves_batched(values, &mut scratch, |value| value);
+            reduce_exact_digests_materialized_fixed_first(&mut scratch)
+        });
+    }
+    sequential_prefix_root(values, capacity, zeros)
+}
+
+/// Reproduce the complete pre-direct-message path: materialized leaf blocks
+/// and materialized parent blocks with fixed first compression.
+#[doc(hidden)]
+pub fn prefix_root_materialized_blocks_for_benchmark(
+    values: &[Field192],
+    capacity: usize,
+    zeros: &[Digest],
+) -> Digest {
+    assert!(values.len() <= capacity && capacity.is_power_of_two());
+    if values.len() == capacity && values.len() >= 8 {
+        return EXACT_ROOT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.clear();
+            extend_field_leaves_batched_materialized(values, &mut scratch, |value| value);
+            reduce_exact_digests_materialized_fixed_first(&mut scratch)
         });
     }
     sequential_prefix_root(values, capacity, zeros)
@@ -957,6 +1276,50 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "direct canonical-limb field-leaf microbenchmark"]
+    fn direct_field_leaves_benchmark_materialized_blocks() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let values = std::array::from_fn(|index| {
+            let seed = blake3::hash(&(index as u64 + 17).to_le_bytes());
+            Field192::from_le_bytes_mod_order(seed.as_bytes())
+        });
+        assert_eq!(field_leaves8(&values), field_leaves8_materialized(&values));
+        let iterations = 1_000_000;
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            black_box(field_leaves8_materialized(black_box(&values)));
+        }
+        let materialized_first = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            black_box(field_leaves8(black_box(&values)));
+        }
+        let direct_first = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            black_box(field_leaves8(black_box(&values)));
+        }
+        let direct_second = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            black_box(field_leaves8_materialized(black_box(&values)));
+        }
+        let materialized_second = start.elapsed();
+
+        eprintln!(
+            "field_leaf8 iterations={} direct={:.3}/{:.3} ms materialized={:.3}/{:.3} ms",
+            iterations,
+            direct_first.as_secs_f64() * 1_000.0,
+            direct_second.as_secs_f64() * 1_000.0,
+            materialized_first.as_secs_f64() * 1_000.0,
+            materialized_second.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
     fn four_way_parents_match_scalar_parents() {
         for batch in 0..1024_u64 {
             let children = std::array::from_fn(|index| {
@@ -997,6 +1360,10 @@ mod tests {
             parent8(&children),
             parent8_platform_first_compression(&children)
         );
+        assert_eq!(
+            parent8(&children),
+            parent8_materialized_fixed_first_compression(&children)
+        );
 
         let iterations = 1_000_000;
         let start = Instant::now();
@@ -1005,6 +1372,12 @@ mod tests {
             children[iteration & 15] = roots[iteration & 7];
         }
         let platform_first = start.elapsed();
+        let start = Instant::now();
+        for iteration in 0..iterations {
+            let roots = parent8_materialized_fixed_first_compression(black_box(&children));
+            children[iteration & 15] = roots[iteration & 7];
+        }
+        let materialized_first = start.elapsed();
         let start = Instant::now();
         for iteration in 0..iterations {
             let roots = parent8(black_box(&children));
@@ -1019,6 +1392,12 @@ mod tests {
         let fixed_second = start.elapsed();
         let start = Instant::now();
         for iteration in 0..iterations {
+            let roots = parent8_materialized_fixed_first_compression(black_box(&children));
+            children[iteration & 15] = roots[iteration & 7];
+        }
+        let materialized_second = start.elapsed();
+        let start = Instant::now();
+        for iteration in 0..iterations {
             let roots = parent8_platform_first_compression(black_box(&children));
             children[iteration & 15] = roots[iteration & 7];
         }
@@ -1026,12 +1405,14 @@ mod tests {
 
         black_box(children);
         eprintln!(
-            "parent8 iterations={} platform_hash_many={:.3}/{:.3} ms fixed_first={:.3}/{:.3} ms",
+            "parent8 iterations={} direct_messages={:.3}/{:.3} ms materialized_fixed_first={:.3}/{:.3} ms platform_hash_many={:.3}/{:.3} ms",
             iterations,
-            platform_first.as_secs_f64() * 1_000.0,
-            platform_second.as_secs_f64() * 1_000.0,
             fixed_first.as_secs_f64() * 1_000.0,
             fixed_second.as_secs_f64() * 1_000.0,
+            materialized_first.as_secs_f64() * 1_000.0,
+            materialized_second.as_secs_f64() * 1_000.0,
+            platform_first.as_secs_f64() * 1_000.0,
+            platform_second.as_secs_f64() * 1_000.0,
         );
     }
 
@@ -1079,6 +1460,13 @@ mod tests {
         for _ in 0..iterations {
             scratch.clear();
             extend_field_leaves_batched(black_box(&values), &mut scratch, |value| value);
+            black_box(reduce_exact_digests_materialized_fixed_first(&mut scratch));
+        }
+        let materialized_first = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            scratch.clear();
+            extend_field_leaves_batched(black_box(&values), &mut scratch, |value| value);
             black_box(reduce_exact_digests(&mut scratch));
         }
         let fixed_first = start.elapsed();
@@ -1093,17 +1481,113 @@ mod tests {
         for _ in 0..iterations {
             scratch.clear();
             extend_field_leaves_batched(black_box(&values), &mut scratch, |value| value);
+            black_box(reduce_exact_digests_materialized_fixed_first(&mut scratch));
+        }
+        let materialized_second = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            scratch.clear();
+            extend_field_leaves_batched(black_box(&values), &mut scratch, |value| value);
             black_box(reduce_exact_digests_platform_first(&mut scratch));
         }
         let platform_second = start.elapsed();
 
         eprintln!(
-            "exact_root_1024 iterations={} platform_hash_many={:.3}/{:.3} ms fixed_first={:.3}/{:.3} ms",
+            "exact_root_1024 iterations={} direct_messages={:.3}/{:.3} ms materialized_fixed_first={:.3}/{:.3} ms platform_hash_many={:.3}/{:.3} ms",
             iterations,
-            platform_first.as_secs_f64() * 1_000.0,
-            platform_second.as_secs_f64() * 1_000.0,
             fixed_first.as_secs_f64() * 1_000.0,
             fixed_second.as_secs_f64() * 1_000.0,
+            materialized_first.as_secs_f64() * 1_000.0,
+            materialized_second.as_secs_f64() * 1_000.0,
+            platform_first.as_secs_f64() * 1_000.0,
+            platform_second.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "direct field-leaf 1,024-field exact-root benchmark"]
+    fn direct_field_leaves_benchmark_complete_exact_root() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let values = (0..1024_u64)
+            .map(|index| {
+                let seed = blake3::hash(&index.to_le_bytes());
+                Field192::from_le_bytes_mod_order(seed.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        let zeros = zero_roots(10);
+        assert_eq!(
+            exact_prefix_root_batched(&values),
+            prefix_root_materialized_leaves_for_benchmark(&values, values.len(), &zeros)
+        );
+        assert_eq!(
+            exact_prefix_root_batched(&values),
+            prefix_root_materialized_blocks_for_benchmark(&values, values.len(), &zeros)
+        );
+        let iterations = 10_000;
+        let mut scratch = Vec::with_capacity(values.len());
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            scratch.clear();
+            extend_field_leaves_batched_materialized(black_box(&values), &mut scratch, |value| {
+                value
+            });
+            black_box(reduce_exact_digests_materialized_fixed_first(&mut scratch));
+        }
+        let baseline_first = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            scratch.clear();
+            extend_field_leaves_batched_materialized(black_box(&values), &mut scratch, |value| {
+                value
+            });
+            black_box(reduce_exact_digests(&mut scratch));
+        }
+        let materialized_first = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            scratch.clear();
+            extend_field_leaves_batched(black_box(&values), &mut scratch, |value| value);
+            black_box(reduce_exact_digests(&mut scratch));
+        }
+        let direct_first = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            scratch.clear();
+            extend_field_leaves_batched(black_box(&values), &mut scratch, |value| value);
+            black_box(reduce_exact_digests(&mut scratch));
+        }
+        let direct_second = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            scratch.clear();
+            extend_field_leaves_batched_materialized(black_box(&values), &mut scratch, |value| {
+                value
+            });
+            black_box(reduce_exact_digests(&mut scratch));
+        }
+        let materialized_second = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            scratch.clear();
+            extend_field_leaves_batched_materialized(black_box(&values), &mut scratch, |value| {
+                value
+            });
+            black_box(reduce_exact_digests_materialized_fixed_first(&mut scratch));
+        }
+        let baseline_second = start.elapsed();
+
+        eprintln!(
+            "exact_root_1024 iterations={} direct_all={:.3}/{:.3} ms materialized_leaves={:.3}/{:.3} ms materialized_all={:.3}/{:.3} ms",
+            iterations,
+            direct_first.as_secs_f64() * 1_000.0,
+            direct_second.as_secs_f64() * 1_000.0,
+            materialized_first.as_secs_f64() * 1_000.0,
+            materialized_second.as_secs_f64() * 1_000.0,
+            baseline_first.as_secs_f64() * 1_000.0,
+            baseline_second.as_secs_f64() * 1_000.0,
         );
     }
 

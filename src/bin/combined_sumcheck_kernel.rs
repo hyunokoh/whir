@@ -29,7 +29,10 @@ use whir::{
 };
 
 #[cfg(test)]
-use whir::lilac_merkle::prefix_root_platform_first_for_benchmark;
+use whir::lilac_merkle::{
+    prefix_root_materialized_blocks_for_benchmark, prefix_root_materialized_leaves_for_benchmark,
+    prefix_root_materialized_parents_for_benchmark,
+};
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -1855,11 +1858,12 @@ fn tensor_row_commitments_materialized(
 }
 
 #[cfg(test)]
-fn tensor_row_commitments_platform_first(
+fn tensor_row_commitments_with_root(
     vertical_codeword: &[Field192],
     message_row_roots: &[Digest],
     horizontal_spectra: &[Vec<Field192>],
     zeros: &[Digest],
+    row_root: fn(&[Field192], usize, &[Digest]) -> Digest,
 ) -> Vec<MatrixCommitment> {
     let row_roots = vertical_codeword
         .par_chunks_exact(CARRYOPEN_WIDTH)
@@ -1884,11 +1888,7 @@ fn tensor_row_commitments_platform_first(
                             .zip(spectrum)
                             .for_each(|(value, multiplier)| *value *= multiplier);
                         wht(parity);
-                        *root = prefix_root_platform_first_for_benchmark(
-                            parity,
-                            CARRYOPEN_WIDTH,
-                            zeros,
-                        );
+                        *root = row_root(parity, CARRYOPEN_WIDTH, zeros);
                     }
                     combine_equal_subtrees(&roots)
                 } else {
@@ -1903,7 +1903,7 @@ fn tensor_row_commitments_platform_first(
                             .for_each(|(value, multiplier)| *value *= multiplier);
                         wht(parity);
                     }
-                    prefix_root_platform_first_for_benchmark(encoded, CARRYOPEN_TENSOR_WIDTH, zeros)
+                    row_root(encoded, CARRYOPEN_TENSOR_WIDTH, zeros)
                 }
             },
         )
@@ -7808,45 +7808,63 @@ mod tests {
         let start = Instant::now();
         let encoding_first = encode_only();
         let encoding_first_time = start.elapsed();
-        let start = Instant::now();
-        let platform_first = tensor_row_commitments_platform_first(
-            &proof_codeword,
-            &message_row_roots,
-            &horizontal_spectra,
-            &zeros,
-        );
-        let platform_first_time = start.elapsed();
-        let start = Instant::now();
-        let optimized_first = tensor_row_commitments(
-            &proof_codeword,
-            &message_row_roots,
-            &horizontal_spectra,
-            &zeros,
-        );
-        let optimized_first_time = start.elapsed();
-        let start = Instant::now();
-        let optimized_second = tensor_row_commitments(
-            &proof_codeword,
-            &message_row_roots,
-            &horizontal_spectra,
-            &zeros,
-        );
-        let optimized_second_time = start.elapsed();
-        let start = Instant::now();
-        let platform_second = tensor_row_commitments_platform_first(
-            &proof_codeword,
-            &message_row_roots,
-            &horizontal_spectra,
-            &zeros,
-        );
-        let platform_second_time = start.elapsed();
+        type RowRoot = fn(&[Field192], usize, &[Digest]) -> Digest;
+        let run_commitment = |row_root: Option<RowRoot>| {
+            let start = Instant::now();
+            let commitment = if let Some(row_root) = row_root {
+                tensor_row_commitments_with_root(
+                    &proof_codeword,
+                    &message_row_roots,
+                    &horizontal_spectra,
+                    &zeros,
+                    row_root,
+                )
+            } else {
+                tensor_row_commitments(
+                    &proof_codeword,
+                    &message_row_roots,
+                    &horizontal_spectra,
+                    &zeros,
+                )
+            };
+            (commitment, start.elapsed())
+        };
+
+        let (optimized_first, optimized_first_time) = run_commitment(None);
+        let (leaf_first, leaf_first_time) = run_commitment(Some(
+            prefix_root_materialized_leaves_for_benchmark as RowRoot,
+        ));
+        let (parent_first, parent_first_time) = run_commitment(Some(
+            prefix_root_materialized_parents_for_benchmark as RowRoot,
+        ));
+        let (baseline_first, baseline_first_time) = run_commitment(Some(
+            prefix_root_materialized_blocks_for_benchmark as RowRoot,
+        ));
+        let (baseline_second, baseline_second_time) = run_commitment(Some(
+            prefix_root_materialized_blocks_for_benchmark as RowRoot,
+        ));
+        let (parent_second, parent_second_time) = run_commitment(Some(
+            prefix_root_materialized_parents_for_benchmark as RowRoot,
+        ));
+        let (leaf_second, leaf_second_time) = run_commitment(Some(
+            prefix_root_materialized_leaves_for_benchmark as RowRoot,
+        ));
+        let (optimized_second, optimized_second_time) = run_commitment(None);
         let start = Instant::now();
         let encoding_second = encode_only();
         let encoding_second_time = start.elapsed();
 
         assert_eq!(encoding_first, encoding_second);
         assert_ne!(encoding_first, Field192::ZERO);
-        for candidate in [&platform_first, &platform_second, &optimized_second] {
+        for candidate in [
+            &baseline_first,
+            &baseline_second,
+            &parent_first,
+            &parent_second,
+            &leaf_first,
+            &leaf_second,
+            &optimized_second,
+        ] {
             assert_eq!(candidate.len(), optimized_first.len());
             for (candidate, expected) in candidate.iter().zip(&optimized_first) {
                 assert_eq!(candidate.root, expected.root);
@@ -7854,14 +7872,18 @@ mod tests {
             }
         }
         eprintln!(
-            "rows={} encoding_only={:.3}/{:.3} ms fixed_first={:.3}/{:.3} ms platform_hash_many={:.3}/{:.3} ms",
+            "rows={} encoding_only={:.3}/{:.3} ms direct_all={:.3}/{:.3} ms materialized_leaves={:.3}/{:.3} ms materialized_parents={:.3}/{:.3} ms materialized_all={:.3}/{:.3} ms",
             proof_codeword.len() / CARRYOPEN_WIDTH,
             encoding_first_time.as_secs_f64() * 1_000.0,
             encoding_second_time.as_secs_f64() * 1_000.0,
             optimized_first_time.as_secs_f64() * 1_000.0,
             optimized_second_time.as_secs_f64() * 1_000.0,
-            platform_first_time.as_secs_f64() * 1_000.0,
-            platform_second_time.as_secs_f64() * 1_000.0,
+            leaf_first_time.as_secs_f64() * 1_000.0,
+            leaf_second_time.as_secs_f64() * 1_000.0,
+            parent_first_time.as_secs_f64() * 1_000.0,
+            parent_second_time.as_secs_f64() * 1_000.0,
+            baseline_first_time.as_secs_f64() * 1_000.0,
+            baseline_second_time.as_secs_f64() * 1_000.0,
         );
     }
 
