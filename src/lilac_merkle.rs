@@ -889,10 +889,19 @@ fn exact_prefix_root_batched(values: &[Field192]) -> Digest {
     assert!(values.len() >= 8 && values.len().is_power_of_two());
     EXACT_ROOT_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
-        scratch.clear();
-        extend_field_leaves_batched(values, &mut scratch, |value| value);
-        reduce_exact_digests(&mut scratch)
+        exact_prefix_root_with_scratch(values, &mut scratch)
     })
+}
+
+/// Compute an exact field-Merkle root with caller-owned digest scratch.
+///
+/// This is transcript-identical to [`prefix_root`] and lets a Rayon worker
+/// reuse one buffer without repeated TLS lookup and `RefCell` borrows.
+pub fn exact_prefix_root_with_scratch(values: &[Field192], scratch: &mut Vec<Digest>) -> Digest {
+    assert!(values.len() >= 8 && values.len().is_power_of_two());
+    scratch.clear();
+    extend_field_leaves_batched(values, scratch, |value| value);
+    reduce_exact_digests(scratch)
 }
 
 /// Reproduce the pre-optimization AArch64 exact-root path for crossed
@@ -1179,6 +1188,21 @@ mod tests {
             assert_eq!(
                 combine_equal_subtrees(&roots[..size]),
                 combine_equal_subtrees_parallel(&roots[..size])
+            );
+        }
+    }
+
+    #[test]
+    fn caller_owned_exact_root_scratch_matches_tls_path() {
+        let zeros = zero_roots(12);
+        let values = (0..4096)
+            .map(|index| Field192::from((19 * index + 7) as u64))
+            .collect::<Vec<_>>();
+        let mut scratch = Vec::new();
+        for size in [8, 16, 64, 256, 1024, 4096] {
+            assert_eq!(
+                exact_prefix_root_with_scratch(&values[..size], &mut scratch),
+                prefix_root(&values[..size], size, &zeros)
             );
         }
     }

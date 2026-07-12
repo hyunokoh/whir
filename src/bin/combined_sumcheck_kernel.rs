@@ -20,8 +20,8 @@ use whir::{
     bits::Bits,
     hash::{BLAKE3, HASH_COUNTER},
     lilac_merkle::{
-        combine_equal_subtrees, parent, prefix_root, scaled_prefix_root, zero_roots, Digest,
-        MerkleAccumulator,
+        combine_equal_subtrees, exact_prefix_root_with_scratch, parent, prefix_root,
+        scaled_prefix_root, zero_roots, Digest, MerkleAccumulator,
     },
     parameters::ProtocolParameters,
     transcript::{codecs::Empty, DomainSeparator, Proof, ProverState, VerifierState},
@@ -1669,9 +1669,9 @@ fn encode_horizontal_row(row: &[Field192], spectra: &[Vec<Field192>]) -> Vec<Fie
 fn horizontal_encoded_row_root_with_scratch(
     row: &[Field192],
     spectra: &[Vec<Field192>],
-    zeros: &[Digest],
     transformed: &mut [Field192],
     encoded: &mut [Field192],
+    digest_scratch: &mut Vec<Digest>,
 ) -> Digest {
     assert_eq!(row.len(), CARRYOPEN_WIDTH);
     assert_eq!(spectra.len(), CARRYOPEN_INVERSE_RATE - 1);
@@ -1690,7 +1690,7 @@ fn horizontal_encoded_row_root_with_scratch(
             .for_each(|(value, multiplier)| *value *= multiplier);
         wht(parity);
     }
-    prefix_root(encoded, CARRYOPEN_TENSOR_WIDTH, zeros)
+    exact_prefix_root_with_scratch(encoded, digest_scratch)
 }
 
 /// Return the ordinary flat Merkle root together with its exact `row_width`
@@ -1744,9 +1744,9 @@ fn horizontal_row_root_with_systematic_subtree_scratch(
     row: &[Field192],
     systematic_root: Digest,
     spectra: &[Vec<Field192>],
-    zeros: &[Digest],
     transformed: &mut [Field192],
     parity: &mut [Field192],
+    digest_scratch: &mut Vec<Digest>,
 ) -> Digest {
     assert_eq!(row.len(), CARRYOPEN_WIDTH);
     assert_eq!(spectra.len(), CARRYOPEN_INVERSE_RATE - 1);
@@ -1763,7 +1763,7 @@ fn horizontal_row_root_with_systematic_subtree_scratch(
             .zip(spectrum)
             .for_each(|(value, multiplier)| *value *= multiplier);
         wht(parity);
-        *root = prefix_root(parity, CARRYOPEN_WIDTH, zeros);
+        *root = exact_prefix_root_with_scratch(parity, digest_scratch);
     }
     combine_equal_subtrees(&roots)
 }
@@ -1787,25 +1787,26 @@ fn tensor_row_commitments(
                 (
                     vec![Field192::ZERO; CARRYOPEN_WIDTH],
                     vec![Field192::ZERO; CARRYOPEN_TENSOR_WIDTH],
+                    Vec::with_capacity(CARRYOPEN_TENSOR_WIDTH),
                 )
             },
-            |(transformed, encoded), (index, row)| {
+            |(transformed, encoded, digest_scratch), (index, row)| {
                 if index < CARRYOPEN_ROWS {
                     horizontal_row_root_with_systematic_subtree_scratch(
                         row,
                         message_row_roots[index],
                         horizontal_spectra,
-                        zeros,
                         transformed,
                         encoded,
+                        digest_scratch,
                     )
                 } else {
                     horizontal_encoded_row_root_with_scratch(
                         row,
                         horizontal_spectra,
-                        zeros,
                         transformed,
                         encoded,
+                        digest_scratch,
                     )
                 }
             },
@@ -3038,7 +3039,10 @@ fn run_strong_round(
 
     let start = Instant::now();
     let base = attach_base.then(|| StrongBaseProof {
-        terminal_witness: terminal_source.clone(),
+        private_f_rows: terminal_source
+            .chunks_exact(2 * level.width)
+            .flat_map(|pair| pair[..level.width].iter().copied())
+            .collect(),
     });
     if let Some(base) = &base {
         assert!(base.verify(&core));
@@ -5141,11 +5145,6 @@ impl StrongTransitionCore {
         self.component_roots.get(STRONG_INVERSE_RATE - 1).copied()
     }
 
-    fn terminal_fields(&self) -> Option<usize> {
-        self.level()
-            .map(|level| 2 * level.next_blocks * level.width)
-    }
-
     fn terminal_capacity(&self) -> Option<usize> {
         let level = self.level()?;
         Some(strong_round_level(self.round + 1).map_or_else(
@@ -5283,17 +5282,44 @@ impl StrongTransitionCore {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StrongBaseProof {
-    terminal_witness: Vec<Field192>,
+    private_f_rows: Vec<Field192>,
 }
 
 impl StrongBaseProof {
-    const MAGIC: &'static [u8; 8] = b"LILSBP02";
+    const MAGIC: &'static [u8; 8] = b"LILSBP03";
+
+    fn restore_terminal_witness(&self, core: &StrongTransitionCore) -> Option<Vec<Field192>> {
+        let level = core.level()?;
+        if self.private_f_rows.len() != level.next_blocks * level.width {
+            return None;
+        }
+        let point = core.membership.challenges()?;
+        let ood_w = virtual_index_ood_row(12 + core.round, level, &core.component_roots, &point)?;
+        let factors =
+            validated_virtual_index_factors(12 + core.round, level, &core.component_roots)?;
+        let (coefficients, alpha) = factors.as_ref();
+        let mut terminal = Vec::with_capacity(2 * self.private_f_rows.len());
+        for (block, f_row) in self.private_f_rows.chunks_exact(level.width).enumerate() {
+            terminal.extend_from_slice(f_row);
+            if block == 0 {
+                terminal.extend_from_slice(&ood_w);
+            } else {
+                let row = *core.selected_front.selected.get(block - 1)?;
+                let coefficient = *coefficients.get(row)?;
+                terminal.extend(alpha.iter().map(|value| coefficient * *value));
+            }
+        }
+        Some(terminal)
+    }
 
     fn verify(&self, core: &StrongTransitionCore) -> bool {
         let Some(level) = core.level() else {
             return false;
         };
-        self.terminal_witness.len() == core.terminal_fields().unwrap()
+        let Some(terminal_witness) = self.restore_terminal_witness(core) else {
+            return false;
+        };
+        self.private_f_rows.len() == level.next_blocks * level.width
             && audit_strong_terminal_restoration(
                 12 + core.round,
                 level,
@@ -5302,7 +5328,7 @@ impl StrongBaseProof {
                 &core.membership,
                 core.ood_block_root,
                 core.terminal_source_root,
-                &self.terminal_witness,
+                &terminal_witness,
                 &zero_roots(30),
             )
     }
@@ -5315,10 +5341,10 @@ impl StrongBaseProof {
 
     /// Serialize bytes after a verified aggregate has accepted this base proof.
     fn serialize_unchecked(&self) -> Vec<u8> {
-        let mut output = Vec::with_capacity(12 + self.terminal_witness.len() * 24);
+        let mut output = Vec::with_capacity(12 + self.private_f_rows.len() * 24);
         output.extend_from_slice(Self::MAGIC);
-        output.extend_from_slice(&(self.terminal_witness.len() as u32).to_le_bytes());
-        for value in &self.terminal_witness {
+        output.extend_from_slice(&(self.private_f_rows.len() as u32).to_le_bytes());
+        for value in &self.private_f_rows {
             output.extend_from_slice(&canonical_field_bytes(*value));
         }
         output
@@ -5331,21 +5357,22 @@ impl StrongBaseProof {
             return None;
         }
         let fields = u32::from_le_bytes(payload[8..12].try_into().ok()?) as usize;
-        if fields != core.terminal_fields()? || payload.len() != HEADER + fields * 24 {
+        let level = core.level()?;
+        if fields != level.next_blocks * level.width || payload.len() != HEADER + fields * 24 {
             return None;
         }
         let mut position = HEADER;
-        let mut terminal_witness = Vec::with_capacity(fields);
+        let mut private_f_rows = Vec::with_capacity(fields);
         for _ in 0..fields {
             let bytes = payload.get(position..position + 24)?;
             let value = Field192::from_le_bytes_mod_order(bytes);
             if canonical_field_bytes(value).as_slice() != bytes {
                 return None;
             }
-            terminal_witness.push(value);
+            private_f_rows.push(value);
             position += 24;
         }
-        let proof = Self { terminal_witness };
+        let proof = Self { private_f_rows };
         Some(proof)
     }
 }
@@ -5990,7 +6017,7 @@ impl RecursiveStrongEndToEndProof {
             .map(|proof| proof.membership.serialize().len())
             .sum::<usize>();
         let algebra = carry_algebra + certificate_algebra + strong_algebra;
-        let terminal_witness = self.base.terminal_witness.len() * 24;
+        let terminal_witness = self.base.private_f_rows.len() * 24;
         let terminal_pcs = 0;
         let named = proof_row_merkle
             + index_row_merkle
@@ -7566,13 +7593,14 @@ mod tests {
         assert_eq!(encoded, legacy);
         let mut transformed = vec![Field192::ZERO; CARRYOPEN_WIDTH];
         let mut scratch_encoded = vec![Field192::ZERO; CARRYOPEN_TENSOR_WIDTH];
+        let mut digest_scratch = Vec::new();
         assert_eq!(
             horizontal_encoded_row_root_with_scratch(
                 row,
                 &spectra,
-                &zeros,
                 &mut transformed,
                 &mut scratch_encoded,
+                &mut digest_scratch,
             ),
             prefix_root(&encoded, CARRYOPEN_TENSOR_WIDTH, &zeros)
         );
@@ -7581,9 +7609,9 @@ mod tests {
                 row,
                 row_roots[0],
                 &spectra,
-                &zeros,
                 &mut transformed,
                 &mut scratch_encoded,
+                &mut digest_scratch,
             ),
             prefix_root(&encoded, CARRYOPEN_TENSOR_WIDTH, &zeros)
         );
@@ -7937,6 +7965,68 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "production-scale worker-local versus TLS digest-scratch crossed A/B benchmark"]
+    fn worker_digest_scratch_benchmarks_tls_scratch() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let (_, message_row_roots) =
+            exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
+        let vertical_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(11, block, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &message, &mut proof_codeword, &vertical_spectra, 64);
+
+        let run = |worker_scratch: bool| {
+            let start = Instant::now();
+            let commitment = if worker_scratch {
+                tensor_row_commitments(
+                    &proof_codeword,
+                    &message_row_roots,
+                    &horizontal_spectra,
+                    &zeros,
+                )
+            } else {
+                tensor_row_commitments_with_root(
+                    &proof_codeword,
+                    &message_row_roots,
+                    &horizontal_spectra,
+                    &zeros,
+                    prefix_root,
+                    combine_equal_subtrees,
+                )
+            };
+            (commitment, start.elapsed())
+        };
+        let (worker_first, worker_first_time) = run(true);
+        let (tls_first, tls_first_time) = run(false);
+        let (tls_second, tls_second_time) = run(false);
+        let (worker_second, worker_second_time) = run(true);
+
+        for candidate in [&tls_first, &tls_second, &worker_second] {
+            assert_eq!(candidate.len(), worker_first.len());
+            for (candidate, expected) in candidate.iter().zip(&worker_first) {
+                assert_eq!(candidate.root, expected.root);
+                assert_eq!(candidate.row_roots, expected.row_roots);
+            }
+        }
+        eprintln!(
+            "worker-digest-scratch={:.3}/{:.3} ms tls-digest-scratch={:.3}/{:.3} ms",
+            worker_first_time.as_secs_f64() * 1_000.0,
+            worker_second_time.as_secs_f64() * 1_000.0,
+            tls_first_time.as_secs_f64() * 1_000.0,
+            tls_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
     fn reusable_precarry_scratch_matches_materialized_helpers() {
         let point = [
             Field192::from(2_u64),
@@ -8223,15 +8313,15 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 314_028);
+        assert_eq!(payload.len(), 301_740);
         let breakdown = proof.byte_breakdown(payload.len());
         assert_eq!(breakdown.total, payload.len());
-        assert_eq!(breakdown.base_total, 24_588);
-        assert_eq!(breakdown.terminal_witness, 24_576);
+        assert_eq!(breakdown.base_total, 12_300);
+        assert_eq!(breakdown.terminal_witness, 12_288);
         assert_eq!(breakdown.terminal_pcs, 0);
 
         let mut changed_base = proof.clone();
-        changed_base.base.terminal_witness[0] += Field192::ONE;
+        changed_base.base.private_f_rows[0] += Field192::ONE;
         assert!(!changed_base.verify());
 
         clear_virtual_index_factor_cache();
@@ -8342,6 +8432,34 @@ mod tests {
             redundant_second_time.as_secs_f64() * 1_000.0,
             payload.len(),
         );
+    }
+
+    #[test]
+    #[ignore = "production terminal-cutoff byte audit"]
+    fn terminal_cutoff_byte_audit() {
+        let carry = run_production_carryopen(1, false);
+        let certificate = run_semantic_certificate_only(64, false);
+        let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
+        let payload = proof.serialize();
+        assert_eq!(payload.len(), 301_740);
+
+        let strong_sizes = proof
+            .strong
+            .iter()
+            .map(|core| 4 + core.serialize_unchecked().len())
+            .collect::<Vec<_>>();
+        let current_base = proof.base.serialize_unchecked().len();
+        eprintln!("strong-core-framed-bytes={strong_sizes:?}");
+        for round in 0..STRONG_ROUNDS {
+            let level = proof.strong[round].level().unwrap();
+            let terminal_fields = level.next_blocks * level.width;
+            let direct_base = 12 + terminal_fields * 24;
+            let removed_later = strong_sizes[round + 1..].iter().sum::<usize>();
+            let projected_total = payload.len() - removed_later - current_base + direct_base;
+            eprintln!(
+                "cutoff-round={round} terminal-fields={terminal_fields} direct-base-bytes={direct_base} projected-total-bytes={projected_total}"
+            );
+        }
     }
 
     #[test]
