@@ -451,12 +451,8 @@ mod neon4 {
         (low | high) as u32
     }
 
-    /// Hash eight canonical 192-bit field encodings without first writing and
-    /// then reparsing eight zero-padded 64-byte blocks.
-    #[target_feature(enable = "neon")]
-    unsafe fn compress_field_leaves8_impl<const TRANSPOSED_OUTPUT: bool>(
-        canonical: &[[u64; 3]; 8],
-    ) -> [Digest; 8] {
+    #[inline(always)]
+    unsafe fn field_message8_scalar(canonical: &[[u64; 3]; 8]) -> [Packed8; 16] {
         let zero = Packed8([vdupq_n_u32(0), vdupq_n_u32(0)]);
         let mut message = [zero; 16];
         for (word, value) in [0x414c_694c, 0x6966_2f43, 0x2d64_6c65, 0x6661_656c]
@@ -477,6 +473,64 @@ mod neon4 {
                 }))
             };
         }
+        message
+    }
+
+    #[inline(always)]
+    unsafe fn field_message8_vector(canonical: &[[u64; 3]; 8]) -> [Packed8; 16] {
+        let zero = Packed8([vdupq_n_u32(0), vdupq_n_u32(0)]);
+        let mut canonical_words = [zero; 6];
+        for group in 0..2 {
+            let rows = std::array::from_fn(|lane| unsafe {
+                vld1q_u32(canonical[4 * group + lane].as_ptr().cast())
+            });
+            let words = unsafe { transpose4x4(rows) };
+            for word in 0..4 {
+                canonical_words[word].0[group] = words[word];
+            }
+        }
+        canonical_words[4] = unsafe { set8(std::array::from_fn(|lane| canonical[lane][2] as u32)) };
+        canonical_words[5] = unsafe {
+            set8(std::array::from_fn(|lane| {
+                (canonical[lane][2] >> 32) as u32
+            }))
+        };
+
+        let mut message = [zero; 16];
+        for (word, value) in [0x414c_694c, 0x6966_2f43, 0x2d64_6c65, 0x6661_656c]
+            .into_iter()
+            .enumerate()
+        {
+            message[word] = Packed8([vdupq_n_u32(value), vdupq_n_u32(value)]);
+        }
+        let domain_tail = Packed8([vdupq_n_u32(0x0031_762f), vdupq_n_u32(0x0031_762f)]);
+        message[4] = unsafe { or8(domain_tail, shl24_8(canonical_words[0])) };
+        for word in 0..5 {
+            message[5 + word] = unsafe {
+                or8(
+                    shr8_8(canonical_words[word]),
+                    shl24_8(canonical_words[word + 1]),
+                )
+            };
+        }
+        message[10] = unsafe { shr8_8(canonical_words[5]) };
+        message
+    }
+
+    /// Hash eight canonical 192-bit field encodings without first writing and
+    /// then reparsing eight zero-padded 64-byte blocks.
+    #[target_feature(enable = "neon")]
+    unsafe fn compress_field_leaves8_impl<
+        const TRANSPOSED_OUTPUT: bool,
+        const VECTOR_MESSAGES: bool,
+    >(
+        canonical: &[[u64; 3]; 8],
+    ) -> [Digest; 8] {
+        let message = if VECTOR_MESSAGES && cfg!(target_endian = "little") {
+            unsafe { field_message8_vector(canonical) }
+        } else {
+            unsafe { field_message8_scalar(canonical) }
+        };
         unsafe {
             compress_message_xof32_8::<TRANSPOSED_OUTPUT>(
                 &[BLAKE3_IV; 8],
@@ -489,12 +543,17 @@ mod neon4 {
 
     #[target_feature(enable = "neon")]
     pub unsafe fn compress_field_leaves8(canonical: &[[u64; 3]; 8]) -> [Digest; 8] {
-        unsafe { compress_field_leaves8_impl::<true>(canonical) }
+        unsafe { compress_field_leaves8_impl::<true, true>(canonical) }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_field_leaves8_scalar_messages(canonical: &[[u64; 3]; 8]) -> [Digest; 8] {
+        unsafe { compress_field_leaves8_impl::<true, false>(canonical) }
     }
 
     #[target_feature(enable = "neon")]
     pub unsafe fn compress_field_leaves8_scatter(canonical: &[[u64; 3]; 8]) -> [Digest; 8] {
-        unsafe { compress_field_leaves8_impl::<false>(canonical) }
+        unsafe { compress_field_leaves8_impl::<false, true>(canonical) }
     }
 
     #[inline(always)]
@@ -854,6 +913,18 @@ fn field_leaves8_scatter(values: &[Field192; 8]) -> [Digest; 8] {
     {
         let canonical = std::array::from_fn(|index| values[index].into_bigint().0);
         unsafe { neon4::compress_field_leaves8_scatter(&canonical) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        field_leaves8_materialized(values)
+    }
+}
+
+fn field_leaves8_scalar_messages(values: &[Field192; 8]) -> [Digest; 8] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let canonical = std::array::from_fn(|index| values[index].into_bigint().0);
+        unsafe { neon4::compress_field_leaves8_scalar_messages(&canonical) }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -1299,6 +1370,27 @@ fn extend_field_level1_batched_scatter(values: &[Field192], scratch: &mut Vec<Di
     }
 }
 
+fn extend_field_level1_batched_scalar_leaf_messages(
+    values: &[Field192],
+    scratch: &mut Vec<Digest>,
+) {
+    assert!(values.len() >= 16 && values.len().is_power_of_two());
+    for chunk in values.chunks_exact(16) {
+        let left_values = std::array::from_fn(|index| chunk[index]);
+        let right_values = std::array::from_fn(|index| chunk[8 + index]);
+        let left = field_leaves8_scalar_messages(&left_values);
+        let right = field_leaves8_scalar_messages(&right_values);
+        let children = std::array::from_fn(|index| {
+            if index < 8 {
+                left[index]
+            } else {
+                right[index - 8]
+            }
+        });
+        scratch.extend_from_slice(&parent8(&children));
+    }
+}
+
 fn extend_field_leaves_batched_materialized<F>(
     values: &[Field192],
     scratch: &mut Vec<Digest>,
@@ -1447,6 +1539,27 @@ pub fn prefix_root_scalar_parent_messages_for_benchmark(
             scratch.clear();
             extend_field_level1_batched(values, &mut scratch);
             reduce_exact_digests_scalar_messages(&mut scratch)
+        });
+    }
+    prefix_root(values, capacity, zeros)
+}
+
+/// Reproduce the pre-vector-load field-leaf message-packing schedule for
+/// crossed artifact benchmarks. This is transcript-identical to
+/// [`prefix_root`].
+#[doc(hidden)]
+pub fn prefix_root_scalar_leaf_messages_for_benchmark(
+    values: &[Field192],
+    capacity: usize,
+    zeros: &[Digest],
+) -> Digest {
+    assert!(values.len() <= capacity && capacity.is_power_of_two());
+    if values.len() == capacity && values.len() >= 16 {
+        return EXACT_ROOT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.clear();
+            extend_field_level1_batched_scalar_leaf_messages(values, &mut scratch);
+            reduce_exact_digests(&mut scratch)
         });
     }
     prefix_root(values, capacity, zeros)
@@ -2095,6 +2208,52 @@ mod tests {
             .map(|value| field_leaf(*value))
             .collect::<Vec<_>>();
         assert_eq!(batched, scalar);
+        for chunk in values[..4096].chunks_exact(8) {
+            let values = std::array::from_fn(|index| chunk[index]);
+            assert_eq!(
+                field_leaves8_scalar_messages(&values),
+                field_leaves8(&values)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "vector-load versus scalar-gather field-leaf message benchmark"]
+    fn vector_field_messages_benchmark_scalar_gather() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let values = std::array::from_fn(|index| {
+            let seed = blake3::hash(&(index as u64 + 0x4c45_4146).to_le_bytes());
+            Field192::from_le_bytes_mod_order(seed.as_bytes())
+        });
+        assert_eq!(
+            field_leaves8(&values),
+            field_leaves8_scalar_messages(&values)
+        );
+        let iterations = 1_000_000;
+        let run = |candidate: fn(&[Field192; 8]) -> [Digest; 8]| {
+            let mut values = values;
+            let start = Instant::now();
+            for iteration in 0..iterations {
+                let hashes = candidate(black_box(&values));
+                values[iteration & 7] = Field192::from_le_bytes_mod_order(&hashes[iteration & 7]);
+            }
+            black_box(values);
+            start.elapsed()
+        };
+
+        let vector_first = run(field_leaves8);
+        let scalar_first = run(field_leaves8_scalar_messages);
+        let scalar_second = run(field_leaves8_scalar_messages);
+        let vector_second = run(field_leaves8);
+        eprintln!(
+            "field-leaf8-messages iterations={iterations} vector-load={:.3}/{:.3} ms scalar-gather={:.3}/{:.3} ms",
+            vector_first.as_secs_f64() * 1_000.0,
+            vector_second.as_secs_f64() * 1_000.0,
+            scalar_first.as_secs_f64() * 1_000.0,
+            scalar_second.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]

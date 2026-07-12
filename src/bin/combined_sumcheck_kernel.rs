@@ -33,6 +33,7 @@ use whir::lilac_merkle::{
     combine_equal_subtrees_parallel_for_benchmark, prefix_root_copied_parents_for_benchmark,
     prefix_root_materialized_blocks_for_benchmark, prefix_root_materialized_cv_for_benchmark,
     prefix_root_materialized_leaves_for_benchmark, prefix_root_materialized_parents_for_benchmark,
+    prefix_root_scalar_leaf_messages_for_benchmark,
     prefix_root_scalar_parent_messages_for_benchmark, prefix_root_scatter_for_benchmark,
     prefix_root_unfused_for_benchmark, scaled_prefix_root_sequential_for_benchmark,
 };
@@ -8973,6 +8974,73 @@ mod tests {
         }
         eprintln!(
             "scalar-first-order={scalar_first_order} vector-parent-messages={:.3}/{:.3} ms scalar-parent-messages={:.3}/{:.3} ms",
+            vector_first_time.as_secs_f64() * 1_000.0,
+            vector_second_time.as_secs_f64() * 1_000.0,
+            scalar_first_time.as_secs_f64() * 1_000.0,
+            scalar_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale vector-load versus scalar-gather leaf-message benchmark"]
+    fn vector_leaf_messages_benchmark_scalar_tensor_roots() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let (_, message_row_roots) =
+            exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
+        let vertical_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(10, component, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(11, component, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &message, &mut proof_codeword, &vertical_spectra, 64);
+        let run = |row_root: fn(&[Field192], usize, &[Digest]) -> Digest| {
+            let start = Instant::now();
+            let commitments = tensor_row_commitments_with_root(
+                &proof_codeword,
+                &message_row_roots,
+                &horizontal_spectra,
+                &zeros,
+                row_root,
+                combine_equal_subtrees,
+            );
+            (commitments, start.elapsed())
+        };
+
+        let scalar_first_order = std::env::var_os("LILAC_LEAF_MESSAGES_SCALAR_FIRST").is_some();
+        let (
+            (vector_first, vector_first_time),
+            (scalar_first, scalar_first_time),
+            (scalar_second, scalar_second_time),
+            (vector_second, vector_second_time),
+        ) = if scalar_first_order {
+            let scalar_first = run(prefix_root_scalar_leaf_messages_for_benchmark);
+            let vector_first = run(prefix_root);
+            let vector_second = run(prefix_root);
+            let scalar_second = run(prefix_root_scalar_leaf_messages_for_benchmark);
+            (vector_first, scalar_first, scalar_second, vector_second)
+        } else {
+            let vector_first = run(prefix_root);
+            let scalar_first = run(prefix_root_scalar_leaf_messages_for_benchmark);
+            let scalar_second = run(prefix_root_scalar_leaf_messages_for_benchmark);
+            let vector_second = run(prefix_root);
+            (vector_first, scalar_first, scalar_second, vector_second)
+        };
+        for candidate in [&scalar_first, &scalar_second, &vector_second] {
+            assert_eq!(candidate.len(), vector_first.len());
+            for (candidate, expected) in candidate.iter().zip(&vector_first) {
+                assert_eq!(candidate.root, expected.root);
+                assert_eq!(candidate.row_roots, expected.row_roots);
+            }
+        }
+        eprintln!(
+            "scalar-first-order={scalar_first_order} vector-leaf-messages={:.3}/{:.3} ms scalar-leaf-messages={:.3}/{:.3} ms",
             vector_first_time.as_secs_f64() * 1_000.0,
             vector_second_time.as_secs_f64() * 1_000.0,
             scalar_first_time.as_secs_f64() * 1_000.0,
