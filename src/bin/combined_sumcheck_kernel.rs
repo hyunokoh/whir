@@ -3640,6 +3640,34 @@ fn encode_parity_blocks(
     spectra: &[Vec<Field192>],
 ) -> Vec<Vec<Field192>> {
     wht(&mut message);
+    let Some((last, prefix)) = spectra.split_last() else {
+        return Vec::new();
+    };
+    let mut parity_blocks = Vec::with_capacity(spectra.len());
+    parity_blocks.extend(prefix.iter().map(|spectrum| {
+        let mut parity = message.clone();
+        parity
+            .iter_mut()
+            .zip(spectrum)
+            .for_each(|(value, multiplier)| *value *= multiplier);
+        wht(&mut parity);
+        parity
+    }));
+    message
+        .iter_mut()
+        .zip(last)
+        .for_each(|(value, multiplier)| *value *= multiplier);
+    wht(&mut message);
+    parity_blocks.push(message);
+    parity_blocks
+}
+
+#[cfg(test)]
+fn encode_parity_blocks_cloned_forward(
+    mut message: Vec<Field192>,
+    spectra: &[Vec<Field192>],
+) -> Vec<Vec<Field192>> {
+    wht(&mut message);
     spectra
         .iter()
         .map(|spectrum| {
@@ -3675,6 +3703,45 @@ fn populate_parity_from_systematic(
                         .map(|row| row[lane])
                         .collect::<Vec<_>>();
                     encode_parity_blocks(message, spectra)
+                })
+                .collect::<Vec<_>>()
+        };
+        for parity_block in 0..level.inverse_rate - 1 {
+            let start = (parity_block + 1) * systematic_fields;
+            proof_codeword[start..start + systematic_fields]
+                .par_chunks_mut(level.width)
+                .enumerate()
+                .for_each(|(row, target)| {
+                    for (offset, lane) in encoded.iter().enumerate() {
+                        target[lane_start + offset] = lane[parity_block][row];
+                    }
+                });
+        }
+    }
+}
+
+#[cfg(test)]
+fn populate_parity_from_systematic_cloned_forward(
+    level: Level,
+    proof_codeword: &mut [Field192],
+    spectra: &[Vec<Field192>],
+    batch_lanes: usize,
+) {
+    assert_eq!(proof_codeword.len(), level.qa_fields());
+    assert_eq!(spectra.len(), level.inverse_rate - 1);
+    let systematic_fields = level.group * level.width;
+    for lane_start in (0..level.width).step_by(batch_lanes) {
+        let lane_end = (lane_start + batch_lanes).min(level.width);
+        let encoded = {
+            let systematic = &proof_codeword[..systematic_fields];
+            (lane_start..lane_end)
+                .into_par_iter()
+                .map(|lane| {
+                    let message = systematic
+                        .chunks_exact(level.width)
+                        .map(|row| row[lane])
+                        .collect::<Vec<_>>();
+                    encode_parity_blocks_cloned_forward(message, spectra)
                 })
                 .collect::<Vec<_>>()
         };
@@ -8299,6 +8366,125 @@ mod tests {
             shared_second.as_secs_f64() * 1_000.0,
             independent_first.as_secs_f64() * 1_000.0,
             independent_second.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "full-column last-parity forward-buffer reuse A/B benchmark"]
+    fn last_parity_reuses_forward_buffer() {
+        let group = CARRYOPEN_ROWS;
+        let message = (0..group).map(left_value).collect::<Vec<_>>();
+        let spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(10, block, group))
+            .collect::<Vec<_>>();
+        let expected = encode_parity_blocks_cloned_forward(message.clone(), &spectra);
+        assert_eq!(encode_parity_blocks(message.clone(), &spectra), expected);
+
+        let mut reused_ms = Vec::new();
+        let mut cloned_ms = Vec::new();
+        for trial in 0..10 {
+            let run_reused = || {
+                let start = Instant::now();
+                let output = std::hint::black_box(encode_parity_blocks(
+                    std::hint::black_box(message.clone()),
+                    std::hint::black_box(&spectra),
+                ));
+                let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+                assert_eq!(output, expected);
+                elapsed
+            };
+            let run_cloned = || {
+                let start = Instant::now();
+                let output = std::hint::black_box(encode_parity_blocks_cloned_forward(
+                    std::hint::black_box(message.clone()),
+                    std::hint::black_box(&spectra),
+                ));
+                let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+                assert_eq!(output, expected);
+                elapsed
+            };
+            if trial % 2 == 0 {
+                reused_ms.push(run_reused());
+                cloned_ms.push(run_cloned());
+            } else {
+                cloned_ms.push(run_cloned());
+                reused_ms.push(run_reused());
+            }
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        eprintln!(
+            "last-parity-reuse reused-ms={reused_ms:?} cloned-ms={cloned_ms:?} reused-median={:.3} cloned-median={:.3}",
+            median(&reused_ms),
+            median(&cloned_ms),
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale last-parity buffer-reuse A/B benchmark"]
+    fn last_parity_reuse_benchmarks_production_vertical_encoder() {
+        let level = carryopen_level();
+        let spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let mut codeword = Vec::with_capacity(level.qa_fields());
+        codeword.extend((0..CARRYOPEN_FIELDS).map(precarry_message_value));
+        codeword.resize(level.qa_fields(), Field192::ZERO);
+        let sample_step = CARRYOPEN_WIDTH * CARRYOPEN_ROWS / 64;
+        let mut reused_ms = Vec::new();
+        let mut cloned_ms = Vec::new();
+        let mut expected_samples = None;
+        for trial in 0..4 {
+            let run_reused = |codeword: &mut [Field192]| {
+                let start = Instant::now();
+                populate_parity_from_systematic(level, codeword, &spectra, 64);
+                let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+                let samples = codeword
+                    .iter()
+                    .step_by(sample_step)
+                    .copied()
+                    .collect::<Vec<_>>();
+                (elapsed, samples)
+            };
+            let run_cloned = |codeword: &mut [Field192]| {
+                let start = Instant::now();
+                populate_parity_from_systematic_cloned_forward(level, codeword, &spectra, 64);
+                let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+                let samples = codeword
+                    .iter()
+                    .step_by(sample_step)
+                    .copied()
+                    .collect::<Vec<_>>();
+                (elapsed, samples)
+            };
+            let ((reused, reused_samples), (cloned, cloned_samples)) = if trial % 2 == 0 {
+                (run_reused(&mut codeword), run_cloned(&mut codeword))
+            } else {
+                let cloned = run_cloned(&mut codeword);
+                let reused = run_reused(&mut codeword);
+                (reused, cloned)
+            };
+            assert_eq!(reused_samples, cloned_samples);
+            if let Some(expected) = &expected_samples {
+                assert_eq!(&reused_samples, expected);
+            } else {
+                expected_samples = Some(reused_samples);
+            }
+            reused_ms.push(reused);
+            cloned_ms.push(cloned);
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        eprintln!(
+            "production-last-parity-reuse reused-ms={reused_ms:?} cloned-ms={cloned_ms:?} reused-median={:.3} cloned-median={:.3}",
+            median(&reused_ms),
+            median(&cloned_ms),
         );
     }
 
