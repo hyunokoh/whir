@@ -3179,6 +3179,25 @@ fn apply_encoder(message: &mut [Field192], spectrum: &[Field192]) {
     wht(message);
 }
 
+fn encode_parity_blocks(
+    mut message: Vec<Field192>,
+    spectra: &[Vec<Field192>],
+) -> Vec<Vec<Field192>> {
+    wht(&mut message);
+    spectra
+        .iter()
+        .map(|spectrum| {
+            let mut parity = message.clone();
+            parity
+                .iter_mut()
+                .zip(spectrum)
+                .for_each(|(value, multiplier)| *value *= multiplier);
+            wht(&mut parity);
+            parity
+        })
+        .collect()
+}
+
 fn dot(left: &[Field192], right: &[Field192]) -> Field192 {
     assert_eq!(left.len(), right.len());
     left.par_iter()
@@ -3212,6 +3231,53 @@ fn populate_proof_codeword(
             }
         });
 
+    for lane_start in (0..level.width).step_by(batch_lanes) {
+        let lane_end = (lane_start + batch_lanes).min(level.width);
+        let encoded = (lane_start..lane_end)
+            .into_par_iter()
+            .map(|lane| {
+                let message = systematic_lane(level, source, lane);
+                encode_parity_blocks(message, spectra)
+            })
+            .collect::<Vec<_>>();
+        for parity_block in 0..level.inverse_rate - 1 {
+            let start = (parity_block + 1) * level.group * level.width;
+            proof_codeword[start..start + level.group * level.width]
+                .par_chunks_mut(level.width)
+                .enumerate()
+                .for_each(|(row, target)| {
+                    for (offset, lane) in encoded.iter().enumerate() {
+                        target[lane_start + offset] = lane[parity_block][row];
+                    }
+                });
+        }
+    }
+}
+
+#[cfg(test)]
+fn populate_proof_codeword_independent_wht(
+    level: Level,
+    source: &[Field192],
+    proof_codeword: &mut [Field192],
+    spectra: &[Vec<Field192>],
+    batch_lanes: usize,
+) {
+    assert_eq!(proof_codeword.len(), level.qa_fields());
+    proof_codeword[..level.group * level.width]
+        .par_chunks_mut(level.width)
+        .enumerate()
+        .for_each(|(row, target)| {
+            let block = row / level.row_span;
+            let local_row = row % level.row_span;
+            if block < level.blocks {
+                for (lane, value) in target.iter_mut().enumerate() {
+                    let local = local_row * level.width + lane;
+                    if local < level.block_semantic {
+                        *value = source[block * level.block_semantic + local];
+                    }
+                }
+            }
+        });
     for lane_start in (0..level.width).step_by(batch_lanes) {
         let lane_end = (lane_start + batch_lanes).min(level.width);
         let encoded = (lane_start..lane_end)
@@ -7299,6 +7365,78 @@ mod tests {
         assert_eq!(
             horizontal_row_root_with_systematic_subtree(row, row_roots[0], &spectra, &zeros,),
             prefix_root(&encoded, CARRYOPEN_TENSOR_WIDTH, &zeros)
+        );
+    }
+
+    #[test]
+    fn shared_forward_wht_matches_independent_parity_encoders() {
+        let message = (0..64).map(left_value).collect::<Vec<_>>();
+        let spectra = (0..3)
+            .map(|block| generator_spectrum(17, block, message.len()))
+            .collect::<Vec<_>>();
+        let shared = encode_parity_blocks(message.clone(), &spectra);
+        let independent = spectra
+            .iter()
+            .map(|spectrum| {
+                let mut parity = message.clone();
+                apply_encoder(&mut parity, spectrum);
+                parity
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shared, independent);
+    }
+
+    #[test]
+    #[ignore = "production-scale vertical-encoding A/B benchmark"]
+    fn shared_forward_wht_benchmarks_independent_vertical_encoder() {
+        let level = carryopen_level();
+        let source = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let mut codeword = vec![Field192::ZERO; level.qa_fields()];
+
+        let start = Instant::now();
+        populate_proof_codeword(level, &source, &mut codeword, &spectra, 64);
+        let shared_first = start.elapsed();
+        let sample_step = CARRYOPEN_WIDTH * CARRYOPEN_ROWS / 64;
+        let shared_samples = codeword
+            .iter()
+            .step_by(sample_step)
+            .copied()
+            .collect::<Vec<_>>();
+        let start = Instant::now();
+        populate_proof_codeword_independent_wht(level, &source, &mut codeword, &spectra, 64);
+        let independent_first = start.elapsed();
+        assert_eq!(
+            codeword
+                .iter()
+                .step_by(sample_step)
+                .copied()
+                .collect::<Vec<_>>(),
+            shared_samples
+        );
+        let start = Instant::now();
+        populate_proof_codeword_independent_wht(level, &source, &mut codeword, &spectra, 64);
+        let independent_second = start.elapsed();
+        let start = Instant::now();
+        populate_proof_codeword(level, &source, &mut codeword, &spectra, 64);
+        let shared_second = start.elapsed();
+        let checksum = codeword
+            .iter()
+            .step_by(sample_step)
+            .copied()
+            .sum::<Field192>();
+        assert_ne!(checksum, Field192::ZERO);
+        eprintln!(
+            "shared={:.3}/{:.3} ms independent={:.3}/{:.3} ms",
+            shared_first.as_secs_f64() * 1_000.0,
+            shared_second.as_secs_f64() * 1_000.0,
+            independent_first.as_secs_f64() * 1_000.0,
+            independent_second.as_secs_f64() * 1_000.0,
         );
     }
 
