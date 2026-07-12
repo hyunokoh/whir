@@ -4118,6 +4118,48 @@ fn run_semantic_kernel(batch_lanes: usize, direct_whir_tail: bool) -> KernelMeas
     )
 }
 
+/// Build the production certificate state without the diagnostic global
+/// product-sumcheck. The final recursive proof consumes only the local
+/// transition proofs and terminal source; the global fold is not serialized
+/// or referenced by any challenge in that proof.
+fn run_semantic_certificate_only(batch_lanes: usize, direct_whir_tail: bool) -> KernelMeasurement {
+    let start = Instant::now();
+    let (
+        left,
+        right,
+        roots,
+        terminal_tail,
+        terminal_context,
+        terminal_binding_root,
+        transition_proofs,
+        breakdown,
+    ) = semantic_vectors(batch_lanes, direct_whir_tail);
+    let setup = start.elapsed();
+    drop(left);
+    drop(right);
+    let component_root_count = roots.len();
+    let roots = aggregate_roots(&roots);
+    KernelMeasurement {
+        setup,
+        polynomial: Duration::ZERO,
+        folding: Duration::ZERO,
+        total: Duration::ZERO,
+        terminal_left: Field192::ZERO,
+        terminal_right: Field192::ZERO,
+        terminal_claim: Field192::ZERO,
+        pairs: Vec::new(),
+        transcript_root_count: roots.len(),
+        roots,
+        fields: PRODUCTION_FIELDS,
+        component_root_count,
+        semantic_breakdown: Some(breakdown),
+        transition_proofs: Some(transition_proofs),
+        terminal_tail: Some(terminal_tail),
+        terminal_context,
+        terminal_binding_root: Some(terminal_binding_root),
+    }
+}
+
 #[derive(Debug)]
 struct WhirTailMeasurement {
     semantic_fields: usize,
@@ -5826,7 +5868,9 @@ fn main() {
         if args.carryopen {
             carryopen_measurements.push(run_production_carryopen(args.whir_verifier_repetitions));
         }
-        let measurement = if args.semantic && args.relation_whir {
+        let measurement = if args.final_only {
+            run_semantic_certificate_only(args.batch_lanes, certificate_direct_tail)
+        } else if args.semantic && args.relation_whir {
             let (measurement, relation) = run_semantic_kernel_with_relation_whir(
                 args.batch_lanes,
                 certificate_direct_tail,
@@ -5839,11 +5883,13 @@ fn main() {
         } else {
             run_kernel(args.fields)
         };
-        let sumcheck_payload = measurement.sumcheck_proof().serialize();
-        let parsed_sumcheck = PackedSumcheckProof::deserialize(&sumcheck_payload)
-            .expect("serialized combined sumcheck must verify");
-        assert_eq!(parsed_sumcheck, measurement.sumcheck_proof());
-        serialized_sumcheck_bytes = sumcheck_payload.len();
+        if !args.final_only {
+            let sumcheck_payload = measurement.sumcheck_proof().serialize();
+            let parsed_sumcheck = PackedSumcheckProof::deserialize(&sumcheck_payload)
+                .expect("serialized combined sumcheck must verify");
+            assert_eq!(parsed_sumcheck, measurement.sumcheck_proof());
+            serialized_sumcheck_bytes = sumcheck_payload.len();
+        }
         if let Some(proofs) = &measurement.transition_proofs {
             transition_proof_count = proofs.len();
             transition_proof_bytes = proofs.iter().map(|proof| proof.serialize().len()).sum();
@@ -5852,7 +5898,9 @@ fn main() {
                 ProductionTransitionProof::deserialize(&payload).as_ref() == Some(proof)
             }));
         }
-        assert_eq!(measurement.pairs.len(), variables);
+        if !args.final_only {
+            assert_eq!(measurement.pairs.len(), variables);
+        }
         setup_ms.push(measurement.setup.as_secs_f64() * 1_000.0);
         polynomial_ms.push(measurement.polynomial.as_secs_f64() * 1_000.0);
         folding_ms.push(measurement.folding.as_secs_f64() * 1_000.0);
@@ -6102,8 +6150,10 @@ fn main() {
             changed[64] ^= 1;
             assert!(ProductionCertificateProof::deserialize(&changed).is_none());
         }
-        checksum +=
-            measurement.terminal_left + measurement.terminal_right + measurement.terminal_claim;
+        if !args.final_only {
+            checksum +=
+                measurement.terminal_left + measurement.terminal_right + measurement.terminal_claim;
+        }
     }
     println!("LiLAC packed combined product-sumcheck kernel");
     println!(
@@ -6127,31 +6177,42 @@ fn main() {
         2.0 * args.fields as f64 * 24.0 / (1_u64 << 30) as f64
     );
     println!(
-        "- witness-vector setup median/p95: {:.3}/{:.3} ms",
+        "- {} median/p95: {:.3}/{:.3} ms",
+        if args.final_only {
+            "certificate-state construction"
+        } else {
+            "witness-vector setup"
+        },
         percentile(&setup_ms, 0.5),
         percentile(&setup_ms, 0.95)
     );
-    println!(
-        "- round-polynomial generation median/p95: {:.3}/{:.3} ms",
-        percentile(&polynomial_ms, 0.5),
-        percentile(&polynomial_ms, 0.95)
-    );
-    println!(
-        "- in-place prefix folding median/p95: {:.3}/{:.3} ms",
-        percentile(&folding_ms, 0.5),
-        percentile(&folding_ms, 0.95)
-    );
-    println!(
-        "- 26-round kernel median/p95: {:.3}/{:.3} ms",
-        percentile(&total_ms, 0.5),
-        percentile(&total_ms, 0.95)
-    );
-    println!("- legacy compressed-transcript model: {TRANSCRIPT_BYTES} B");
-    println!("- canonical serialized sumcheck proof: {serialized_sumcheck_bytes} B");
-    println!(
-        "- terminal checksum nonzero: {}",
-        checksum != Field192::ZERO
-    );
+    if args.final_only {
+        println!(
+            "- diagnostic global 26-round sumcheck: skipped (not serialized in the canonical proof)"
+        );
+    } else {
+        println!(
+            "- round-polynomial generation median/p95: {:.3}/{:.3} ms",
+            percentile(&polynomial_ms, 0.5),
+            percentile(&polynomial_ms, 0.95)
+        );
+        println!(
+            "- in-place prefix folding median/p95: {:.3}/{:.3} ms",
+            percentile(&folding_ms, 0.5),
+            percentile(&folding_ms, 0.95)
+        );
+        println!(
+            "- 26-round kernel median/p95: {:.3}/{:.3} ms",
+            percentile(&total_ms, 0.5),
+            percentile(&total_ms, 0.95)
+        );
+        println!("- legacy compressed-transcript model: {TRANSCRIPT_BYTES} B");
+        println!("- canonical serialized sumcheck proof: {serialized_sumcheck_bytes} B");
+        println!(
+            "- terminal checksum nonzero: {}",
+            checksum != Field192::ZERO
+        );
+    }
     if args.carryopen {
         let message_ms = carryopen_measurements
             .iter()
