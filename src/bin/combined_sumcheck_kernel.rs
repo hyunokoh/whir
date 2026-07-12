@@ -1457,7 +1457,8 @@ fn fill_scaled_equality_weights(point: &[Field192], scale: Field192, target: &mu
     }
 }
 
-fn accumulate_scaled_equality_weights(
+#[cfg(test)]
+fn accumulate_scaled_equality_weights_one_round(
     point: &[Field192],
     scale: Field192,
     scratch: &mut [Field192],
@@ -1490,6 +1491,55 @@ fn accumulate_scaled_equality_weights(
             let high = *source * coordinate;
             *target_low += *source - high;
             *target_high += high;
+        });
+}
+
+/// Expand the final two equality coordinates directly into the four target
+/// quarters. This performs the same three multiplications per source value as
+/// two ordinary rounds while avoiding both intermediate scratch levels.
+fn accumulate_scaled_equality_weights(
+    point: &[Field192],
+    scale: Field192,
+    scratch: &mut [Field192],
+    target: &mut [Field192],
+) {
+    assert!(point.len() >= 2);
+    assert_eq!(scratch.len(), 1_usize << point.len());
+    assert_eq!(target.len(), scratch.len());
+    scratch[0] = scale;
+    let mut active = 1;
+    for coordinate in point[2..].iter().rev() {
+        let (low, high_and_tail) = scratch.split_at_mut(active);
+        let high = &mut high_and_tail[..active];
+        high.copy_from_slice(low);
+        high.par_iter_mut().for_each(|value| *value *= *coordinate);
+        low.par_iter_mut()
+            .zip(high.par_iter())
+            .for_each(|(low, high)| *low -= *high);
+        active *= 2;
+    }
+    assert_eq!(4 * active, scratch.len());
+    let source = &scratch[..active];
+    let (target_0, tail) = target.split_at_mut(active);
+    let (target_1, tail) = tail.split_at_mut(active);
+    let (target_2, target_3) = tail.split_at_mut(active);
+    let coordinate_1 = point[1];
+    let coordinate_0 = point[0];
+    target_0
+        .par_iter_mut()
+        .zip(target_1.par_iter_mut())
+        .zip(target_2.par_iter_mut())
+        .zip(target_3.par_iter_mut())
+        .zip(source.par_iter())
+        .for_each(|((((target_0, target_1), target_2), target_3), source)| {
+            let high_1 = *source * coordinate_1;
+            let low_1 = *source - high_1;
+            let low_1_high_0 = low_1 * coordinate_0;
+            let high_1_high_0 = high_1 * coordinate_0;
+            *target_0 += low_1 - low_1_high_0;
+            *target_1 += high_1 - high_1_high_0;
+            *target_2 += low_1_high_0;
+            *target_3 += high_1_high_0;
         });
 }
 
@@ -1651,6 +1701,51 @@ fn build_production_precarry(
     for (point, coefficient) in points.iter().zip(coefficients) {
         accumulate_scaled_equality_weights(point, coefficient, &mut scratch, &mut combined_weight);
     }
+    drop(scratch);
+    let proof = ProductionPreCarryProof {
+        commitment_root,
+        points,
+        claims,
+        sumcheck: prove_local_product_relation_with_claim(
+            message.to_vec(),
+            combined_weight,
+            local_relation_roots(b"pre-Carry-batch", 0, &[commitment_root, statement]),
+            claimed,
+        ),
+    };
+    assert!(proof.verify());
+    proof
+}
+
+#[cfg(test)]
+fn build_production_precarry_one_round(
+    message: &[Field192],
+    commitment_root: Digest,
+) -> ProductionPreCarryProof {
+    assert_eq!(message.len(), CARRYOPEN_FIELDS);
+    let points = precarry_opening_points(&commitment_root, 16);
+    let mut scratch = vec![Field192::ZERO; message.len()];
+    let claims = points
+        .iter()
+        .map(|point| evaluate_power_of_two_message_with_scratch(message, point, &mut scratch))
+        .collect::<Vec<_>>();
+    let statement = precarry_statement_root(&commitment_root, &points, &claims);
+    let coefficients = precarry_coefficients(&statement, claims.len());
+    let claimed = claims
+        .iter()
+        .zip(&coefficients)
+        .map(|(claim, coefficient)| *claim * coefficient)
+        .sum::<Field192>();
+    let mut combined_weight = vec![Field192::ZERO; message.len()];
+    for (point, coefficient) in points.iter().zip(coefficients) {
+        accumulate_scaled_equality_weights_one_round(
+            point,
+            coefficient,
+            &mut scratch,
+            &mut combined_weight,
+        );
+    }
+
     drop(scratch);
     let proof = ProductionPreCarryProof {
         commitment_root,
@@ -8233,6 +8328,9 @@ mod tests {
         let mut accumulated = vec![Field192::ZERO; materialized.len()];
         accumulate_scaled_equality_weights(&point, scale, &mut scratch, &mut accumulated);
         assert_eq!(accumulated, materialized);
+        let mut one_round = vec![Field192::ZERO; materialized.len()];
+        accumulate_scaled_equality_weights_one_round(&point, scale, &mut scratch, &mut one_round);
+        assert_eq!(one_round, materialized);
     }
 
     #[test]
@@ -8282,6 +8380,53 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "production pre-Carry two-round versus one-round accumulation benchmark"]
+    fn two_round_equality_accumulation_benchmarks_one_round() {
+        let points = precarry_opening_points(&[43_u8; 32], 16);
+        let coefficients = precarry_coefficients(&[97_u8; 32], points.len());
+        let run = |two_rounds: bool| {
+            let start = Instant::now();
+            let mut scratch = vec![Field192::ZERO; CARRYOPEN_FIELDS];
+            let mut combined = vec![Field192::ZERO; CARRYOPEN_FIELDS];
+            for (point, coefficient) in points.iter().zip(&coefficients) {
+                if two_rounds {
+                    accumulate_scaled_equality_weights(
+                        point,
+                        *coefficient,
+                        &mut scratch,
+                        &mut combined,
+                    );
+                } else {
+                    accumulate_scaled_equality_weights_one_round(
+                        point,
+                        *coefficient,
+                        &mut scratch,
+                        &mut combined,
+                    );
+                }
+            }
+            (combined, start.elapsed())
+        };
+
+        let (two_first, two_first_time) = run(true);
+        let (one_first, one_first_time) = run(false);
+        assert_eq!(one_first, two_first);
+        drop(one_first);
+        let (one_second, one_second_time) = run(false);
+        assert_eq!(one_second, two_first);
+        drop(one_second);
+        let (two_second, two_second_time) = run(true);
+        assert_eq!(two_second, two_first);
+        eprintln!(
+            "two-round-accumulation={:.3}/{:.3} ms one-round-accumulation={:.3}/{:.3} ms",
+            two_first_time.as_secs_f64() * 1_000.0,
+            two_second_time.as_secs_f64() * 1_000.0,
+            one_first_time.as_secs_f64() * 1_000.0,
+            one_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
     #[ignore = "production pre-Carry end-to-end fused-accumulation benchmark"]
     fn fused_equality_weight_accumulation_benchmarks_full_precarry() {
         let message = (0..CARRYOPEN_FIELDS)
@@ -8316,6 +8461,44 @@ mod tests {
             fused_second_time.as_secs_f64() * 1_000.0,
             separate_first_time.as_secs_f64() * 1_000.0,
             separate_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production pre-Carry two-round versus one-round full-proof benchmark"]
+    fn two_round_equality_accumulation_benchmarks_full_precarry() {
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let commitment_root = prefix_root(
+            &message,
+            CARRYOPEN_FIELDS,
+            &zero_roots(CARRYOPEN_FIELDS.trailing_zeros() as usize),
+        );
+        let run = |two_rounds: bool| {
+            let start = Instant::now();
+            let proof = if two_rounds {
+                build_production_precarry(&message, commitment_root)
+            } else {
+                build_production_precarry_one_round(&message, commitment_root)
+            };
+            (proof, start.elapsed())
+        };
+
+        let (two_first, two_first_time) = run(true);
+        let (one_first, one_first_time) = run(false);
+        let (one_second, one_second_time) = run(false);
+        let (two_second, two_second_time) = run(true);
+        assert_eq!(one_first, two_first);
+        assert_eq!(one_second, two_first);
+        assert_eq!(two_second, two_first);
+        eprintln!(
+            "precarry-two-round={:.3}/{:.3} ms precarry-one-round={:.3}/{:.3} ms",
+            two_first_time.as_secs_f64() * 1_000.0,
+            two_second_time.as_secs_f64() * 1_000.0,
+            one_first_time.as_secs_f64() * 1_000.0,
+            one_second_time.as_secs_f64() * 1_000.0,
         );
     }
 
