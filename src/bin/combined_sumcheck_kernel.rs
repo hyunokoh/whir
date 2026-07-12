@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     collections::BTreeMap,
     convert::TryInto,
+    mem::MaybeUninit,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -3328,8 +3329,7 @@ fn run_production_carryopen(
     let generator_setup = horizontal_setup + start.elapsed();
     let vertical_start = Instant::now();
     assert!(proof_codeword.capacity() >= level.qa_fields());
-    proof_codeword.resize(level.qa_fields(), Field192::ZERO);
-    let parity_commitments = populate_parity_and_commit_from_systematic(
+    let parity_commitments = populate_parity_and_commit_in_spare_capacity(
         level,
         &mut proof_codeword,
         &spectra,
@@ -4043,6 +4043,7 @@ fn populate_parity_from_systematic_with_scatter_tile(
     }
 }
 
+#[cfg(test)]
 fn scatter_final_parity_block_and_commit(
     target: &mut [Field192],
     width: usize,
@@ -4098,6 +4099,101 @@ fn scatter_final_parity_block_and_commit(
     row_roots
 }
 
+fn scatter_parity_block_blocked_uninit(
+    target: &mut [MaybeUninit<Field192>],
+    width: usize,
+    lane_start: usize,
+    encoded: &[Vec<Vec<Field192>>],
+    parity_block: usize,
+) {
+    const ROW_BLOCK: usize = 64;
+    const LANE_TILE: usize = 4;
+    assert_eq!(target.len() % width, 0);
+    assert!(lane_start + encoded.len() <= width);
+    let rows = target.len() / width;
+    assert!(encoded.iter().all(|lane| lane
+        .get(parity_block)
+        .is_some_and(|values| values.len() == rows)));
+    target
+        .par_chunks_mut(width * ROW_BLOCK)
+        .enumerate()
+        .for_each(|(block, target_rows)| {
+            let row_start = block * ROW_BLOCK;
+            for offset_start in (0..encoded.len()).step_by(LANE_TILE) {
+                let offset_end = (offset_start + LANE_TILE).min(encoded.len());
+                for (local_row, target_row) in target_rows.chunks_exact_mut(width).enumerate() {
+                    let row = row_start + local_row;
+                    for offset in offset_start..offset_end {
+                        target_row[lane_start + offset].write(encoded[offset][parity_block][row]);
+                    }
+                }
+            }
+        });
+}
+
+fn scatter_final_parity_block_and_commit_uninit(
+    target: &mut [MaybeUninit<Field192>],
+    width: usize,
+    lane_start: usize,
+    encoded: &[Vec<Vec<Field192>>],
+    parity_block: usize,
+    horizontal_spectra: &[Vec<Field192>],
+) -> Vec<Digest> {
+    const ROW_BLOCK: usize = 64;
+    const LANE_TILE: usize = 4;
+    assert_eq!(width, CARRYOPEN_WIDTH);
+    assert_eq!(target.len() % width, 0);
+    assert_eq!(lane_start + encoded.len(), width);
+    let rows = target.len() / width;
+    assert!(encoded.iter().all(|lane| lane
+        .get(parity_block)
+        .is_some_and(|values| values.len() == rows)));
+    let mut row_roots = vec![[0_u8; 32]; rows];
+    target
+        .par_chunks_mut(width * ROW_BLOCK)
+        .zip(row_roots.par_chunks_mut(ROW_BLOCK))
+        .enumerate()
+        .for_each_init(
+            || {
+                (
+                    vec![Field192::ZERO; CARRYOPEN_WIDTH + CARRYOPEN_TENSOR_WIDTH],
+                    Vec::with_capacity(CARRYOPEN_TENSOR_WIDTH / 4),
+                )
+            },
+            |(field_scratch, digest_scratch), (block, (target_rows, roots))| {
+                let row_start = block * ROW_BLOCK;
+                for offset_start in (0..encoded.len()).step_by(LANE_TILE) {
+                    let offset_end = (offset_start + LANE_TILE).min(encoded.len());
+                    for (local_row, target_row) in target_rows.chunks_exact_mut(width).enumerate() {
+                        let row = row_start + local_row;
+                        for offset in offset_start..offset_end {
+                            target_row[lane_start + offset]
+                                .write(encoded[offset][parity_block][row]);
+                        }
+                    }
+                }
+                let (transformed, horizontal) = field_scratch.split_at_mut(CARRYOPEN_WIDTH);
+                for (row, root) in target_rows.chunks_exact(width).zip(roots) {
+                    // All lanes of this row have been written across the completed
+                    // lane batches, including the final batch above.  Field192 is
+                    // Copy and the allocation remains fixed for the whole pass.
+                    let initialized = unsafe {
+                        std::slice::from_raw_parts(row.as_ptr().cast::<Field192>(), width)
+                    };
+                    *root = horizontal_encoded_row_root_with_scratch(
+                        initialized,
+                        horizontal_spectra,
+                        transformed,
+                        horizontal,
+                        digest_scratch,
+                    );
+                }
+            },
+        );
+    row_roots
+}
+
+#[cfg(test)]
 fn populate_parity_and_commit_from_systematic(
     level: Level,
     proof_codeword: &mut [Field192],
@@ -4160,6 +4256,90 @@ fn populate_parity_and_commit_from_systematic(
             }
         }
     }
+    assert_eq!(commitments.len(), level.inverse_rate - 1);
+    commitments
+}
+
+/// Fill the three parity quarters directly in the reserved spare capacity.
+/// The preceding `resize(..., ZERO)` wrote 1.125 GiB that was immediately
+/// overwritten. Every parity cell is initialized exactly once per lane, and
+/// the vector length is extended only after all cells and row roots exist.
+fn populate_parity_and_commit_in_spare_capacity(
+    level: Level,
+    proof_codeword: &mut Vec<Field192>,
+    spectra: &[Vec<Field192>],
+    horizontal_spectra: &[Vec<Field192>],
+    batch_lanes: usize,
+    zeros: &[Digest],
+) -> Vec<MatrixCommitment> {
+    assert_eq!(proof_codeword.len(), level.group * level.width);
+    assert!(proof_codeword.capacity() >= level.qa_fields());
+    assert_eq!(spectra.len(), level.inverse_rate - 1);
+    assert_eq!(horizontal_spectra.len(), level.inverse_rate - 1);
+    assert_eq!(level.group, CARRYOPEN_ROWS);
+    assert_eq!(level.width, CARRYOPEN_WIDTH);
+    assert_eq!(batch_lanes, 64);
+    assert!(!std::mem::needs_drop::<Field192>());
+    let systematic_fields = level.group * level.width;
+    let parity_fields = level.qa_fields() - systematic_fields;
+    let systematic_ptr = proof_codeword.as_ptr();
+    let mut commitments = Vec::with_capacity(level.inverse_rate - 1);
+    {
+        let spare = proof_codeword.spare_capacity_mut();
+        assert!(spare.len() >= parity_fields);
+        let parity = &mut spare[..parity_fields];
+        for lane_start in (0..level.width).step_by(batch_lanes) {
+            let lane_end = (lane_start + batch_lanes).min(level.width);
+            let encoded = {
+                // The immutable systematic prefix and mutable spare capacity are
+                // disjoint, and `with_capacity` prevents reallocation here.
+                let systematic =
+                    unsafe { std::slice::from_raw_parts(systematic_ptr, systematic_fields) };
+                (lane_start..lane_end)
+                    .into_par_iter()
+                    .map(|lane| {
+                        let message = systematic
+                            .chunks_exact(level.width)
+                            .map(|row| row[lane])
+                            .collect::<Vec<_>>();
+                        encode_parity_blocks(message, spectra)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for parity_block in 0..level.inverse_rate - 1 {
+                let start = parity_block * systematic_fields;
+                let target = &mut parity[start..start + systematic_fields];
+                if lane_end == level.width {
+                    let row_roots = scatter_final_parity_block_and_commit_uninit(
+                        target,
+                        level.width,
+                        lane_start,
+                        &encoded,
+                        parity_block,
+                        horizontal_spectra,
+                    );
+                    commitments.push(MatrixCommitment {
+                        root: combine_equal_subtrees(&row_roots),
+                        row_roots,
+                        row_domain: CARRYOPEN_ROWS,
+                        zero_row_root: zeros[CARRYOPEN_TENSOR_WIDTH.trailing_zeros() as usize],
+                    });
+                } else {
+                    scatter_parity_block_blocked_uninit(
+                        target,
+                        level.width,
+                        lane_start,
+                        &encoded,
+                        parity_block,
+                    );
+                }
+            }
+        }
+    }
+    // SAFETY: each of the `parity_fields` cells was written once in every
+    // lane position above; Field192 has no destructor, and no panic path can
+    // observe the spare cells as initialized vector elements.
+    unsafe { proof_codeword.set_len(level.qa_fields()) };
     assert_eq!(commitments.len(), level.inverse_rate - 1);
     commitments
 }
@@ -9874,6 +10054,114 @@ mod tests {
             retained_second.1.as_secs_f64() * 1_000.0,
             fused_first.1.as_secs_f64() * 1_000.0,
             fused_second.1.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale zero-fill versus spare-capacity parity A/B"]
+    fn parity_spare_capacity_avoids_zero_fill() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(11, block, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut initialized = Vec::with_capacity(level.qa_fields());
+        initialized.extend_from_slice(&message);
+        let mut spare = Vec::with_capacity(level.qa_fields());
+        spare.extend_from_slice(&message);
+        let run_initialized = |codeword: &mut Vec<Field192>| {
+            codeword.truncate(CARRYOPEN_FIELDS);
+            let start = Instant::now();
+            codeword.resize(level.qa_fields(), Field192::ZERO);
+            let commitments = populate_parity_and_commit_from_systematic(
+                level,
+                codeword,
+                &spectra,
+                &horizontal_spectra,
+                64,
+                &zeros,
+            );
+            (commitments, start.elapsed().as_secs_f64() * 1_000.0)
+        };
+        let run_spare = |codeword: &mut Vec<Field192>| {
+            codeword.truncate(CARRYOPEN_FIELDS);
+            let start = Instant::now();
+            let commitments = populate_parity_and_commit_in_spare_capacity(
+                level,
+                codeword,
+                &spectra,
+                &horizontal_spectra,
+                64,
+                &zeros,
+            );
+            (commitments, start.elapsed().as_secs_f64() * 1_000.0)
+        };
+        let assert_same = |candidate: &[MatrixCommitment], expected: &[MatrixCommitment]| {
+            assert_eq!(candidate.len(), expected.len());
+            for (candidate, expected) in candidate.iter().zip(expected) {
+                assert_eq!(candidate.root, expected.root);
+                assert_eq!(candidate.row_roots, expected.row_roots);
+                assert_eq!(candidate.row_domain, expected.row_domain);
+                assert_eq!(candidate.zero_row_root, expected.zero_row_root);
+            }
+        };
+        let mut initialized_ms = Vec::with_capacity(16);
+        let mut spare_ms = Vec::with_capacity(16);
+        for trial in 0..8 {
+            let (initialized_first, spare_first, spare_second, initialized_second) =
+                if trial % 2 == 0 {
+                    (
+                        run_initialized(&mut initialized),
+                        run_spare(&mut spare),
+                        run_spare(&mut spare),
+                        run_initialized(&mut initialized),
+                    )
+                } else {
+                    let spare_first = run_spare(&mut spare);
+                    let initialized_first = run_initialized(&mut initialized);
+                    let initialized_second = run_initialized(&mut initialized);
+                    let spare_second = run_spare(&mut spare);
+                    (
+                        initialized_first,
+                        spare_first,
+                        spare_second,
+                        initialized_second,
+                    )
+                };
+            assert_same(&spare_first.0, &initialized_first.0);
+            assert_same(&spare_second.0, &initialized_first.0);
+            assert_same(&initialized_second.0, &initialized_first.0);
+            assert_eq!(spare, initialized);
+            initialized_ms.extend([initialized_first.1, initialized_second.1]);
+            spare_ms.extend([spare_first.1, spare_second.1]);
+            eprintln!(
+                "parity-spare trial={} initialized={:.3}/{:.3} ms spare={:.3}/{:.3} ms",
+                trial + 1,
+                initialized_first.1,
+                initialized_second.1,
+                spare_first.1,
+                spare_second.1,
+            );
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        let mean = |samples: &[f64]| samples.iter().sum::<f64>() / samples.len() as f64;
+        eprintln!(
+            "parity-spare initialized-ms={initialized_ms:?} spare-ms={spare_ms:?} initialized-median={:.3} spare-median={:.3} initialized-mean={:.3} spare-mean={:.3}",
+            median(&initialized_ms),
+            median(&spare_ms),
+            mean(&initialized_ms),
+            mean(&spare_ms),
         );
     }
 
