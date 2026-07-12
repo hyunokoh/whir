@@ -2989,17 +2989,22 @@ fn run_production_carryopen(
 ) -> CarryOpenMeasurement {
     let level = carryopen_level();
     let zeros = zero_roots(30);
-    let message = (0..CARRYOPEN_FIELDS)
-        .into_par_iter()
-        .map(precarry_message_value)
-        .collect::<Vec<_>>();
+    // Reserve the final codeword once and initially expose only its systematic
+    // prefix as the message. Extending within this capacity later avoids a
+    // separate 384-MiB message allocation and copy.
+    let mut proof_codeword = Vec::with_capacity(level.qa_fields());
+    proof_codeword.resize(CARRYOPEN_FIELDS, Field192::ZERO);
+    proof_codeword
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(index, value)| *value = precarry_message_value(index));
     let start = Instant::now();
     let (message_root, message_row_roots) =
-        exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
+        exact_root_with_row_subtrees(&proof_codeword, CARRYOPEN_WIDTH, &zeros);
     let message_commit = start.elapsed();
 
     let start = Instant::now();
-    let precarry = build_production_precarry(&message, message_root);
+    let precarry = build_production_precarry(&proof_codeword, message_root);
     let precarry_time = start.elapsed();
 
     let start = Instant::now();
@@ -3015,8 +3020,9 @@ fn run_production_carryopen(
         .collect::<Vec<_>>();
     let generator_setup = start.elapsed();
     let vertical_start = Instant::now();
-    let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
-    populate_proof_codeword(level, &message, &mut proof_codeword, &spectra, 64);
+    assert!(proof_codeword.capacity() >= level.qa_fields());
+    proof_codeword.resize(level.qa_fields(), Field192::ZERO);
+    populate_parity_from_systematic(level, &mut proof_codeword, &spectra, 64);
     let vertical_encoding = vertical_start.elapsed();
     let commitment_start = Instant::now();
     let proof_commitments = tensor_row_commitments(
@@ -3025,6 +3031,8 @@ fn run_production_carryopen(
         &horizontal_spectra,
         &zeros,
     );
+    // The final commitments own the row roots needed by the selected front.
+    drop(message_row_roots);
     let tensor_commitment = commitment_start.elapsed();
     let front_start = Instant::now();
     let mut component_roots = generator_roots;
@@ -3032,6 +3040,7 @@ fn run_production_carryopen(
     component_roots.extend(proof_commitments.iter().map(|commitment| commitment.root));
     let (index_coefficients, index_alpha) =
         index_oracle_factors(10, level, &spectra, &component_roots);
+    drop(spectra);
     let index_descriptor = virtual_index_descriptor(10, level, &component_roots);
     component_roots.push(index_descriptor);
     let selected = selected_rows(
@@ -3041,6 +3050,9 @@ fn run_production_carryopen(
         &component_roots,
     );
     let (selected_front, _, _) = selected_row_front(level, &proof_commitments, &selected);
+    // All commitment roots are already transcript-bound and the selected
+    // authentication front is self-contained.
+    drop(proof_commitments);
     let selected_rows = selected_tensor_carry_rows(
         &proof_codeword,
         &index_coefficients,
@@ -3492,6 +3504,7 @@ fn generator_spectrum(level_index: usize, parity_block: usize, group: usize) -> 
         .collect()
 }
 
+#[cfg(test)]
 fn systematic_lane(level: Level, source: &[Field192], lane: usize) -> Vec<Field192> {
     let mut message = vec![Field192::ZERO; level.group];
     for block in 0..level.blocks {
@@ -3533,6 +3546,44 @@ fn encode_parity_blocks(
         .collect()
 }
 
+fn populate_parity_from_systematic(
+    level: Level,
+    proof_codeword: &mut [Field192],
+    spectra: &[Vec<Field192>],
+    batch_lanes: usize,
+) {
+    assert_eq!(proof_codeword.len(), level.qa_fields());
+    assert_eq!(spectra.len(), level.inverse_rate - 1);
+    let systematic_fields = level.group * level.width;
+    for lane_start in (0..level.width).step_by(batch_lanes) {
+        let lane_end = (lane_start + batch_lanes).min(level.width);
+        let encoded = {
+            let systematic = &proof_codeword[..systematic_fields];
+            (lane_start..lane_end)
+                .into_par_iter()
+                .map(|lane| {
+                    let message = systematic
+                        .chunks_exact(level.width)
+                        .map(|row| row[lane])
+                        .collect::<Vec<_>>();
+                    encode_parity_blocks(message, spectra)
+                })
+                .collect::<Vec<_>>()
+        };
+        for parity_block in 0..level.inverse_rate - 1 {
+            let start = (parity_block + 1) * systematic_fields;
+            proof_codeword[start..start + systematic_fields]
+                .par_chunks_mut(level.width)
+                .enumerate()
+                .for_each(|(row, target)| {
+                    for (offset, lane) in encoded.iter().enumerate() {
+                        target[lane_start + offset] = lane[parity_block][row];
+                    }
+                });
+        }
+    }
+}
+
 fn dot(left: &[Field192], right: &[Field192]) -> Field192 {
     assert_eq!(left.len(), right.len());
     left.par_iter()
@@ -3566,27 +3617,7 @@ fn populate_proof_codeword(
             }
         });
 
-    for lane_start in (0..level.width).step_by(batch_lanes) {
-        let lane_end = (lane_start + batch_lanes).min(level.width);
-        let encoded = (lane_start..lane_end)
-            .into_par_iter()
-            .map(|lane| {
-                let message = systematic_lane(level, source, lane);
-                encode_parity_blocks(message, spectra)
-            })
-            .collect::<Vec<_>>();
-        for parity_block in 0..level.inverse_rate - 1 {
-            let start = (parity_block + 1) * level.group * level.width;
-            proof_codeword[start..start + level.group * level.width]
-                .par_chunks_mut(level.width)
-                .enumerate()
-                .for_each(|(row, target)| {
-                    for (offset, lane) in encoded.iter().enumerate() {
-                        target[lane_start + offset] = lane[parity_block][row];
-                    }
-                });
-        }
-    }
+    populate_parity_from_systematic(level, proof_codeword, spectra, batch_lanes);
 }
 
 #[cfg(test)]
@@ -7922,6 +7953,50 @@ mod tests {
             shared_second.as_secs_f64() * 1_000.0,
             independent_first.as_secs_f64() * 1_000.0,
             independent_second.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale preallocated systematic-prefix versus separate-message benchmark"]
+    fn preallocated_systematic_prefix_benchmarks_separate_message() {
+        let level = carryopen_level();
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(10, component, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let run = |preallocated: bool| {
+            if preallocated {
+                let mut codeword = Vec::with_capacity(level.qa_fields());
+                codeword.extend_from_slice(&message);
+                let start = Instant::now();
+                codeword.resize(level.qa_fields(), Field192::ZERO);
+                populate_parity_from_systematic(level, &mut codeword, &spectra, 64);
+                (codeword, start.elapsed())
+            } else {
+                let start = Instant::now();
+                let mut codeword = vec![Field192::ZERO; level.qa_fields()];
+                populate_proof_codeword(level, &message, &mut codeword, &spectra, 64);
+                (codeword, start.elapsed())
+            }
+        };
+
+        let (preallocated_first, preallocated_first_time) = run(true);
+        let (separate_first, separate_first_time) = run(false);
+        assert_eq!(preallocated_first, separate_first);
+        drop(preallocated_first);
+        drop(separate_first);
+        let (separate_second, separate_second_time) = run(false);
+        let (preallocated_second, preallocated_second_time) = run(true);
+        assert_eq!(preallocated_second, separate_second);
+        eprintln!(
+            "preallocated-systematic-prefix={:.3}/{:.3} ms separate-message={:.3}/{:.3} ms",
+            preallocated_first_time.as_secs_f64() * 1_000.0,
+            preallocated_second_time.as_secs_f64() * 1_000.0,
+            separate_first_time.as_secs_f64() * 1_000.0,
+            separate_second_time.as_secs_f64() * 1_000.0,
         );
     }
 
