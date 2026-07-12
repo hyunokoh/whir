@@ -201,6 +201,15 @@ fn prove_local_product_relation_with_claim(
     roots: Vec<Digest>,
     claimed_sum: Field192,
 ) -> PackedSumcheckProof {
+    prove_local_product_relation_with_claim_reusing(&mut left, &mut right, roots, claimed_sum)
+}
+
+fn prove_local_product_relation_with_claim_reusing(
+    left: &mut Vec<Field192>,
+    right: &mut Vec<Field192>,
+    roots: Vec<Digest>,
+    claimed_sum: Field192,
+) -> PackedSumcheckProof {
     assert!(left.len() > 1 && left.len() == right.len());
     assert_eq!(dot(&left, &right), claimed_sum);
     let fields = left.len();
@@ -213,8 +222,8 @@ fn prove_local_product_relation_with_claim(
         pairs.push((constant, quadratic));
         let challenge = transcript_challenge(fields, variables, &roots, claimed_sum, &pairs);
         let linear = claim - constant.double() - quadratic;
-        let next_left = fold_active(&mut left, active, challenge);
-        let next_right = fold_active(&mut right, active, challenge);
+        let next_left = fold_active(left, active, challenge);
+        let next_right = fold_active(right, active, challenge);
         assert_eq!(next_left, next_right);
         active = next_left;
         claim = (quadratic * challenge + linear) * challenge + constant;
@@ -302,6 +311,16 @@ fn prove_tensor_product_relation(
     width: usize,
     roots: Vec<Digest>,
 ) -> TensorProductProof {
+    prove_tensor_product_relation_reusing(&mut left, &mut right, rows, width, roots)
+}
+
+fn prove_tensor_product_relation_reusing(
+    left: &mut Vec<Field192>,
+    right: &mut Vec<Field192>,
+    rows: usize,
+    width: usize,
+    roots: Vec<Digest>,
+) -> TensorProductProof {
     assert!(rows > 1 && width > 1 && left.len() == rows * width && right.len() == left.len());
     let claimed_sum = dot(&left, &right);
     let row_domain = rows.next_power_of_two();
@@ -317,8 +336,8 @@ fn prove_tensor_product_relation(
         pairs.push((constant, quadratic));
         let challenge = transcript_challenge(fields, variables, &roots, claimed_sum, &pairs);
         let linear = claim - constant.double() - quadratic;
-        let next_left = fold_tensor_rows(&mut left, active_rows, width, challenge);
-        let next_right = fold_tensor_rows(&mut right, active_rows, width, challenge);
+        let next_left = fold_tensor_rows(left, active_rows, width, challenge);
+        let next_right = fold_tensor_rows(right, active_rows, width, challenge);
         assert_eq!(next_left, next_right);
         active_rows = next_left;
         claim = (quadratic * challenge + linear) * challenge + constant;
@@ -333,8 +352,8 @@ fn prove_tensor_product_relation(
         pairs.push((constant, quadratic));
         let challenge = transcript_challenge(fields, variables, &roots, claimed_sum, &pairs);
         let linear = claim - constant.double() - quadratic;
-        let next_left = fold_active(&mut left, active_lanes, challenge);
-        let next_right = fold_active(&mut right, active_lanes, challenge);
+        let next_left = fold_active(left, active_lanes, challenge);
+        let next_right = fold_active(right, active_lanes, challenge);
         assert_eq!(next_left, next_right);
         active_lanes = next_left;
         claim = (quadratic * challenge + linear) * challenge + constant;
@@ -4956,6 +4975,47 @@ fn derive_next_source(
     next
 }
 
+fn selected_row_values(values: &[Field192], row_width: usize, indices: &[usize]) -> Vec<Field192> {
+    assert!(row_width > 0 && values.len() % row_width == 0);
+    assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(indices
+        .last()
+        .is_none_or(|index| *index < values.len() / row_width));
+    let mut selected = Vec::with_capacity(indices.len() * row_width);
+    for row_index in indices.iter().copied() {
+        let start = row_index * row_width;
+        selected.extend_from_slice(&values[start..start + row_width]);
+    }
+    selected
+}
+
+fn derive_next_source_from_selected_rows(
+    level: Level,
+    selected_proof_rows: &[Field192],
+    selected_index_rows: &[Field192],
+    proof_ood: &[Field192],
+    index_ood: &[Field192],
+) -> Vec<Field192> {
+    let query_count = level.next_blocks - 1;
+    assert_eq!(selected_proof_rows.len(), query_count * level.width);
+    assert_eq!(selected_index_rows.len(), selected_proof_rows.len());
+    assert_eq!(proof_ood.len(), level.width);
+    assert_eq!(index_ood.len(), level.width);
+
+    let mut next = vec![Field192::ZERO; 2 * level.next_blocks * level.width];
+    next[..level.width].copy_from_slice(proof_ood);
+    next[level.width..2 * level.width].copy_from_slice(index_ood);
+    for block in 0..query_count {
+        let target = (block + 1) * 2 * level.width;
+        let source = block * level.width;
+        next[target..target + level.width]
+            .copy_from_slice(&selected_proof_rows[source..source + level.width]);
+        next[target + level.width..target + 2 * level.width]
+            .copy_from_slice(&selected_index_rows[source..source + level.width]);
+    }
+    next
+}
+
 #[cfg(test)]
 fn populate_link_relation(
     level_index: usize,
@@ -5243,6 +5303,238 @@ fn semantic_vectors(
     )
 }
 
+/// Construct only the certificate objects consumed by the recursive proof.
+///
+/// Unlike [`semantic_vectors`], this path does not pack every local relation
+/// into two `PRODUCTION_FIELDS` diagnostic vectors. Each QA or copy relation
+/// owns exactly one pair of local vectors and moves them into its sumcheck.
+/// Selected rows are extracted before the QA vectors are consumed, so the
+/// authenticated successor and every transcript remain unchanged.
+fn semantic_certificate_objects(
+    batch_lanes: usize,
+    direct_whir_tail: bool,
+) -> (
+    Vec<Digest>,
+    Vec<Field192>,
+    Option<Digest>,
+    Digest,
+    Vec<ProductionTransitionProof>,
+    SemanticBreakdown,
+) {
+    assert!(batch_lanes > 0);
+    let zeros = zero_roots(PRODUCTION_VARIABLES);
+    let mut transcript_roots = Vec::<Digest>::new();
+    let mut phi_lengths = Vec::<usize>::with_capacity(LEVELS.len());
+    let mut transition_proofs = Vec::with_capacity(LEVELS.len());
+    let mut breakdown = SemanticBreakdown::default();
+    let mut source = (0..LEVELS[0].raw)
+        .into_par_iter()
+        .map(|index| semantic_value(0, index))
+        .collect::<Vec<_>>();
+    let mut relation_left = Vec::<Field192>::new();
+    let mut relation_right = Vec::<Field192>::new();
+
+    for (level_index, level) in LEVELS.into_iter().enumerate() {
+        assert_eq!(level.raw, level.blocks * level.block_semantic);
+        assert_eq!(source.len(), level.raw);
+
+        let start = Instant::now();
+        let spectra = (0..level.inverse_rate - 1)
+            .map(|block| generator_spectrum(level_index, block, level.group))
+            .collect::<Vec<_>>();
+        let generator_roots = spectra
+            .iter()
+            .map(|spectrum| prefix_root(spectrum, level.group, &zeros))
+            .collect::<Vec<_>>();
+        breakdown.generator_preprocessing += start.elapsed();
+
+        let start = Instant::now();
+        relation_right.resize(level.qa_fields(), Field192::ZERO);
+        relation_right.fill(Field192::ZERO);
+        populate_proof_codeword(level, &source, &mut relation_right, &spectra, batch_lanes);
+        breakdown.proof_encoding += start.elapsed();
+
+        let start = Instant::now();
+        let (level_roots, proof_commitments) =
+            level_commitment(level, &source, &relation_right, &generator_roots, &zeros);
+        let mut current_component_roots = level_roots.clone();
+        transcript_roots.extend(level_roots);
+        breakdown.proof_commitment += start.elapsed();
+
+        let start = Instant::now();
+        relation_left.resize(level.qa_fields(), Field192::ZERO);
+        relation_left.fill(Field192::ZERO);
+        populate_index_oracle(
+            level_index,
+            level,
+            &mut relation_left,
+            &spectra,
+            &current_component_roots,
+        );
+        breakdown.index_oracle += start.elapsed();
+        assert_eq!(dot(&relation_left, &relation_right), Field192::ZERO);
+
+        let start = Instant::now();
+        let index_descriptor =
+            virtual_index_descriptor(level_index, level, &current_component_roots);
+        transcript_roots.push(index_descriptor);
+        current_component_roots.push(index_descriptor);
+        breakdown.index_commitment += start.elapsed();
+
+        let selected = selected_rows(
+            level_index,
+            level.inverse_rate * level.group,
+            level.next_blocks - 1,
+            &transcript_roots,
+        );
+        let start = Instant::now();
+        let (selected_front, opening_bytes, frontier_hashes) =
+            selected_row_front(level, &proof_commitments, &selected);
+        breakdown.source_opening += start.elapsed();
+        breakdown.source_opening_bytes += opening_bytes;
+        breakdown.source_frontier_hashes += frontier_hashes;
+        let selected_proof_rows = selected_row_values(&relation_right, level.width, &selected);
+        let selected_index_rows = selected_row_values(&relation_left, level.width, &selected);
+
+        let start = Instant::now();
+        let qa_tensor = prove_tensor_product_relation_reusing(
+            &mut relation_left,
+            &mut relation_right,
+            level.inverse_rate * level.group,
+            level.width,
+            local_relation_roots(b"QA-membership", level_index, &transcript_roots),
+        );
+        assert_eq!(qa_tensor.proof.claimed_sum, Field192::ZERO);
+        let qa_membership = qa_tensor.proof.clone();
+        let qa_point = qa_membership
+            .challenges()
+            .expect("tensor QA sumcheck must produce row/lane OOD challenges");
+        let row_variables = (level.inverse_rate * level.group)
+            .next_power_of_two()
+            .trailing_zeros() as usize;
+        assert_eq!(
+            evaluate_padded_message(
+                &qa_tensor.left_ood_row,
+                level.width.next_power_of_two(),
+                &qa_point[row_variables..],
+            ),
+            qa_membership.terminal_left
+        );
+        assert_eq!(
+            evaluate_padded_message(
+                &qa_tensor.right_ood_row,
+                level.width.next_power_of_two(),
+                &qa_point[row_variables..],
+            ),
+            qa_membership.terminal_right
+        );
+        breakdown.transition_sumchecks += start.elapsed();
+
+        let start = Instant::now();
+        relation_left.resize(level.view_capacity(), Field192::ZERO);
+        relation_right.resize(level.view_capacity(), Field192::ZERO);
+        relation_left.fill(Field192::ZERO);
+        relation_right.fill(Field192::ZERO);
+        populate_copy_relation(
+            level_index,
+            level,
+            &source,
+            &mut relation_left,
+            &mut relation_right,
+            &transcript_roots,
+        );
+        let start_sumcheck = Instant::now();
+        let dual_view_copy = prove_local_product_relation_with_claim_reusing(
+            &mut relation_left,
+            &mut relation_right,
+            local_relation_roots(b"dual-view-copy", level_index, &transcript_roots),
+            Field192::ZERO,
+        );
+        breakdown.transition_sumchecks += start_sumcheck.elapsed();
+
+        transition_proofs.push(ProductionTransitionProof {
+            level: level_index,
+            component_roots: current_component_roots,
+            ood_block_root: [0_u8; 32],
+            next_source_root: [0_u8; 32],
+            selected_front,
+            algebra: TransitionAlgebraProof {
+                level: level_index,
+                qa_membership,
+                dual_view_copy,
+                phi_link: None,
+            },
+        });
+
+        let expected_next = derive_next_source_from_selected_rows(
+            level,
+            &selected_proof_rows,
+            &selected_index_rows,
+            &qa_tensor.right_ood_row,
+            &qa_tensor.left_ood_row,
+        );
+        let ood_block_root = standard_ood_block_root(level, &expected_next, &zeros);
+        let next_source_root = derived_next_source_root(
+            level_index,
+            &transition_proofs[level_index].component_roots,
+            &transition_proofs[level_index].selected_front,
+            ood_block_root,
+            &zeros,
+        )
+        .expect("selected F/W roots must derive the next splice-compatible root");
+        if let Some(next_level) = LEVELS.get(level_index + 1) {
+            assert_eq!(
+                next_source_root,
+                splice_root(*next_level, &expected_next, &zeros)
+            );
+        }
+        transition_proofs[level_index].ood_block_root = ood_block_root;
+        transition_proofs[level_index].next_source_root = next_source_root;
+        phi_lengths.push(expected_next.len());
+        source = expected_next;
+        breakdown.copy_and_phi += start.elapsed();
+    }
+
+    let start = Instant::now();
+    let direct_context = direct_whir_tail.then(|| direct_tail_context_digest(&transcript_roots));
+    let terminal_root = if let Some(context) = direct_context {
+        direct_whir_commitment_root(&source, context)
+    } else {
+        prefix_root(&source, source.len().next_power_of_two(), &zeros)
+    };
+    transcript_roots.push(terminal_root);
+    breakdown.terminal_commitment += start.elapsed();
+
+    for (level_index, fields) in phi_lengths.into_iter().enumerate() {
+        let start_sumcheck = Instant::now();
+        transition_proofs[level_index].algebra.phi_link = Some(zero_phi_link_proof(
+            b"Phi-link",
+            b"Phi-link",
+            level_index,
+            fields,
+            &transcript_roots,
+        ));
+        breakdown.transition_sumchecks += start_sumcheck.elapsed();
+    }
+    for proof in &transition_proofs {
+        let payload = proof.serialize();
+        assert_eq!(
+            ProductionTransitionProof::deserialize(&payload),
+            Some(proof.clone())
+        );
+        breakdown.transition_proof_bytes += payload.len();
+    }
+
+    (
+        transcript_roots,
+        source,
+        direct_context,
+        terminal_root,
+        transition_proofs,
+        breakdown,
+    )
+}
+
 fn field_bytes(value: Field192) -> Vec<u8> {
     value.into_bigint().to_bytes_le()
 }
@@ -5481,18 +5773,14 @@ fn run_semantic_kernel(batch_lanes: usize, direct_whir_tail: bool) -> KernelMeas
 fn run_semantic_certificate_only(batch_lanes: usize, direct_whir_tail: bool) -> KernelMeasurement {
     let start = Instant::now();
     let (
-        left,
-        right,
         roots,
         terminal_tail,
         terminal_context,
         terminal_binding_root,
         transition_proofs,
         breakdown,
-    ) = semantic_vectors(batch_lanes, direct_whir_tail);
+    ) = semantic_certificate_objects(batch_lanes, direct_whir_tail);
     let setup = start.elapsed();
-    drop(left);
-    drop(right);
     let component_root_count = roots.len();
     let roots = aggregate_roots(&roots);
     KernelMeasurement {
@@ -7668,10 +7956,18 @@ fn main() {
     println!("- variables: {variables}");
     println!("- transcript-bound component roots: {component_root_count}");
     println!("- serialized algebra root aggregates: {transcript_root_count}");
-    println!(
-        "- two live Field192 vectors: {:.3} GiB",
-        2.0 * args.fields as f64 * 24.0 / (1_u64 << 30) as f64
-    );
+    if args.final_only {
+        println!(
+            "- reusable relation-local Field192 pair: {:.3} GiB capacity; diagnostic {:.3}-GiB global pair omitted",
+            2.0 * LEVELS[0].qa_fields() as f64 * 24.0 / (1_u64 << 30) as f64,
+            2.0 * args.fields as f64 * 24.0 / (1_u64 << 30) as f64,
+        );
+    } else {
+        println!(
+            "- two live Field192 vectors: {:.3} GiB",
+            2.0 * args.fields as f64 * 24.0 / (1_u64 << 30) as f64
+        );
+    }
     println!(
         "- {} median/p95: {:.3}/{:.3} ms",
         if args.final_only {
@@ -8354,6 +8650,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn selected_row_successor_matches_full_codeword_derivation() {
+        let level = Level {
+            raw: 12,
+            blocks: 1,
+            block_semantic: 12,
+            components: &[(12, 16)],
+            group: 4,
+            width: 3,
+            row_span: 4,
+            inverse_rate: 2,
+            next_blocks: 3,
+        };
+        let proof_codeword = (0..level.qa_fields())
+            .map(|index| Field192::from((7 * index + 1) as u64))
+            .collect::<Vec<_>>();
+        let index_oracle = (0..level.qa_fields())
+            .map(|index| Field192::from((11 * index + 2) as u64))
+            .collect::<Vec<_>>();
+        let proof_ood = (0..level.width)
+            .map(|index| Field192::from((13 * index + 3) as u64))
+            .collect::<Vec<_>>();
+        let index_ood = (0..level.width)
+            .map(|index| Field192::from((17 * index + 4) as u64))
+            .collect::<Vec<_>>();
+        let selected = [1_usize, 6];
+        let selected_proof = selected_row_values(&proof_codeword, level.width, &selected);
+        let selected_index = selected_row_values(&index_oracle, level.width, &selected);
+        assert_eq!(
+            derive_next_source_from_selected_rows(
+                level,
+                &selected_proof,
+                &selected_index,
+                &proof_ood,
+                &index_ood,
+            ),
+            derive_next_source(
+                level,
+                &proof_codeword,
+                &index_oracle,
+                &proof_ood,
+                &index_ood,
+                &selected,
+            )
+        );
     }
 
     #[test]
@@ -10943,6 +11286,59 @@ mod tests {
             whir.commit.as_secs_f64() * 1_000.0,
             whir.prove.as_secs_f64() * 1_000.0,
             whir.verify.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production canonical payload digest checkpoint"]
+    fn canonical_payload_digest_checkpoint() {
+        let carry = run_production_carryopen(1, false);
+        let certificate = run_semantic_certificate_only(64, false);
+        let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
+        let payload = proof.serialize();
+        assert_eq!(payload.len(), 301_740);
+        let digest = blake3::hash(&payload);
+        assert_eq!(
+            digest.as_bytes(),
+            &hex::decode("c19fe62415f7607f84900e3692bedcd0fae827770343dadf0dce70db49168d10")
+                .unwrap()[..]
+        );
+        eprintln!(
+            "canonical-payload-bytes={} blake3={}",
+            payload.len(),
+            digest.to_hex()
+        );
+    }
+
+    #[test]
+    #[ignore = "production packed-global certificate memory profile"]
+    fn packed_global_certificate_memory_profile() {
+        let (_, _, roots, source, _, terminal_root, proofs, _) = semantic_vectors(64, false);
+        assert_eq!(roots.len(), 31);
+        assert_eq!(source.len(), 247_192);
+        assert_eq!(roots.last(), Some(&terminal_root));
+        assert_eq!(
+            proofs
+                .iter()
+                .map(|proof| proof.serialize().len())
+                .sum::<usize>(),
+            180_156
+        );
+    }
+
+    #[test]
+    #[ignore = "production relation-local certificate memory profile"]
+    fn relation_local_certificate_memory_profile() {
+        let (roots, source, _, terminal_root, proofs, _) = semantic_certificate_objects(64, false);
+        assert_eq!(roots.len(), 31);
+        assert_eq!(source.len(), 247_192);
+        assert_eq!(roots.last(), Some(&terminal_root));
+        assert_eq!(
+            proofs
+                .iter()
+                .map(|proof| proof.serialize().len())
+                .sum::<usize>(),
+            180_156
         );
     }
 
