@@ -152,6 +152,26 @@ mod neon4 {
     }
 
     #[inline(always)]
+    unsafe fn or8(left: Packed8, right: Packed8) -> Packed8 {
+        unsafe {
+            Packed8([
+                vorrq_u32(left.0[0], right.0[0]),
+                vorrq_u32(left.0[1], right.0[1]),
+            ])
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn shr8_8(value: Packed8) -> Packed8 {
+        unsafe { Packed8([vshrq_n_u32::<8>(value.0[0]), vshrq_n_u32::<8>(value.0[1])]) }
+    }
+
+    #[inline(always)]
+    unsafe fn shl24_8(value: Packed8) -> Packed8 {
+        unsafe { Packed8([vshlq_n_u32::<24>(value.0[0]), vshlq_n_u32::<24>(value.0[1])]) }
+    }
+
+    #[inline(always)]
     unsafe fn rotr16_8(value: Packed8) -> Packed8 {
         unsafe { Packed8([rotr16(value.0[0]), rotr16(value.0[1])]) }
     }
@@ -281,6 +301,32 @@ mod neon4 {
                 )),
             ]
         }
+    }
+
+    /// Load either the left or right digest of eight parent lanes and
+    /// transpose its words into the word-major representation used by the
+    /// compression kernel.
+    #[inline(always)]
+    unsafe fn load_digest_words8(children: &[Digest; 16], parity: usize) -> [Packed8; 8] {
+        let zero = Packed8([vdupq_n_u32(0), vdupq_n_u32(0)]);
+        let mut output = [zero; 8];
+        for group in 0..2 {
+            for word_block in 0..2 {
+                let rows = std::array::from_fn(|lane| unsafe {
+                    vld1q_u32(
+                        children[2 * (4 * group + lane) + parity]
+                            .as_ptr()
+                            .add(16 * word_block)
+                            .cast(),
+                    )
+                });
+                let words = unsafe { transpose4x4(rows) };
+                for word in 0..4 {
+                    output[4 * word_block + word].0[group] = words[word];
+                }
+            }
+        }
+        output
     }
 
     #[inline(always)]
@@ -456,12 +502,8 @@ mod neon4 {
         u32::from_le_bytes(digest[byte_offset..byte_offset + 4].try_into().unwrap())
     }
 
-    /// Hash eight 83-byte nodes directly from their child digests, avoiding
-    /// sixteen temporary 64-byte blocks and their subsequent word parsing.
-    #[target_feature(enable = "neon")]
-    unsafe fn compress_parents8_impl<const TRANSPOSED_OUTPUT: bool, const MATERIALIZED_CV: bool>(
-        children: &[Digest; 16],
-    ) -> [Digest; 8] {
+    #[inline(always)]
+    unsafe fn parent_messages8_scalar(children: &[Digest; 16]) -> ([Packed8; 16], [Packed8; 16]) {
         let zero = Packed8([vdupq_n_u32(0), vdupq_n_u32(0)]);
         let mut first = [zero; 16];
         for (word, value) in [0x414c_694c, 0x6966_2f43, 0x2d64_6c65, 0x6564_6f6e]
@@ -513,6 +555,54 @@ mod neon4 {
                     | (u32::from(children[2 * lane + 1][31]) << 16)
             }))
         };
+        (first, final_block)
+    }
+
+    #[inline(always)]
+    unsafe fn parent_messages8_vector(children: &[Digest; 16]) -> ([Packed8; 16], [Packed8; 16]) {
+        let zero = Packed8([vdupq_n_u32(0), vdupq_n_u32(0)]);
+        let left = unsafe { load_digest_words8(children, 0) };
+        let right = unsafe { load_digest_words8(children, 1) };
+        let mut first = [zero; 16];
+        for (word, value) in [0x414c_694c, 0x6966_2f43, 0x2d64_6c65, 0x6564_6f6e]
+            .into_iter()
+            .enumerate()
+        {
+            first[word] = Packed8([vdupq_n_u32(value), vdupq_n_u32(value)]);
+        }
+        let domain_tail = Packed8([vdupq_n_u32(0x0031_762f), vdupq_n_u32(0x0031_762f)]);
+        first[4] = unsafe { or8(domain_tail, shl24_8(left[0])) };
+        for word in 0..7 {
+            first[5 + word] = unsafe { or8(shr8_8(left[word]), shl24_8(left[word + 1])) };
+        }
+        first[12] = unsafe { or8(shr8_8(left[7]), shl24_8(right[0])) };
+        for word in 0..3 {
+            first[13 + word] = unsafe { or8(shr8_8(right[word]), shl24_8(right[word + 1])) };
+        }
+
+        let mut final_block = [zero; 16];
+        for word in 0..4 {
+            final_block[word] = unsafe { or8(shr8_8(right[word + 3]), shl24_8(right[word + 4])) };
+        }
+        final_block[4] = unsafe { shr8_8(right[7]) };
+        (first, final_block)
+    }
+
+    /// Hash eight 83-byte nodes directly from their child digests, avoiding
+    /// sixteen temporary 64-byte blocks and their subsequent word parsing.
+    #[target_feature(enable = "neon")]
+    unsafe fn compress_parents8_impl<
+        const TRANSPOSED_OUTPUT: bool,
+        const MATERIALIZED_CV: bool,
+        const VECTOR_MESSAGES: bool,
+    >(
+        children: &[Digest; 16],
+    ) -> [Digest; 8] {
+        let (first, final_block) = if VECTOR_MESSAGES && cfg!(target_endian = "little") {
+            unsafe { parent_messages8_vector(children) }
+        } else {
+            unsafe { parent_messages8_scalar(children) }
+        };
         if MATERIALIZED_CV {
             let cvs = unsafe {
                 compress_message_cv32_8::<TRANSPOSED_OUTPUT>(
@@ -548,17 +638,22 @@ mod neon4 {
 
     #[target_feature(enable = "neon")]
     pub unsafe fn compress_parents8(children: &[Digest; 16]) -> [Digest; 8] {
-        unsafe { compress_parents8_impl::<true, false>(children) }
+        unsafe { compress_parents8_impl::<true, false, true>(children) }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_parents8_scalar_messages(children: &[Digest; 16]) -> [Digest; 8] {
+        unsafe { compress_parents8_impl::<true, false, false>(children) }
     }
 
     #[target_feature(enable = "neon")]
     pub unsafe fn compress_parents8_materialized_cv(children: &[Digest; 16]) -> [Digest; 8] {
-        unsafe { compress_parents8_impl::<true, true>(children) }
+        unsafe { compress_parents8_impl::<true, true, false>(children) }
     }
 
     #[target_feature(enable = "neon")]
     pub unsafe fn compress_parents8_scatter(children: &[Digest; 16]) -> [Digest; 8] {
-        unsafe { compress_parents8_impl::<false, true>(children) }
+        unsafe { compress_parents8_impl::<false, true, false>(children) }
     }
 
     #[target_feature(enable = "neon")]
@@ -872,6 +967,19 @@ fn parent8_scatter(children: &[Digest; 16]) -> [Digest; 8] {
     }
 }
 
+/// Reproduce the scalar-gather message-packing schedule while retaining the
+/// register-resident chaining-value handoff.
+fn parent8_scalar_messages(children: &[Digest; 16]) -> [Digest; 8] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { neon4::compress_parents8_scalar_messages(children) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        parent8_materialized_fixed_first_compression(children)
+    }
+}
+
 /// Reproduce the former AArch64 schedule that transposed the first-block
 /// chaining values to lane-major memory before gathering them for block two.
 fn parent8_materialized_cv(children: &[Digest; 16]) -> [Digest; 8] {
@@ -994,6 +1102,37 @@ fn reduce_exact_digests_materialized_cv(scratch: &mut [Digest]) -> Digest {
             let roots = {
                 let children: &[Digest; 16] = scratch[child..child + 16].try_into().unwrap();
                 parent8_materialized_cv(children)
+            };
+            scratch[pair..pair + 8].copy_from_slice(&roots);
+        }
+        let batched4 = batched8 + (pairs - batched8) / 4 * 4;
+        for pair in (batched8..batched4).step_by(4) {
+            let child = 2 * pair;
+            let roots = {
+                let children: &[Digest; 8] = scratch[child..child + 8].try_into().unwrap();
+                parent4(children)
+            };
+            scratch[pair..pair + 4].copy_from_slice(&roots);
+        }
+        for pair in batched4..pairs {
+            scratch[pair] = parent(scratch[2 * pair], scratch[2 * pair + 1]);
+        }
+        active = pairs;
+    }
+    scratch[0]
+}
+
+fn reduce_exact_digests_scalar_messages(scratch: &mut [Digest]) -> Digest {
+    assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
+    let mut active = scratch.len();
+    while active > 1 {
+        let pairs = active / 2;
+        let batched8 = pairs / 8 * 8;
+        for pair in (0..batched8).step_by(8) {
+            let child = 2 * pair;
+            let roots = {
+                let children: &[Digest; 16] = scratch[child..child + 16].try_into().unwrap();
+                parent8_scalar_messages(children)
             };
             scratch[pair..pair + 8].copy_from_slice(&roots);
         }
@@ -1288,6 +1427,26 @@ pub fn prefix_root_materialized_cv_for_benchmark(
             scratch.clear();
             extend_field_level1_batched(values, &mut scratch);
             reduce_exact_digests_materialized_cv(&mut scratch)
+        });
+    }
+    prefix_root(values, capacity, zeros)
+}
+
+/// Reproduce the pre-vector-load parent message-packing schedule for crossed
+/// artifact benchmarks. This is transcript-identical to [`prefix_root`].
+#[doc(hidden)]
+pub fn prefix_root_scalar_parent_messages_for_benchmark(
+    values: &[Field192],
+    capacity: usize,
+    zeros: &[Digest],
+) -> Digest {
+    assert!(values.len() <= capacity && capacity.is_power_of_two());
+    if values.len() == capacity && values.len() >= 16 {
+        return EXACT_ROOT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.clear();
+            extend_field_level1_batched(values, &mut scratch);
+            reduce_exact_digests_scalar_messages(&mut scratch)
         });
     }
     prefix_root(values, capacity, zeros)
@@ -2007,8 +2166,47 @@ mod tests {
             let scalar =
                 std::array::from_fn(|index| parent(children[2 * index], children[2 * index + 1]));
             assert_eq!(batched, scalar);
+            assert_eq!(parent8_scalar_messages(&children), scalar);
             assert_eq!(parent8_materialized_cv(&children), scalar);
         }
+    }
+
+    #[test]
+    #[ignore = "vector-load versus scalar-gather parent-message benchmark"]
+    fn vector_parent_messages_benchmark_scalar_gather() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let seed_children = std::array::from_fn(|index| {
+            *blake3::hash(&(index as u64 + 0x4d53_47).to_le_bytes()).as_bytes()
+        });
+        assert_eq!(
+            parent8(&seed_children),
+            parent8_scalar_messages(&seed_children)
+        );
+        let iterations = 1_000_000;
+        let run = |candidate: fn(&[Digest; 16]) -> [Digest; 8]| {
+            let mut children = seed_children;
+            let start = Instant::now();
+            for iteration in 0..iterations {
+                let roots = candidate(black_box(&children));
+                children[iteration & 15] = roots[iteration & 7];
+            }
+            black_box(children);
+            start.elapsed()
+        };
+
+        let vector_first = run(parent8);
+        let scalar_first = run(parent8_scalar_messages);
+        let scalar_second = run(parent8_scalar_messages);
+        let vector_second = run(parent8);
+        eprintln!(
+            "parent8-messages iterations={iterations} vector-load={:.3}/{:.3} ms scalar-gather={:.3}/{:.3} ms",
+            vector_first.as_secs_f64() * 1_000.0,
+            vector_second.as_secs_f64() * 1_000.0,
+            scalar_first.as_secs_f64() * 1_000.0,
+            scalar_second.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]
