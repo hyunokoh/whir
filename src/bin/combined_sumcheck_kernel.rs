@@ -2471,7 +2471,7 @@ struct ProductionCarryOpenProof {
     membership: PackedSumcheckProof,
     evaluation: PackedSumcheckProof,
     phi_link: PackedSumcheckProof,
-    tail: DirectTailProofArtifact,
+    tail: Option<DirectTailProofArtifact>,
 }
 
 impl ProductionCarryOpenProof {
@@ -2483,7 +2483,7 @@ impl ProductionCarryOpenProof {
             + self.membership.serialize().len()
             + self.evaluation.serialize().len()
             + self.phi_link.serialize().len()
-            + self.tail.serialize().len()
+            + self.tail.as_ref().map_or(0, |tail| tail.serialize().len())
     }
 
     fn verify(&self) -> bool {
@@ -2518,14 +2518,20 @@ impl ProductionCarryOpenProof {
             || self.evaluation.claimed_sum != self.precarry.sumcheck.terminal_left
             || self.evaluation.roots
                 != local_relation_roots(b"CarryOpen-evaluation", 10, &self.component_roots)
-            || self.tail.semantic_fields != CARRYOPEN_TERMINAL_FIELDS
-            || self.tail.context_digest != direct_tail_context_digest(&self.component_roots)
-            || !self.tail.verify()
+        {
+            return false;
+        }
+        let Some(tail) = &self.tail else {
+            return false;
+        };
+        if tail.semantic_fields != CARRYOPEN_TERMINAL_FIELDS
+            || tail.context_digest != direct_tail_context_digest(&self.component_roots)
+            || !tail.verify()
         {
             return false;
         }
         let mut final_roots = self.component_roots.clone();
-        final_roots.push(self.tail.commitment_root);
+        final_roots.push(tail.commitment_root);
         self.phi_link.claimed_sum == Field192::ZERO
             && self.phi_link.roots == local_relation_roots(b"CarryOpen-Phi-link", 10, &final_roots)
             && self.phi_link.challenges().is_some()
@@ -2743,7 +2749,10 @@ struct CarryOpenMeasurement {
     terminal: Duration,
 }
 
-fn run_production_carryopen(verifier_repetitions: usize) -> CarryOpenMeasurement {
+fn run_production_carryopen(
+    verifier_repetitions: usize,
+    include_standalone_tail: bool,
+) -> CarryOpenMeasurement {
     let level = carryopen_level();
     let zeros = zero_roots(30);
     let message = (0..CARRYOPEN_FIELDS)
@@ -2855,11 +2864,15 @@ fn run_production_carryopen(verifier_repetitions: usize) -> CarryOpenMeasurement
     let algebra = start.elapsed();
 
     let start = Instant::now();
-    let context = direct_tail_context_digest(&component_roots);
-    let tail_measurement =
-        run_direct_whir_tail(terminal_source.clone(), context, verifier_repetitions);
+    let tail = include_standalone_tail.then(|| {
+        let context = direct_tail_context_digest(&component_roots);
+        run_direct_whir_tail(terminal_source.clone(), context, verifier_repetitions).artifact
+    });
     let mut final_roots = component_roots.clone();
-    final_roots.push(tail_measurement.commitment_root);
+    final_roots.push(
+        tail.as_ref()
+            .map_or(terminal_source_root, |tail| tail.commitment_root),
+    );
     let phi_point = (0..terminal_source.len().next_power_of_two().trailing_zeros() as usize)
         .map(|index| semantic_challenge(b"CarryOpen-Phi-link", 10, index, &final_roots))
         .collect::<Vec<_>>();
@@ -2879,12 +2892,20 @@ fn run_production_carryopen(verifier_repetitions: usize) -> CarryOpenMeasurement
         membership,
         evaluation,
         phi_link,
-        tail: tail_measurement.artifact,
+        tail,
     };
-    assert!(proof.verify());
+    if include_standalone_tail {
+        assert!(proof.verify());
+    } else {
+        assert!(CarryOpenCoreProof::from(&proof).verify(terminal_source_root));
+    }
     let mut changed = proof.clone();
     changed.evaluation.claimed_sum += Field192::ONE;
-    assert!(!changed.verify());
+    if include_standalone_tail {
+        assert!(!changed.verify());
+    } else {
+        assert!(!CarryOpenCoreProof::from(&changed).verify(terminal_source_root));
+    }
     CarryOpenMeasurement {
         proof,
         terminal_source,
@@ -2923,7 +2944,7 @@ fn run_strong_round(
     mut source: Vec<Field192>,
     expected_source_root: Digest,
     attach_base: bool,
-    verifier_repetitions: usize,
+    _verifier_repetitions: usize,
 ) -> StrongRoundMeasurement {
     let level = strong_round_level(round).expect("strong round must be in the fixed schedule");
     let relation_level = 12 + round;
@@ -3015,19 +3036,8 @@ fn run_strong_round(
     let algebra = start.elapsed();
 
     let start = Instant::now();
-    let base = attach_base.then(|| {
-        let mut tail_roots = core.component_roots.clone();
-        tail_roots.push(core.terminal_source_root);
-        let tail = run_direct_whir_tail(
-            terminal_source.clone(),
-            direct_tail_context_digest(&tail_roots),
-            verifier_repetitions,
-        )
-        .artifact;
-        StrongBaseProof {
-            tail,
-            terminal_witness: terminal_source.clone(),
-        }
+    let base = attach_base.then(|| StrongBaseProof {
+        terminal_witness: terminal_source.clone(),
     });
     if let Some(base) = &base {
         assert!(base.verify(&core));
@@ -5272,19 +5282,16 @@ impl StrongTransitionCore {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StrongBaseProof {
-    tail: DirectTailProofArtifact,
     terminal_witness: Vec<Field192>,
 }
 
 impl StrongBaseProof {
-    const MAGIC: &'static [u8; 8] = b"LILSBP01";
+    const MAGIC: &'static [u8; 8] = b"LILSBP02";
 
     fn verify(&self, core: &StrongTransitionCore) -> bool {
         let Some(level) = core.level() else {
             return false;
         };
-        let mut tail_roots = core.component_roots.clone();
-        tail_roots.push(core.terminal_source_root);
         self.terminal_witness.len() == core.terminal_fields().unwrap()
             && audit_strong_terminal_restoration(
                 12 + core.round,
@@ -5297,10 +5304,6 @@ impl StrongBaseProof {
                 &self.terminal_witness,
                 &zero_roots(30),
             )
-            && self.tail.semantic_fields == self.terminal_witness.len()
-            && self.tail.context_digest == direct_tail_context_digest(&tail_roots)
-            && self.tail.verify()
-            && terminal_witness_matches_tail(&self.terminal_witness, &self.tail)
     }
 
     #[cfg(test)]
@@ -5311,14 +5314,9 @@ impl StrongBaseProof {
 
     /// Serialize bytes after a verified aggregate has accepted this base proof.
     fn serialize_unchecked(&self) -> Vec<u8> {
-        let tail = self.tail.serialize();
-        let mut output = Vec::with_capacity(24 + tail.len() + self.terminal_witness.len() * 24);
+        let mut output = Vec::with_capacity(12 + self.terminal_witness.len() * 24);
         output.extend_from_slice(Self::MAGIC);
-        output.extend_from_slice(&(tail.len() as u32).to_le_bytes());
         output.extend_from_slice(&(self.terminal_witness.len() as u32).to_le_bytes());
-        output.extend_from_slice(&0_u32.to_le_bytes());
-        output.extend_from_slice(&0_u32.to_le_bytes());
-        output.extend_from_slice(&tail);
         for value in &self.terminal_witness {
             output.extend_from_slice(&canonical_field_bytes(*value));
         }
@@ -5327,22 +5325,15 @@ impl StrongBaseProof {
 
     /// Structural parser used only inside a verified strong aggregate.
     fn deserialize_unchecked(payload: &[u8], core: &StrongTransitionCore) -> Option<Self> {
-        if payload.len() < 24 || &payload[..8] != Self::MAGIC {
+        const HEADER: usize = 12;
+        if payload.len() < HEADER || &payload[..8] != Self::MAGIC {
             return None;
         }
-        let tail_size = u32::from_le_bytes(payload[8..12].try_into().ok()?) as usize;
-        let fields = u32::from_le_bytes(payload[12..16].try_into().ok()?) as usize;
-        let reserved0 = u32::from_le_bytes(payload[16..20].try_into().ok()?);
-        let reserved1 = u32::from_le_bytes(payload[20..24].try_into().ok()?);
-        if fields != core.terminal_fields()?
-            || reserved0 != 0
-            || reserved1 != 0
-            || payload.len() != 24 + tail_size + fields * 24
-        {
+        let fields = u32::from_le_bytes(payload[8..12].try_into().ok()?) as usize;
+        if fields != core.terminal_fields()? || payload.len() != HEADER + fields * 24 {
             return None;
         }
-        let tail = DirectTailProofArtifact::deserialize(payload.get(24..24 + tail_size)?)?;
-        let mut position = 24 + tail_size;
+        let mut position = HEADER;
         let mut terminal_witness = Vec::with_capacity(fields);
         for _ in 0..fields {
             let bytes = payload.get(position..position + 24)?;
@@ -5353,10 +5344,7 @@ impl StrongBaseProof {
             terminal_witness.push(value);
             position += 24;
         }
-        let proof = Self {
-            tail,
-            terminal_witness,
-        };
+        let proof = Self { terminal_witness };
         Some(proof)
     }
 }
@@ -5795,7 +5783,7 @@ struct CanonicalProofByteBreakdown {
     selected_front_framing: usize,
     algebra: usize,
     terminal_witness: usize,
-    terminal_whir: usize,
+    terminal_pcs: usize,
     other: usize,
     proof_row_merkle_by_stage: [usize; 11],
     index_row_merkle_by_stage: [usize; 11],
@@ -6002,13 +5990,13 @@ impl RecursiveStrongEndToEndProof {
             .sum::<usize>();
         let algebra = carry_algebra + certificate_algebra + strong_algebra;
         let terminal_witness = self.base.terminal_witness.len() * 24;
-        let terminal_whir = self.base.tail.serialize().len();
+        let terminal_pcs = 0;
         let named = proof_row_merkle
             + index_row_merkle
             + selected_front_framing
             + algebra
             + terminal_witness
-            + terminal_whir;
+            + terminal_pcs;
         let other = total
             .checked_sub(named)
             .expect("named canonical components must fit in total proof bytes");
@@ -6023,7 +6011,7 @@ impl RecursiveStrongEndToEndProof {
             selected_front_framing,
             algebra,
             terminal_witness,
-            terminal_whir,
+            terminal_pcs,
             other,
             proof_row_merkle_by_stage,
             index_row_merkle_by_stage,
@@ -6598,7 +6586,10 @@ fn main() {
     for _ in 0..args.iterations {
         let iteration_start = Instant::now();
         if args.carryopen {
-            carryopen_measurements.push(run_production_carryopen(args.whir_verifier_repetitions));
+            carryopen_measurements.push(run_production_carryopen(
+                args.whir_verifier_repetitions,
+                !args.final_only,
+            ));
         }
         let measurement = if args.final_only {
             run_semantic_certificate_only(args.batch_lanes, certificate_direct_tail)
@@ -6988,7 +6979,7 @@ fn main() {
             "- production CarryOpen code: vertical and horizontal systematic QA rate 1/4, 2^16 x 2^8 message, 1024-field tensor rows, q={CARRYOPEN_QUERIES}"
         );
         println!(
-            "- CarryOpen M-root/pre-Carry/encode+commit/algebra/tail medians: {:.3}/{:.3}/{:.3}/{:.3}/{:.3} ms",
+            "- CarryOpen M-root/pre-Carry/encode+commit/algebra/terminal medians: {:.3}/{:.3}/{:.3}/{:.3}/{:.3} ms",
             percentile(&message_ms, 0.5),
             percentile(&precarry_ms, 0.5),
             percentile(&encode_ms, 0.5),
@@ -7004,11 +6995,11 @@ fn main() {
         );
         println!(
             "- CarryOpen terminal fields/padded: {}/{}; serialized component proof: {} B",
-            first.tail.semantic_fields,
-            first.tail.padded_fields,
+            CARRYOPEN_TERMINAL_FIELDS,
+            CARRYOPEN_TERMINAL_FIELDS.next_power_of_two(),
             first.serialized_component_bytes()
         );
-        println!("- CarryOpen verifier checks the actual M root, pre-Carry claim, QA membership/evaluation, authenticated F rows, public virtual-W rows, Phi link, and terminal WHIR; claim mutation rejected");
+        println!("- CarryOpen verifier checks the actual M root, pre-Carry claim, QA membership/evaluation, authenticated F rows, public virtual-W rows, Phi link, and recursive terminal restoration; claim mutation rejected");
     }
     if args.semantic {
         println!(
@@ -7197,13 +7188,13 @@ fn main() {
                     bytes.base_total
                 );
                 println!(
-                    "- canonical proof byte classes: F-row Merkle={} B; W-row Merkle={} B; selected-front framing={} B; algebra={} B; final witness={} B; terminal WHIR={} B; other={} B",
+                    "- canonical proof byte classes: F-row Merkle={} B; W-row Merkle={} B; selected-front framing={} B; algebra={} B; final witness={} B; terminal PCS={} B; other={} B",
                     bytes.proof_row_merkle,
                     bytes.index_row_merkle,
                     bytes.selected_front_framing,
                     bytes.algebra,
                     bytes.terminal_witness,
-                    bytes.terminal_whir,
+                    bytes.terminal_pcs,
                     bytes.other
                 );
                 for stage in 0..(1 + LEVELS.len() + STRONG_ROUNDS) {
@@ -8170,12 +8161,20 @@ mod tests {
     #[test]
     #[ignore = "production canonical single-pass serialization/verifier A/B benchmark"]
     fn canonical_verifier_benchmarks_single_semantic_pass() {
-        let carry = run_production_carryopen(1);
+        let carry = run_production_carryopen(1, false);
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 443_496);
-        assert_eq!(proof.byte_breakdown(payload.len()).total, payload.len());
+        assert_eq!(payload.len(), 314_028);
+        let breakdown = proof.byte_breakdown(payload.len());
+        assert_eq!(breakdown.total, payload.len());
+        assert_eq!(breakdown.base_total, 24_588);
+        assert_eq!(breakdown.terminal_witness, 24_576);
+        assert_eq!(breakdown.terminal_pcs, 0);
+
+        let mut changed_base = proof.clone();
+        changed_base.base.terminal_witness[0] += Field192::ONE;
+        assert!(!changed_base.verify());
 
         clear_virtual_index_factor_cache();
         let start = Instant::now();
