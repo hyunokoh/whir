@@ -1994,18 +1994,26 @@ fn tensor_row_commitments(
         .chunks_exact(CARRYOPEN_FIELDS)
         .enumerate()
         .map(|(matrix, matrix_values)| {
+            // One allocation serves both field workspaces.  The systematic
+            // matrix hashes only 256-field parity subtrees, while the three
+            // vertical-parity matrices retain a complete 1,024-field row.
+            let encoded_fields = if matrix == 0 {
+                CARRYOPEN_WIDTH
+            } else {
+                CARRYOPEN_TENSOR_WIDTH
+            };
             let row_roots = matrix_values
                 .par_chunks_exact(CARRYOPEN_WIDTH)
                 .enumerate()
                 .map_init(
                     || {
                         (
-                            vec![Field192::ZERO; CARRYOPEN_WIDTH],
-                            vec![Field192::ZERO; CARRYOPEN_TENSOR_WIDTH],
-                            Vec::with_capacity(CARRYOPEN_TENSOR_WIDTH / 2),
+                            vec![Field192::ZERO; CARRYOPEN_WIDTH + encoded_fields],
+                            Vec::with_capacity(encoded_fields / 2),
                         )
                     },
-                    |(transformed, encoded, digest_scratch), (row_index, row)| {
+                    |(field_scratch, digest_scratch), (row_index, row)| {
+                        let (transformed, encoded) = field_scratch.split_at_mut(CARRYOPEN_WIDTH);
                         if matrix == 0 {
                             horizontal_row_root_with_systematic_subtree_scratch(
                                 row,
@@ -2089,6 +2097,65 @@ fn tensor_row_commitments_flat_staging(
             row_roots: roots.to_vec(),
             row_domain: CARRYOPEN_ROWS,
             zero_row_root: zeros[CARRYOPEN_TENSOR_WIDTH.trailing_zeros() as usize],
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn tensor_row_commitments_separate_scratch_for_benchmark(
+    vertical_codeword: &[Field192],
+    message_row_roots: &[Digest],
+    horizontal_spectra: &[Vec<Field192>],
+    zeros: &[Digest],
+) -> Vec<MatrixCommitment> {
+    assert_eq!(
+        vertical_codeword.len(),
+        CARRYOPEN_INVERSE_RATE * CARRYOPEN_FIELDS
+    );
+    assert_eq!(message_row_roots.len(), CARRYOPEN_ROWS);
+    vertical_codeword
+        .chunks_exact(CARRYOPEN_FIELDS)
+        .enumerate()
+        .map(|(matrix, matrix_values)| {
+            let row_roots = matrix_values
+                .par_chunks_exact(CARRYOPEN_WIDTH)
+                .enumerate()
+                .map_init(
+                    || {
+                        (
+                            vec![Field192::ZERO; CARRYOPEN_WIDTH],
+                            vec![Field192::ZERO; CARRYOPEN_TENSOR_WIDTH],
+                            Vec::with_capacity(CARRYOPEN_TENSOR_WIDTH / 2),
+                        )
+                    },
+                    |(transformed, encoded, digest_scratch), (row_index, row)| {
+                        if matrix == 0 {
+                            horizontal_row_root_with_systematic_subtree_scratch(
+                                row,
+                                message_row_roots[row_index],
+                                horizontal_spectra,
+                                transformed,
+                                encoded,
+                                digest_scratch,
+                            )
+                        } else {
+                            horizontal_encoded_row_root_with_scratch(
+                                row,
+                                horizontal_spectra,
+                                transformed,
+                                encoded,
+                                digest_scratch,
+                            )
+                        }
+                    },
+                )
+                .collect::<Vec<_>>();
+            MatrixCommitment {
+                root: combine_equal_subtrees(&row_roots),
+                row_roots,
+                row_domain: CARRYOPEN_ROWS,
+                zero_row_root: zeros[CARRYOPEN_TENSOR_WIDTH.trailing_zeros() as usize],
+            }
         })
         .collect()
 }
@@ -8823,6 +8890,76 @@ mod tests {
             matrix_second_time.as_secs_f64() * 1_000.0,
             flat_first_time.as_secs_f64() * 1_000.0,
             flat_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale coalesced versus separate folder scratch"]
+    fn coalesced_tensor_scratch_benchmarks_separate_allocations() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let (_, message_row_roots) =
+            exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
+        let vertical_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(10, component, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(11, component, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &message, &mut proof_codeword, &vertical_spectra, 64);
+
+        let mut coalesced_ms = Vec::with_capacity(4);
+        let mut separate_ms = Vec::with_capacity(4);
+        let mut expected: Option<Vec<(Digest, Vec<Digest>)>> = None;
+        for order in [[true, false, false, true], [false, true, true, false]] {
+            for coalesced in order {
+                let start = Instant::now();
+                let candidate = if coalesced {
+                    tensor_row_commitments(
+                        &proof_codeword,
+                        &message_row_roots,
+                        &horizontal_spectra,
+                        &zeros,
+                    )
+                } else {
+                    tensor_row_commitments_separate_scratch_for_benchmark(
+                        &proof_codeword,
+                        &message_row_roots,
+                        &horizontal_spectra,
+                        &zeros,
+                    )
+                };
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+                if let Some(expected) = &expected {
+                    assert_eq!(candidate.len(), expected.len());
+                    for (candidate, (expected_root, expected_rows)) in
+                        candidate.iter().zip(expected)
+                    {
+                        assert_eq!(candidate.root, *expected_root);
+                        assert_eq!(candidate.row_roots, *expected_rows);
+                    }
+                } else {
+                    expected = Some(
+                        candidate
+                            .iter()
+                            .map(|commitment| (commitment.root, commitment.row_roots.clone()))
+                            .collect(),
+                    );
+                }
+                if coalesced {
+                    coalesced_ms.push(elapsed_ms);
+                } else {
+                    separate_ms.push(elapsed_ms);
+                }
+            }
+        }
+        eprintln!(
+            "coalesced-tensor-scratch-ms={coalesced_ms:?} separate-scratch-ms={separate_ms:?}"
         );
     }
 
