@@ -30,9 +30,10 @@ use whir::{
 
 #[cfg(test)]
 use whir::lilac_merkle::{
-    combine_equal_subtrees_parallel_for_benchmark, prefix_root_materialized_blocks_for_benchmark,
-    prefix_root_materialized_leaves_for_benchmark, prefix_root_materialized_parents_for_benchmark,
-    prefix_root_scatter_for_benchmark, prefix_root_unfused_for_benchmark,
+    combine_equal_subtrees_parallel_for_benchmark, prefix_root_copied_parents_for_benchmark,
+    prefix_root_materialized_blocks_for_benchmark, prefix_root_materialized_leaves_for_benchmark,
+    prefix_root_materialized_parents_for_benchmark, prefix_root_scatter_for_benchmark,
+    prefix_root_unfused_for_benchmark,
 };
 
 #[derive(Debug, Parser)]
@@ -8301,6 +8302,58 @@ mod tests {
             transposed_second_time.as_secs_f64() * 1_000.0,
             scatter_first_time.as_secs_f64() * 1_000.0,
             scatter_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale borrowed versus copied parent-input benchmark"]
+    fn borrowed_parent_inputs_benchmark_copied_tensor_roots() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let (_, message_row_roots) =
+            exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
+        let vertical_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(0, component, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(1, component, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &message, &mut proof_codeword, &vertical_spectra, 64);
+        let run = |row_root: fn(&[Field192], usize, &[Digest]) -> Digest| {
+            let start = Instant::now();
+            let commitments = tensor_row_commitments_with_root(
+                &proof_codeword,
+                &message_row_roots,
+                &horizontal_spectra,
+                &zeros,
+                row_root,
+                combine_equal_subtrees,
+            );
+            (commitments, start.elapsed())
+        };
+
+        let (borrowed_first, borrowed_first_time) = run(prefix_root);
+        let (copied_first, copied_first_time) = run(prefix_root_copied_parents_for_benchmark);
+        let (copied_second, copied_second_time) = run(prefix_root_copied_parents_for_benchmark);
+        let (borrowed_second, borrowed_second_time) = run(prefix_root);
+        for candidate in [&copied_first, &copied_second, &borrowed_second] {
+            assert_eq!(candidate.len(), borrowed_first.len());
+            for (candidate, expected) in candidate.iter().zip(&borrowed_first) {
+                assert_eq!(candidate.root, expected.root);
+                assert_eq!(candidate.row_roots, expected.row_roots);
+            }
+        }
+        eprintln!(
+            "borrowed-parent-inputs={:.3}/{:.3} ms copied-parent-inputs={:.3}/{:.3} ms",
+            borrowed_first_time.as_secs_f64() * 1_000.0,
+            borrowed_second_time.as_secs_f64() * 1_000.0,
+            copied_first_time.as_secs_f64() * 1_000.0,
+            copied_second_time.as_secs_f64() * 1_000.0,
         );
     }
 

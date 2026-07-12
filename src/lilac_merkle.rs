@@ -874,6 +874,37 @@ fn reduce_exact_digests(scratch: &mut [Digest]) -> Digest {
         let batched8 = pairs / 8 * 8;
         for pair in (0..batched8).step_by(8) {
             let child = 2 * pair;
+            let roots = {
+                let children: &[Digest; 16] = scratch[child..child + 16].try_into().unwrap();
+                parent8(children)
+            };
+            scratch[pair..pair + 8].copy_from_slice(&roots);
+        }
+        let batched4 = batched8 + (pairs - batched8) / 4 * 4;
+        for pair in (batched8..batched4).step_by(4) {
+            let child = 2 * pair;
+            let roots = {
+                let children: &[Digest; 8] = scratch[child..child + 8].try_into().unwrap();
+                parent4(children)
+            };
+            scratch[pair..pair + 4].copy_from_slice(&roots);
+        }
+        for pair in batched4..pairs {
+            scratch[pair] = parent(scratch[2 * pair], scratch[2 * pair + 1]);
+        }
+        active = pairs;
+    }
+    scratch[0]
+}
+
+fn reduce_exact_digests_copied(scratch: &mut [Digest]) -> Digest {
+    assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
+    let mut active = scratch.len();
+    while active > 1 {
+        let pairs = active / 2;
+        let batched8 = pairs / 8 * 8;
+        for pair in (0..batched8).step_by(8) {
+            let child = 2 * pair;
             let children = std::array::from_fn(|index| scratch[child + index]);
             let roots = parent8(&children);
             scratch[pair..pair + 8].copy_from_slice(&roots);
@@ -881,16 +912,7 @@ fn reduce_exact_digests(scratch: &mut [Digest]) -> Digest {
         let batched4 = batched8 + (pairs - batched8) / 4 * 4;
         for pair in (batched8..batched4).step_by(4) {
             let child = 2 * pair;
-            let children = [
-                scratch[child],
-                scratch[child + 1],
-                scratch[child + 2],
-                scratch[child + 3],
-                scratch[child + 4],
-                scratch[child + 5],
-                scratch[child + 6],
-                scratch[child + 7],
-            ];
+            let children = std::array::from_fn(|index| scratch[child + index]);
             let roots = parent4(&children);
             scratch[pair..pair + 4].copy_from_slice(&roots);
         }
@@ -1135,6 +1157,26 @@ pub fn prefix_root_scatter_for_benchmark(
             scratch.clear();
             extend_field_level1_batched_scatter(values, &mut scratch);
             reduce_exact_digests_scatter(&mut scratch)
+        });
+    }
+    prefix_root(values, capacity, zeros)
+}
+
+/// Reproduce the pre-borrowed parent-input schedule for crossed artifact
+/// benchmarks. This is transcript-identical to [`prefix_root`].
+#[doc(hidden)]
+pub fn prefix_root_copied_parents_for_benchmark(
+    values: &[Field192],
+    capacity: usize,
+    zeros: &[Digest],
+) -> Digest {
+    assert!(values.len() <= capacity && capacity.is_power_of_two());
+    if values.len() == capacity && values.len() >= 16 {
+        return EXACT_ROOT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.clear();
+            extend_field_level1_batched(values, &mut scratch);
+            reduce_exact_digests_copied(&mut scratch)
         });
     }
     prefix_root(values, capacity, zeros)
@@ -1469,6 +1511,59 @@ mod tests {
                 prefix_root_scatter_for_benchmark(&values[..size], size, &zeros)
             );
         }
+    }
+
+    #[test]
+    fn borrowed_parent_inputs_match_copied_exact_root() {
+        let zeros = zero_roots(12);
+        let values = (0..4096)
+            .map(|index| Field192::from((31 * index + 17) as u64))
+            .collect::<Vec<_>>();
+        for size in [16, 64, 256, 1024, 4096] {
+            assert_eq!(
+                prefix_root(&values[..size], size, &zeros),
+                prefix_root_copied_parents_for_benchmark(&values[..size], size, &zeros)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "borrowed versus copied parent-input exact-root benchmark"]
+    fn borrowed_parent_inputs_benchmark_copied_exact_root() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let values = (0..1024_u64)
+            .map(|index| {
+                let seed = blake3::hash(&(index + 89).to_le_bytes());
+                Field192::from_le_bytes_mod_order(seed.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        let zeros = zero_roots(10);
+        assert_eq!(
+            prefix_root(&values, values.len(), &zeros),
+            prefix_root_copied_parents_for_benchmark(&values, values.len(), &zeros)
+        );
+        let iterations = 10_000;
+        let run = |root: fn(&[Field192], usize, &[Digest]) -> Digest| {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(root(black_box(&values), values.len(), &zeros));
+            }
+            start.elapsed()
+        };
+        let borrowed_first = run(prefix_root);
+        let copied_first = run(prefix_root_copied_parents_for_benchmark);
+        let copied_second = run(prefix_root_copied_parents_for_benchmark);
+        let borrowed_second = run(prefix_root);
+        eprintln!(
+            "exact_root_1024 iterations={} borrowed-parent-inputs={:.3}/{:.3} ms copied-parent-inputs={:.3}/{:.3} ms",
+            iterations,
+            borrowed_first.as_secs_f64() * 1_000.0,
+            borrowed_second.as_secs_f64() * 1_000.0,
+            copied_first.as_secs_f64() * 1_000.0,
+            copied_second.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]
