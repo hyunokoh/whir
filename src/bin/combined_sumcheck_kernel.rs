@@ -31,9 +31,10 @@ use whir::{
 #[cfg(test)]
 use whir::lilac_merkle::{
     combine_equal_subtrees_parallel_for_benchmark, prefix_root_copied_parents_for_benchmark,
-    prefix_root_materialized_blocks_for_benchmark, prefix_root_materialized_leaves_for_benchmark,
-    prefix_root_materialized_parents_for_benchmark, prefix_root_scatter_for_benchmark,
-    prefix_root_unfused_for_benchmark, scaled_prefix_root_sequential_for_benchmark,
+    prefix_root_materialized_blocks_for_benchmark, prefix_root_materialized_cv_for_benchmark,
+    prefix_root_materialized_leaves_for_benchmark, prefix_root_materialized_parents_for_benchmark,
+    prefix_root_scatter_for_benchmark, prefix_root_unfused_for_benchmark,
+    scaled_prefix_root_sequential_for_benchmark,
 };
 
 #[derive(Debug, Parser)]
@@ -8831,6 +8832,84 @@ mod tests {
             borrowed_second_time.as_secs_f64() * 1_000.0,
             copied_first_time.as_secs_f64() * 1_000.0,
             copied_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale register-resident versus materialized parent-CV benchmark"]
+    fn register_resident_parent_cv_benchmarks_materialized_tensor_roots() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let (_, message_row_roots) =
+            exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
+        let vertical_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(10, component, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(11, component, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &message, &mut proof_codeword, &vertical_spectra, 64);
+        let run = |row_root: fn(&[Field192], usize, &[Digest]) -> Digest| {
+            let start = Instant::now();
+            let commitments = tensor_row_commitments_with_root(
+                &proof_codeword,
+                &message_row_roots,
+                &horizontal_spectra,
+                &zeros,
+                row_root,
+                combine_equal_subtrees,
+            );
+            (commitments, start.elapsed())
+        };
+
+        let materialized_first_order =
+            std::env::var_os("LILAC_PARENT_CV_MATERIALIZED_FIRST").is_some();
+        let (
+            (packed_first, packed_first_time),
+            (materialized_first, materialized_first_time),
+            (materialized_second, materialized_second_time),
+            (packed_second, packed_second_time),
+        ) = if materialized_first_order {
+            let materialized_first = run(prefix_root_materialized_cv_for_benchmark);
+            let packed_first = run(prefix_root);
+            let packed_second = run(prefix_root);
+            let materialized_second = run(prefix_root_materialized_cv_for_benchmark);
+            (
+                packed_first,
+                materialized_first,
+                materialized_second,
+                packed_second,
+            )
+        } else {
+            let packed_first = run(prefix_root);
+            let materialized_first = run(prefix_root_materialized_cv_for_benchmark);
+            let materialized_second = run(prefix_root_materialized_cv_for_benchmark);
+            let packed_second = run(prefix_root);
+            (
+                packed_first,
+                materialized_first,
+                materialized_second,
+                packed_second,
+            )
+        };
+        for candidate in [&materialized_first, &materialized_second, &packed_second] {
+            assert_eq!(candidate.len(), packed_first.len());
+            for (candidate, expected) in candidate.iter().zip(&packed_first) {
+                assert_eq!(candidate.root, expected.root);
+                assert_eq!(candidate.row_roots, expected.row_roots);
+            }
+        }
+        eprintln!(
+            "materialized-first-order={materialized_first_order} register-resident-parent-cv={:.3}/{:.3} ms materialized-parent-cv={:.3}/{:.3} ms",
+            packed_first_time.as_secs_f64() * 1_000.0,
+            packed_second_time.as_secs_f64() * 1_000.0,
+            materialized_first_time.as_secs_f64() * 1_000.0,
+            materialized_second_time.as_secs_f64() * 1_000.0,
         );
     }
 

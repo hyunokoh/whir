@@ -217,17 +217,15 @@ mod neon4 {
     }
 
     #[inline(always)]
-    unsafe fn compress_message_state8(
-        cvs: &[[u32; 8]; 8],
+    unsafe fn compress_message_state8_packed(
+        cvs: &[Packed8; 8],
         message: &[Packed8; 16],
         block_len: u8,
         flags: u8,
     ) -> [Packed8; 16] {
         let zero = Packed8([vdupq_n_u32(0), vdupq_n_u32(0)]);
         let mut state = [zero; 16];
-        for word in 0..8 {
-            state[word] = unsafe { set8(std::array::from_fn(|lane| cvs[lane][word])) };
-        }
+        state[..8].copy_from_slice(cvs);
         for word in 0..4 {
             state[8 + word] = Packed8([vdupq_n_u32(BLAKE3_IV[word]), vdupq_n_u32(BLAKE3_IV[word])]);
         }
@@ -242,6 +240,19 @@ mod neon4 {
             unsafe { round8(&mut state, message, index) };
         }
         state
+    }
+
+    #[inline(always)]
+    unsafe fn compress_message_state8(
+        cvs: &[[u32; 8]; 8],
+        message: &[Packed8; 16],
+        block_len: u8,
+        flags: u8,
+    ) -> [Packed8; 16] {
+        let packed = std::array::from_fn(|word| unsafe {
+            set8(std::array::from_fn(|lane| cvs[lane][word]))
+        });
+        unsafe { compress_message_state8_packed(&packed, message, block_len, flags) }
     }
 
     #[inline(always)]
@@ -273,13 +284,13 @@ mod neon4 {
     }
 
     #[inline(always)]
-    unsafe fn compress_message_xof32_8<const TRANSPOSED_OUTPUT: bool>(
-        cvs: &[[u32; 8]; 8],
+    unsafe fn compress_message_xof32_8_packed<const TRANSPOSED_OUTPUT: bool>(
+        cvs: &[Packed8; 8],
         message: &[Packed8; 16],
         block_len: u8,
         flags: u8,
     ) -> [Digest; 8] {
-        let state = unsafe { compress_message_state8(cvs, message, block_len, flags) };
+        let state = unsafe { compress_message_state8_packed(cvs, message, block_len, flags) };
         let mut output = [[0_u8; 32]; 8];
         if TRANSPOSED_OUTPUT && cfg!(target_endian = "little") {
             let values = std::array::from_fn::<_, 8, _>(|word| unsafe {
@@ -319,6 +330,21 @@ mod neon4 {
             }
         }
         output
+    }
+
+    #[inline(always)]
+    unsafe fn compress_message_xof32_8<const TRANSPOSED_OUTPUT: bool>(
+        cvs: &[[u32; 8]; 8],
+        message: &[Packed8; 16],
+        block_len: u8,
+        flags: u8,
+    ) -> [Digest; 8] {
+        let packed = std::array::from_fn(|word| unsafe {
+            set8(std::array::from_fn(|lane| cvs[lane][word]))
+        });
+        unsafe {
+            compress_message_xof32_8_packed::<TRANSPOSED_OUTPUT>(&packed, message, block_len, flags)
+        }
     }
 
     #[inline(always)]
@@ -433,7 +459,7 @@ mod neon4 {
     /// Hash eight 83-byte nodes directly from their child digests, avoiding
     /// sixteen temporary 64-byte blocks and their subsequent word parsing.
     #[target_feature(enable = "neon")]
-    unsafe fn compress_parents8_impl<const TRANSPOSED_OUTPUT: bool>(
+    unsafe fn compress_parents8_impl<const TRANSPOSED_OUTPUT: bool, const MATERIALIZED_CV: bool>(
         children: &[Digest; 16],
     ) -> [Digest; 8] {
         let zero = Packed8([vdupq_n_u32(0), vdupq_n_u32(0)]);
@@ -472,14 +498,6 @@ mod neon4 {
             };
         }
 
-        let cvs = unsafe {
-            compress_message_cv32_8::<TRANSPOSED_OUTPUT>(
-                &[BLAKE3_IV; 8],
-                &first,
-                64,
-                super::BLAKE3_CHUNK_START,
-            )
-        };
         let mut final_block = [zero; 16];
         for (word, byte_offset) in (0..=3).zip((13..=25).step_by(4)) {
             final_block[word] = unsafe {
@@ -495,24 +513,52 @@ mod neon4 {
                     | (u32::from(children[2 * lane + 1][31]) << 16)
             }))
         };
-        unsafe {
-            compress_message_xof32_8::<TRANSPOSED_OUTPUT>(
-                &cvs,
-                &final_block,
-                19,
-                super::BLAKE3_CHUNK_END | super::BLAKE3_ROOT,
-            )
+        if MATERIALIZED_CV {
+            let cvs = unsafe {
+                compress_message_cv32_8::<TRANSPOSED_OUTPUT>(
+                    &[BLAKE3_IV; 8],
+                    &first,
+                    64,
+                    super::BLAKE3_CHUNK_START,
+                )
+            };
+            unsafe {
+                compress_message_xof32_8::<TRANSPOSED_OUTPUT>(
+                    &cvs,
+                    &final_block,
+                    19,
+                    super::BLAKE3_CHUNK_END | super::BLAKE3_ROOT,
+                )
+            }
+        } else {
+            let state = unsafe {
+                compress_message_state8(&[BLAKE3_IV; 8], &first, 64, super::BLAKE3_CHUNK_START)
+            };
+            let cvs = std::array::from_fn(|word| unsafe { xor8(state[word], state[word + 8]) });
+            unsafe {
+                compress_message_xof32_8_packed::<TRANSPOSED_OUTPUT>(
+                    &cvs,
+                    &final_block,
+                    19,
+                    super::BLAKE3_CHUNK_END | super::BLAKE3_ROOT,
+                )
+            }
         }
     }
 
     #[target_feature(enable = "neon")]
     pub unsafe fn compress_parents8(children: &[Digest; 16]) -> [Digest; 8] {
-        unsafe { compress_parents8_impl::<true>(children) }
+        unsafe { compress_parents8_impl::<true, false>(children) }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_parents8_materialized_cv(children: &[Digest; 16]) -> [Digest; 8] {
+        unsafe { compress_parents8_impl::<true, true>(children) }
     }
 
     #[target_feature(enable = "neon")]
     pub unsafe fn compress_parents8_scatter(children: &[Digest; 16]) -> [Digest; 8] {
-        unsafe { compress_parents8_impl::<false>(children) }
+        unsafe { compress_parents8_impl::<false, true>(children) }
     }
 
     #[target_feature(enable = "neon")]
@@ -826,6 +872,19 @@ fn parent8_scatter(children: &[Digest; 16]) -> [Digest; 8] {
     }
 }
 
+/// Reproduce the former AArch64 schedule that transposed the first-block
+/// chaining values to lane-major memory before gathering them for block two.
+fn parent8_materialized_cv(children: &[Digest; 16]) -> [Digest; 8] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { neon4::compress_parents8_materialized_cv(children) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        parent8_materialized_fixed_first_compression(children)
+    }
+}
+
 fn parent8_platform_first_compression(children: &[Digest; 16]) -> [Digest; 8] {
     let platform = blake3_platform();
     let blocks = std::array::from_fn::<_, 8, _>(|index| {
@@ -914,6 +973,37 @@ fn reduce_exact_digests_copied(scratch: &mut [Digest]) -> Digest {
             let child = 2 * pair;
             let children = std::array::from_fn(|index| scratch[child + index]);
             let roots = parent4(&children);
+            scratch[pair..pair + 4].copy_from_slice(&roots);
+        }
+        for pair in batched4..pairs {
+            scratch[pair] = parent(scratch[2 * pair], scratch[2 * pair + 1]);
+        }
+        active = pairs;
+    }
+    scratch[0]
+}
+
+fn reduce_exact_digests_materialized_cv(scratch: &mut [Digest]) -> Digest {
+    assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
+    let mut active = scratch.len();
+    while active > 1 {
+        let pairs = active / 2;
+        let batched8 = pairs / 8 * 8;
+        for pair in (0..batched8).step_by(8) {
+            let child = 2 * pair;
+            let roots = {
+                let children: &[Digest; 16] = scratch[child..child + 16].try_into().unwrap();
+                parent8_materialized_cv(children)
+            };
+            scratch[pair..pair + 8].copy_from_slice(&roots);
+        }
+        let batched4 = batched8 + (pairs - batched8) / 4 * 4;
+        for pair in (batched8..batched4).step_by(4) {
+            let child = 2 * pair;
+            let roots = {
+                let children: &[Digest; 8] = scratch[child..child + 8].try_into().unwrap();
+                parent4(children)
+            };
             scratch[pair..pair + 4].copy_from_slice(&roots);
         }
         for pair in batched4..pairs {
@@ -1177,6 +1267,27 @@ pub fn prefix_root_copied_parents_for_benchmark(
             scratch.clear();
             extend_field_level1_batched(values, &mut scratch);
             reduce_exact_digests_copied(&mut scratch)
+        });
+    }
+    prefix_root(values, capacity, zeros)
+}
+
+/// Reproduce the pre-register-resident chaining-value parent schedule for
+/// crossed artifact benchmarks. This is transcript-identical to
+/// [`prefix_root`].
+#[doc(hidden)]
+pub fn prefix_root_materialized_cv_for_benchmark(
+    values: &[Field192],
+    capacity: usize,
+    zeros: &[Digest],
+) -> Digest {
+    assert!(values.len() <= capacity && capacity.is_power_of_two());
+    if values.len() == capacity && values.len() >= 16 {
+        return EXACT_ROOT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.clear();
+            extend_field_level1_batched(values, &mut scratch);
+            reduce_exact_digests_materialized_cv(&mut scratch)
         });
     }
     prefix_root(values, capacity, zeros)
@@ -1896,7 +2007,46 @@ mod tests {
             let scalar =
                 std::array::from_fn(|index| parent(children[2 * index], children[2 * index + 1]));
             assert_eq!(batched, scalar);
+            assert_eq!(parent8_materialized_cv(&children), scalar);
         }
+    }
+
+    #[test]
+    #[ignore = "register-resident versus materialized chaining-value parent benchmark"]
+    fn register_resident_parent_cv_benchmarks_materialized_cv() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let seed_children = std::array::from_fn(|index| {
+            *blake3::hash(&(index as u64 + 0x4356).to_le_bytes()).as_bytes()
+        });
+        assert_eq!(
+            parent8(&seed_children),
+            parent8_materialized_cv(&seed_children)
+        );
+        let iterations = 1_000_000;
+        let run = |candidate: fn(&[Digest; 16]) -> [Digest; 8]| {
+            let mut children = seed_children;
+            let start = Instant::now();
+            for iteration in 0..iterations {
+                let roots = candidate(black_box(&children));
+                children[iteration & 15] = roots[iteration & 7];
+            }
+            black_box(children);
+            start.elapsed()
+        };
+
+        let packed_first = run(parent8);
+        let materialized_first = run(parent8_materialized_cv);
+        let materialized_second = run(parent8_materialized_cv);
+        let packed_second = run(parent8);
+        eprintln!(
+            "parent8-cv iterations={iterations} register-resident={:.3}/{:.3} ms materialized={:.3}/{:.3} ms",
+            packed_first.as_secs_f64() * 1_000.0,
+            packed_second.as_secs_f64() * 1_000.0,
+            materialized_first.as_secs_f64() * 1_000.0,
+            materialized_second.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]
