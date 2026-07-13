@@ -1465,6 +1465,12 @@ const STRONG_WIDTH: usize = 1 << 10;
 const STRONG_INVERSE_RATE: usize = 24;
 const STRONG_QUERIES: usize = 31;
 const STRONG_NEXT_BLOCKS: usize = STRONG_QUERIES + 1;
+// The sixth switch is already tiny.  Paying a lower rate here reduces both
+// authenticated rows and the explicit base while preserving the per-event
+// soundness margin: 0.024^25 < 0.05^31.
+const STRONG_FINAL_INVERSE_RATE: usize = 64;
+const STRONG_FINAL_QUERIES: usize = 25;
+const STRONG_FINAL_NEXT_BLOCKS: usize = STRONG_FINAL_QUERIES + 1;
 const STRONG_SOURCE_FIELDS: usize = STRONG_GROUP * STRONG_WIDTH;
 const STRONG_TERMINAL_FIELDS: usize = 2 * STRONG_NEXT_BLOCKS * STRONG_WIDTH;
 const STRONG_COMPONENTS: [(usize, usize); 1] = [(STRONG_SOURCE_FIELDS, STRONG_SOURCE_FIELDS)];
@@ -1492,13 +1498,49 @@ fn strong_level() -> Level {
 }
 
 fn strong_round_level(round: usize) -> Option<Level> {
-    let (group, width, components) = match round {
-        0 => (1 << 10, 1 << 10, &STRONG_COMPONENTS[..]),
-        1 => (1 << 8, 1 << 8, &STRONG1_COMPONENTS[..]),
-        2 => (1 << 7, 1 << 7, &STRONG2_COMPONENTS[..]),
-        3 => (1 << 7, 1 << 6, &STRONG3_COMPONENTS[..]),
-        4 => (1 << 7, 1 << 5, &STRONG4_COMPONENTS[..]),
-        5 => (1 << 7, 1 << 4, &STRONG5_COMPONENTS[..]),
+    let (group, width, components, inverse_rate, next_blocks) = match round {
+        0 => (
+            1 << 10,
+            1 << 10,
+            &STRONG_COMPONENTS[..],
+            STRONG_INVERSE_RATE,
+            STRONG_NEXT_BLOCKS,
+        ),
+        1 => (
+            1 << 8,
+            1 << 8,
+            &STRONG1_COMPONENTS[..],
+            STRONG_INVERSE_RATE,
+            STRONG_NEXT_BLOCKS,
+        ),
+        2 => (
+            1 << 7,
+            1 << 7,
+            &STRONG2_COMPONENTS[..],
+            STRONG_INVERSE_RATE,
+            STRONG_NEXT_BLOCKS,
+        ),
+        3 => (
+            1 << 7,
+            1 << 6,
+            &STRONG3_COMPONENTS[..],
+            STRONG_INVERSE_RATE,
+            STRONG_NEXT_BLOCKS,
+        ),
+        4 => (
+            1 << 7,
+            1 << 5,
+            &STRONG4_COMPONENTS[..],
+            STRONG_INVERSE_RATE,
+            STRONG_NEXT_BLOCKS,
+        ),
+        5 => (
+            1 << 7,
+            1 << 4,
+            &STRONG5_COMPONENTS[..],
+            STRONG_FINAL_INVERSE_RATE,
+            STRONG_FINAL_NEXT_BLOCKS,
+        ),
         _ => return None,
     };
     Some(Level {
@@ -1509,8 +1551,8 @@ fn strong_round_level(round: usize) -> Option<Level> {
         group,
         width,
         row_span: group,
-        inverse_rate: STRONG_INVERSE_RATE,
-        next_blocks: STRONG_NEXT_BLOCKS,
+        inverse_rate,
+        next_blocks,
     })
 }
 
@@ -3238,7 +3280,7 @@ fn audit_strong_terminal_restoration(
 ) -> bool {
     let terminal_fields = 2 * level.next_blocks * level.width;
     if terminal.len() != terminal_fields
-        || front.selected.len() != STRONG_QUERIES
+        || front.selected.len() != level.next_blocks - 1
         || standard_ood_block_root(level, terminal, zeros) != ood_block_root
         || derived_terminal_root_for_level(
             level_index,
@@ -3824,7 +3866,7 @@ fn run_strong_round(
     let (mut component_roots, proof_commitments) =
         level_commitment(level, &source, &codeword, generator_roots.as_ref(), &zeros);
     assert_eq!(
-        component_roots[STRONG_INVERSE_RATE - 1],
+        component_roots[level.inverse_rate - 1],
         expected_source_root
     );
     let index_oracle =
@@ -3833,12 +3875,12 @@ fn run_strong_round(
     component_roots.push(index_descriptor);
     let selected = selected_rows(
         relation_level,
-        STRONG_INVERSE_RATE * level.group,
-        STRONG_QUERIES,
+        level.inverse_rate * level.group,
+        level.next_blocks - 1,
         &component_roots,
     );
     let (selected_front, _, _) = selected_row_front(level, &proof_commitments, &selected);
-    let mut selected_values = Vec::with_capacity(2 * STRONG_QUERIES * level.width);
+    let mut selected_values = Vec::with_capacity(2 * (level.next_blocks - 1) * level.width);
     for row in &selected {
         let start = row * level.width;
         selected_values.extend_from_slice(&codeword[start..start + level.width]);
@@ -3850,20 +3892,20 @@ fn run_strong_round(
     let qa_tensor = prove_tensor_product_relation(
         index_oracle,
         codeword,
-        STRONG_INVERSE_RATE * level.group,
+        level.inverse_rate * level.group,
         level.width,
         local_relation_roots(b"strong-QA-membership", relation_level, &component_roots),
     );
     assert_eq!(qa_tensor.proof.claimed_sum, Field192::ZERO);
-    let mut terminal_source = Vec::with_capacity(2 * STRONG_NEXT_BLOCKS * level.width);
+    let mut terminal_source = Vec::with_capacity(2 * level.next_blocks * level.width);
     terminal_source.extend_from_slice(&qa_tensor.right_ood_row);
     terminal_source.extend_from_slice(&qa_tensor.left_ood_row);
     terminal_source.extend_from_slice(&selected_values);
-    let expected_terminal_fields = 2 * STRONG_NEXT_BLOCKS * level.width;
+    let expected_terminal_fields = 2 * level.next_blocks * level.width;
     assert_eq!(terminal_source.len(), expected_terminal_fields);
     let ood_block_root = standard_ood_block_root(level, &terminal_source, &zeros);
     let terminal_capacity = strong_round_level(round + 1).map_or_else(
-        || (2 * STRONG_NEXT_BLOCKS * level.group).next_power_of_two(),
+        || (2 * level.next_blocks * level.group).next_power_of_two(),
         Level::view_capacity,
     );
     let terminal_source_root = derived_terminal_root_for_level(
@@ -7134,7 +7176,7 @@ impl StrongTerminalProof {
         let zeros = zero_roots(30);
         let mut tail_roots = self.component_roots.clone();
         tail_roots.push(self.terminal_source_root);
-        self.component_roots.len() == 2 * STRONG_INVERSE_RATE + 1
+        self.component_roots.len() == 2 * level.inverse_rate + 1
             && self
                 .selected_front
                 .verify(12, level, &self.component_roots, level.group, &zeros)
@@ -7298,7 +7340,8 @@ impl StrongTransitionCore {
     }
 
     fn source_root(&self) -> Option<Digest> {
-        self.component_roots.get(STRONG_INVERSE_RATE - 1).copied()
+        let level = self.level()?;
+        self.component_roots.get(level.inverse_rate - 1).copied()
     }
 
     fn terminal_capacity(&self) -> Option<usize> {
@@ -7314,7 +7357,7 @@ impl StrongTransitionCore {
             return false;
         };
         let relation_level = 12 + self.round;
-        self.component_roots.len() == 2 * STRONG_INVERSE_RATE + 1
+        self.component_roots.len() == 2 * level.inverse_rate + 1
             && self.selected_front.verify(
                 relation_level,
                 level,
@@ -7325,12 +7368,12 @@ impl StrongTransitionCore {
             && self.selected_front.selected
                 == selected_rows(
                     relation_level,
-                    STRONG_INVERSE_RATE * level.group,
-                    STRONG_QUERIES,
+                    level.inverse_rate * level.group,
+                    level.next_blocks - 1,
                     &self.component_roots,
                 )
             && self.membership.fields
-                == (STRONG_INVERSE_RATE * level.group).next_power_of_two()
+                == (level.inverse_rate * level.group).next_power_of_two()
                     * level.width.next_power_of_two()
             && self.membership.claimed_sum == Field192::ZERO
             && self.membership.roots
@@ -7361,7 +7404,8 @@ impl StrongTransitionCore {
     fn serialize_unchecked(&self) -> Vec<u8> {
         let front = self.selected_front.serialize();
         let membership = self.membership.serialize();
-        let wire_roots = &self.component_roots[STRONG_INVERSE_RATE - 1..];
+        let level = self.level().expect("strong transition level must exist");
+        let wire_roots = &self.component_roots[level.inverse_rate - 1..];
         let mut output =
             Vec::with_capacity(32 + wire_roots.len() * 32 + 64 + front.len() + membership.len());
         output.extend_from_slice(Self::MAGIC);
@@ -7401,7 +7445,7 @@ impl StrongTransitionCore {
             .collect::<Option<Vec<_>>>()?;
         let round = values[0];
         let level = strong_round_level(round)?;
-        if values[1] != STRONG_INVERSE_RATE + 2
+        if values[1] != level.inverse_rate + 2
             || values[4] != 0
             || values[5] != 0
             || payload.len() != HEADER + values[1] * 32 + 64 + values[2] + values[3]
@@ -9458,12 +9502,10 @@ fn main() {
                 CARRYOPEN_TERMINAL_FIELDS
             );
                 println!(
-                "- strong late switch: systematic QA rate 1/{}, finite-length distance target 0.95, q={}, source/terminal fields {}/{}",
-                STRONG_INVERSE_RATE,
-                STRONG_QUERIES,
-                STRONG_SOURCE_FIELDS,
-                STRONG_TERMINAL_FIELDS
-            );
+                    "- strong late-switch schedule: five rate-1/{STRONG_INVERSE_RATE}, distance-0.95, q={STRONG_QUERIES} rounds; final rate-1/{STRONG_FINAL_INVERSE_RATE}, distance-0.976, q={STRONG_FINAL_QUERIES} round; source/final-private fields {}/{}",
+                    STRONG_SOURCE_FIELDS,
+                    STRONG_FINAL_NEXT_BLOCKS * strong_round_level(STRONG_ROUNDS - 1).unwrap().width,
+                );
                 println!(
                     "- strong switch encode+commit/algebra/terminal median: {:.3}/{:.3}/{:.3} ms",
                     percentile(&strong_encode_ms, 0.5),
@@ -10167,9 +10209,9 @@ mod tests {
 
     #[test]
     fn fixed_generator_preprocessing_matches_direct_spectra() {
-        assert_eq!(canonical_fixed_generator_fields(), 252_928);
-        assert_eq!(canonical_fixed_generator_root_count(), 150);
-        assert_eq!(canonical_fixed_generator_bytes(), 6_075_072);
+        assert_eq!(canonical_fixed_generator_fields(), 258_048);
+        assert_eq!(canonical_fixed_generator_root_count(), 190);
+        assert_eq!(canonical_fixed_generator_bytes(), 6_199_232);
         let zeros = zero_roots(30);
         for (level_index, level) in LEVELS
             .iter()
@@ -11452,6 +11494,127 @@ mod tests {
             median(&spare_ms),
             mean(&initialized_ms),
             mean(&spare_ms),
+        );
+    }
+
+    #[test]
+    #[ignore = "final strong rate-1/64 q=25 versus uniform rate-1/24 q=31 crossed A/B"]
+    fn final_strong_rate_switch_benchmarks_uniform_schedule() {
+        let candidate = strong_round_level(STRONG_ROUNDS - 1).unwrap();
+        let baseline = Level {
+            inverse_rate: STRONG_INVERSE_RATE,
+            next_blocks: STRONG_NEXT_BLOCKS,
+            ..candidate
+        };
+        let relation_level = 12 + STRONG_ROUNDS - 1;
+        let zeros = zero_roots(30);
+        let source = (0..candidate.raw)
+            .map(|index| semantic_value(relation_level, index))
+            .collect::<Vec<_>>();
+        let source_root = splice_root(candidate, &source, &zeros);
+        let run = |level: Level| {
+            let start = Instant::now();
+            let spectra = fixed_generator_spectra(relation_level, level);
+            let generator_roots = fixed_generator_roots(relation_level, level);
+            let codeword = encode_full_systematic_codeword(level, &source, spectra.as_ref(), 64);
+            let (mut component_roots, commitments) =
+                level_commitment(level, &source, &codeword, generator_roots.as_ref(), &zeros);
+            assert_eq!(component_roots[level.inverse_rate - 1], source_root);
+            let index_oracle =
+                materialize_index_oracle(relation_level, level, spectra.as_ref(), &component_roots);
+            component_roots.push(virtual_index_descriptor(
+                relation_level,
+                level,
+                &component_roots,
+            ));
+            let selected = selected_rows(
+                relation_level,
+                level.inverse_rate * level.group,
+                level.next_blocks - 1,
+                &component_roots,
+            );
+            let (front, _, _) = selected_row_front(level, &commitments, &selected);
+            let mut selected_values = Vec::with_capacity(2 * selected.len() * level.width);
+            for row in &selected {
+                let row_start = row * level.width;
+                selected_values.extend_from_slice(&codeword[row_start..row_start + level.width]);
+                selected_values
+                    .extend_from_slice(&index_oracle[row_start..row_start + level.width]);
+            }
+            let qa = prove_tensor_product_relation(
+                index_oracle,
+                codeword,
+                level.inverse_rate * level.group,
+                level.width,
+                local_relation_roots(b"strong-QA-membership", relation_level, &component_roots),
+            );
+            assert_eq!(qa.proof.claimed_sum, Field192::ZERO);
+            let mut terminal = Vec::with_capacity(2 * level.next_blocks * level.width);
+            terminal.extend_from_slice(&qa.right_ood_row);
+            terminal.extend_from_slice(&qa.left_ood_row);
+            terminal.extend_from_slice(&selected_values);
+            let ood_root = standard_ood_block_root(level, &terminal, &zeros);
+            let terminal_root = derived_terminal_root_for_level(
+                relation_level,
+                level,
+                &component_roots,
+                &front,
+                ood_root,
+                (2 * level.next_blocks * level.group).next_power_of_two(),
+                &zeros,
+            )
+            .unwrap();
+            let fingerprint = (
+                terminal_root,
+                front.serialize().len(),
+                qa.proof.serialize().len(),
+                terminal.len(),
+            );
+            (
+                std::hint::black_box(fingerprint),
+                start.elapsed().as_secs_f64() * 1_000.0,
+            )
+        };
+
+        let baseline_expected = run(baseline).0;
+        let candidate_expected = run(candidate).0;
+        let mut baseline_ms = Vec::with_capacity(16);
+        let mut candidate_ms = Vec::with_capacity(16);
+        for trial in 0..8 {
+            let order = if trial % 2 == 0 {
+                [false, true, true, false]
+            } else {
+                [true, false, false, true]
+            };
+            for use_candidate in order {
+                let (fingerprint, elapsed) = run(if use_candidate { candidate } else { baseline });
+                if use_candidate {
+                    assert_eq!(fingerprint, candidate_expected);
+                    candidate_ms.push(elapsed);
+                } else {
+                    assert_eq!(fingerprint, baseline_expected);
+                    baseline_ms.push(elapsed);
+                }
+            }
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        let mean = |samples: &[f64]| samples.iter().sum::<f64>() / samples.len() as f64;
+        eprintln!(
+            "final-strong-rate baseline-ms={baseline_ms:?} candidate-ms={candidate_ms:?} baseline-median={:.3} candidate-median={:.3} baseline-mean={:.3} candidate-mean={:.3} baseline-front/membership/terminal={}/{}/{} candidate-front/membership/terminal={}/{}/{}",
+            median(&baseline_ms),
+            median(&candidate_ms),
+            mean(&baseline_ms),
+            mean(&candidate_ms),
+            baseline_expected.1,
+            baseline_expected.2,
+            baseline_expected.3,
+            candidate_expected.1,
+            candidate_expected.2,
+            candidate_expected.3,
         );
     }
 
@@ -14024,12 +14187,12 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 298_404);
+        assert_eq!(payload.len(), 296_412);
 
         let breakdown = proof.byte_breakdown(payload.len());
         assert_eq!(breakdown.total, payload.len());
-        assert_eq!(breakdown.base_total, 12_300);
-        assert_eq!(breakdown.terminal_witness, 12_288);
+        assert_eq!(breakdown.base_total, 9_996);
+        assert_eq!(breakdown.terminal_witness, 9_984);
         assert_eq!(breakdown.terminal_pcs, 0);
 
         let mut changed_base = proof.clone();
@@ -14155,7 +14318,7 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 298_404);
+        assert_eq!(payload.len(), 296_412);
 
         let mut fronts = Vec::<(&SelectedRowFront, Level, &[Digest])>::with_capacity(11);
         fronts.push((
@@ -14225,7 +14388,7 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 298_404);
+        assert_eq!(payload.len(), 296_412);
 
         clear_fixed_generator_spectra_cache();
         let preprocessing_start = Instant::now();
@@ -14471,7 +14634,7 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 298_404);
+        assert_eq!(payload.len(), 296_412);
 
         let strong_sizes = proof
             .strong
@@ -14479,11 +14642,11 @@ mod tests {
             .map(|core| 4 + core.serialize_unchecked().len())
             .collect::<Vec<_>>();
         let current_base = proof.base.serialize_unchecked().len();
-        let brakedown_distance = 0.95_f64;
-        let brakedown_target_bits = 131.162_f64;
+        let brakedown_distance = 0.976_f64;
+        let brakedown_target_bits = 131.228_f64;
         let brakedown_columns =
             (brakedown_target_bits / -(1.0 - brakedown_distance / 3.0).log2()).ceil() as usize;
-        assert_eq!(brakedown_columns, 239);
+        assert_eq!(brakedown_columns, 232);
         eprintln!("strong-core-framed-bytes={strong_sizes:?}");
         eprintln!(
             "brakedown-equal-security-target={brakedown_target_bits:.3} bits distance={brakedown_distance:.2} columns={brakedown_columns}"
@@ -14537,15 +14700,15 @@ mod tests {
             payload.len(),
             digest.to_hex()
         );
-        assert_eq!(payload.len(), 298_404);
-        assert_eq!(canonical_fixed_generator_root_count(), 150);
-        assert_eq!(payload.len() + 150 * 32, 303_204);
+        assert_eq!(payload.len(), 296_412);
+        assert_eq!(canonical_fixed_generator_root_count(), 190);
+        assert_eq!(payload.len() + 190 * 32, 302_492);
         let restored = RecursiveStrongEndToEndProof::deserialize(&payload)
             .expect("public-index roots must reconstruct a valid logical proof");
         assert_eq!(restored, proof);
         assert_eq!(
             digest.as_bytes(),
-            &hex::decode("482849d734c858837ae4e3c68eafecaca281bb9c3d982fa18b429eb0a2adf594")
+            &hex::decode("e0feaa1c11bcb141b8122e413f6d113a4920ac7fb7c8b9fecd5ff0edcbdb459b")
                 .unwrap()[..]
         );
     }
