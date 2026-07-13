@@ -1721,6 +1721,98 @@ fn evaluate_power_of_two_message_direct_first_round_in_spare(
     fold_message_at_point(initialized, &point[1..])
 }
 
+fn fold_two_messages_at_points(
+    first: &mut [Field192],
+    second: &mut [Field192],
+    first_point: &[Field192],
+    second_point: &[Field192],
+) -> (Field192, Field192) {
+    assert_eq!(first.len(), second.len());
+    assert_eq!(first_point.len(), second_point.len());
+    assert_eq!(first.len(), 1_usize << first_point.len());
+    let mut active = first.len();
+    for (first_challenge, second_challenge) in first_point.iter().zip(second_point) {
+        let half = active / 2;
+        let (first_low, first_high) = first[..active].split_at_mut(half);
+        let (second_low, second_high) = second[..active].split_at_mut(half);
+        first_low
+            .par_iter_mut()
+            .zip(first_high.par_iter())
+            .zip(second_low.par_iter_mut().zip(second_high.par_iter()))
+            .for_each(|((first_low, first_high), (second_low, second_high))| {
+                *first_low += (*first_high - *first_low) * first_challenge;
+                *second_low += (*second_high - *second_low) * second_challenge;
+            });
+        active = half;
+    }
+    assert_eq!(active, 1);
+    (first[0], second[0])
+}
+
+fn evaluate_two_messages_direct_first_round_in_spare(
+    message: &[Field192],
+    first_point: &[Field192],
+    second_point: &[Field192],
+    scratch: &mut [MaybeUninit<Field192>],
+) -> (Field192, Field192) {
+    assert!(!first_point.is_empty() && first_point.len() == second_point.len());
+    assert_eq!(message.len(), scratch.len());
+    assert_eq!(message.len(), 1_usize << first_point.len());
+    let half = message.len() / 2;
+    let (low, high) = message.split_at(half);
+    let (first_scratch, second_scratch) = scratch.split_at_mut(half);
+    // Both points share the only full-message scan.  Their first folds occupy
+    // disjoint halves, and every later fold shares one Rayon traversal too.
+    first_scratch
+        .par_iter_mut()
+        .zip(second_scratch.par_iter_mut())
+        .zip(low.par_iter().zip(high.par_iter()))
+        .for_each(|((first_output, second_output), (low, high))| {
+            let delta = *high - *low;
+            first_output.write(*low + delta * first_point[0]);
+            second_output.write(*low + delta * second_point[0]);
+        });
+    // SAFETY: the parallel loop initialized both disjoint scratch halves.
+    let first = unsafe {
+        std::slice::from_raw_parts_mut(first_scratch.as_mut_ptr().cast::<Field192>(), half)
+    };
+    let second = unsafe {
+        std::slice::from_raw_parts_mut(second_scratch.as_mut_ptr().cast::<Field192>(), half)
+    };
+    fold_two_messages_at_points(first, second, &first_point[1..], &second_point[1..])
+}
+
+fn evaluate_precarry_claims_paired(
+    message: &[Field192],
+    points: &[Vec<Field192>],
+    scratch: &mut [MaybeUninit<Field192>],
+) -> Vec<Field192> {
+    assert!(points.len().is_multiple_of(2));
+    points
+        .chunks_exact(2)
+        .flat_map(|pair| {
+            let (first, second) = evaluate_two_messages_direct_first_round_in_spare(
+                message, &pair[0], &pair[1], scratch,
+            );
+            [first, second]
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn evaluate_precarry_claims_independently(
+    message: &[Field192],
+    points: &[Vec<Field192>],
+    scratch: &mut [MaybeUninit<Field192>],
+) -> Vec<Field192> {
+    points
+        .iter()
+        .map(|point| {
+            evaluate_power_of_two_message_direct_first_round_in_spare(message, point, scratch)
+        })
+        .collect()
+}
+
 fn fold_message_at_point(scratch: &mut [Field192], point: &[Field192]) -> Field192 {
     assert_eq!(scratch.len(), 1_usize << point.len());
     let mut active = scratch.len();
@@ -2221,6 +2313,18 @@ fn build_production_precarry_in_codeword_folded_left(
     codeword: &mut Vec<Field192>,
     commitment_root: Digest,
 ) -> ProductionPreCarryProof {
+    build_production_precarry_in_codeword_folded_left_with_claim_mode(
+        codeword,
+        commitment_root,
+        true,
+    )
+}
+
+fn build_production_precarry_in_codeword_folded_left_with_claim_mode(
+    codeword: &mut Vec<Field192>,
+    commitment_root: Digest,
+    paired_claims: bool,
+) -> ProductionPreCarryProof {
     assert_eq!(codeword.len(), CARRYOPEN_FIELDS);
     assert!(codeword.capacity() >= 4 * CARRYOPEN_FIELDS);
     let points = precarry_opening_points(&commitment_root, 16);
@@ -2233,16 +2337,20 @@ fn build_production_precarry_in_codeword_folded_left(
         // spare borrow begins after it; sufficient reserved capacity prevents
         // reallocation while both views are live.
         let message = unsafe { std::slice::from_raw_parts(message_pointer, CARRYOPEN_FIELDS) };
-        let claims = points
-            .iter()
-            .map(|point| {
-                evaluate_power_of_two_message_direct_first_round_in_spare(
-                    message,
-                    point,
-                    combined_spare,
-                )
-            })
-            .collect::<Vec<_>>();
+        let claims = if paired_claims {
+            evaluate_precarry_claims_paired(message, &points, combined_spare)
+        } else {
+            points
+                .iter()
+                .map(|point| {
+                    evaluate_power_of_two_message_direct_first_round_in_spare(
+                        message,
+                        point,
+                        combined_spare,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         let statement = precarry_statement_root(&commitment_root, &points, &claims);
         let coefficients = precarry_coefficients(&statement, claims.len());
         let claimed = claims
@@ -10615,7 +10723,108 @@ mod tests {
                 &message, &point, &mut spare,
             );
             assert_eq!(spare_actual, expected);
+            let second_point = (0..variables)
+                .map(|index| {
+                    fixed_challenge(b"paired-direct-first-evaluation-round", variables, index)
+                })
+                .collect::<Vec<_>>();
+            let mut second_scratch = vec![Field192::ZERO; fields];
+            let second_expected = evaluate_power_of_two_message_with_scratch(
+                &message,
+                &second_point,
+                &mut second_scratch,
+            );
+            let mut paired_spare = vec![MaybeUninit::<Field192>::uninit(); fields];
+            assert_eq!(
+                evaluate_two_messages_direct_first_round_in_spare(
+                    &message,
+                    &point,
+                    &second_point,
+                    &mut paired_spare,
+                ),
+                (expected, second_expected),
+            );
         }
+    }
+
+    #[test]
+    #[ignore = "production fused-pair pre-Carry claim evaluation crossed benchmark"]
+    fn paired_precarry_claims_benchmark_independent_evaluations() {
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let points = precarry_opening_points(&[61_u8; 32], 16);
+        let mut scratch = vec![MaybeUninit::<Field192>::uninit(); CARRYOPEN_FIELDS];
+        let expected = evaluate_precarry_claims_independently(&message, &points, &mut scratch);
+        assert_eq!(
+            evaluate_precarry_claims_paired(&message, &points, &mut scratch),
+            expected,
+        );
+        let run = |paired: bool, scratch: &mut [MaybeUninit<Field192>]| {
+            let start = Instant::now();
+            let claims = if paired {
+                evaluate_precarry_claims_paired(&message, &points, scratch)
+            } else {
+                evaluate_precarry_claims_independently(&message, &points, scratch)
+            };
+            let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+            assert_eq!(claims, expected);
+            elapsed
+        };
+        let mut independent_ms = Vec::with_capacity(16);
+        let mut paired_ms = Vec::with_capacity(16);
+        let mut midpoint_wins = 0_usize;
+        for trial in 0..8 {
+            let order = if trial % 2 == 0 {
+                [false, true, true, false]
+            } else {
+                [true, false, false, true]
+            };
+            let mut independent = Vec::with_capacity(2);
+            let mut paired = Vec::with_capacity(2);
+            for use_pair in order {
+                let elapsed = run(use_pair, &mut scratch);
+                if use_pair {
+                    paired_ms.push(elapsed);
+                    paired.push(elapsed);
+                } else {
+                    independent_ms.push(elapsed);
+                    independent.push(elapsed);
+                }
+            }
+            let independent_midpoint = (independent[0] + independent[1]) / 2.0;
+            let paired_midpoint = (paired[0] + paired[1]) / 2.0;
+            midpoint_wins += usize::from(paired_midpoint < independent_midpoint);
+            eprintln!(
+                "fused-pair-claims trial={} independent={:.3}/{:.3} ms paired={:.3}/{:.3} ms midpoint={independent_midpoint:.3}/{paired_midpoint:.3} ms",
+                trial + 1,
+                independent[0],
+                independent[1],
+                paired[0],
+                paired[1],
+            );
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        let mean = |samples: &[f64]| samples.iter().sum::<f64>() / samples.len() as f64;
+        let trim_two = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[2..sorted.len() - 2].iter().sum::<f64>() / (sorted.len() - 4) as f64
+        };
+        eprintln!(
+            "fused-pair-claims independent-ms={independent_ms:?} paired-ms={paired_ms:?} independent-median={:.3} paired-median={:.3} independent-mean={:.3} paired-mean={:.3} independent-trim2={:.3} paired-trim2={:.3} midpoint-wins={midpoint_wins}/8",
+            median(&independent_ms),
+            median(&paired_ms),
+            mean(&independent_ms),
+            mean(&paired_ms),
+            trim_two(&independent_ms),
+            trim_two(&paired_ms),
+        );
     }
 
     #[test]
@@ -14054,6 +14263,101 @@ mod tests {
             median(&copied_ms),
             mean(&folded_ms),
             mean(&copied_ms),
+        );
+    }
+
+    #[test]
+    #[ignore = "production fused-pair versus independent pre-Carry claims full-stage A/B"]
+    fn paired_precarry_claims_benchmark_full_precarry() {
+        let mut codeword = Vec::with_capacity(4 * CARRYOPEN_FIELDS);
+        codeword.resize(CARRYOPEN_FIELDS, Field192::ZERO);
+        codeword
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, value)| *value = precarry_message_value(index));
+        let commitment_root = prefix_root(
+            &codeword,
+            CARRYOPEN_FIELDS,
+            &zero_roots(CARRYOPEN_FIELDS.trailing_zeros() as usize),
+        );
+        let expected = build_production_precarry_in_codeword_folded_left_with_claim_mode(
+            &mut codeword,
+            commitment_root,
+            false,
+        );
+        assert_eq!(codeword.len(), CARRYOPEN_FIELDS);
+        assert_eq!(
+            build_production_precarry_in_codeword_folded_left_with_claim_mode(
+                &mut codeword,
+                commitment_root,
+                true,
+            ),
+            expected,
+        );
+        let run = |paired: bool, codeword: &mut Vec<Field192>| {
+            let start = Instant::now();
+            let proof = build_production_precarry_in_codeword_folded_left_with_claim_mode(
+                codeword,
+                commitment_root,
+                paired,
+            );
+            let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+            assert_eq!(proof, expected);
+            assert_eq!(codeword.len(), CARRYOPEN_FIELDS);
+            elapsed
+        };
+        let mut independent_ms = Vec::with_capacity(16);
+        let mut paired_ms = Vec::with_capacity(16);
+        let mut midpoint_wins = 0_usize;
+        for trial in 0..8 {
+            let order = if trial % 2 == 0 {
+                [false, true, true, false]
+            } else {
+                [true, false, false, true]
+            };
+            let mut independent = Vec::with_capacity(2);
+            let mut paired = Vec::with_capacity(2);
+            for use_pair in order {
+                let elapsed = run(use_pair, &mut codeword);
+                if use_pair {
+                    paired_ms.push(elapsed);
+                    paired.push(elapsed);
+                } else {
+                    independent_ms.push(elapsed);
+                    independent.push(elapsed);
+                }
+            }
+            let independent_midpoint = (independent[0] + independent[1]) / 2.0;
+            let paired_midpoint = (paired[0] + paired[1]) / 2.0;
+            midpoint_wins += usize::from(paired_midpoint < independent_midpoint);
+            eprintln!(
+                "fused-pair-full trial={} independent={:.3}/{:.3} ms paired={:.3}/{:.3} ms midpoint={independent_midpoint:.3}/{paired_midpoint:.3} ms",
+                trial + 1,
+                independent[0],
+                independent[1],
+                paired[0],
+                paired[1],
+            );
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        let mean = |samples: &[f64]| samples.iter().sum::<f64>() / samples.len() as f64;
+        let trim_two = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[2..sorted.len() - 2].iter().sum::<f64>() / (sorted.len() - 4) as f64
+        };
+        eprintln!(
+            "fused-pair-full independent-ms={independent_ms:?} paired-ms={paired_ms:?} independent-median={:.3} paired-median={:.3} independent-mean={:.3} paired-mean={:.3} independent-trim2={:.3} paired-trim2={:.3} midpoint-wins={midpoint_wins}/8",
+            median(&independent_ms),
+            median(&paired_ms),
+            mean(&independent_ms),
+            mean(&paired_ms),
+            trim_two(&independent_ms),
+            trim_two(&paired_ms),
         );
     }
 
