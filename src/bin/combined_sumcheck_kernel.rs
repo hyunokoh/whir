@@ -8177,14 +8177,6 @@ impl RecursiveStrongEndToEndProof {
         {
             return false;
         }
-        if !self
-            .strong
-            .par_iter()
-            .enumerate()
-            .all(|(round, proof)| proof.round == round && proof.verify())
-        {
-            return false;
-        }
         if self
             .strong
             .windows(2)
@@ -8192,7 +8184,51 @@ impl RecursiveStrongEndToEndProof {
         {
             return false;
         }
-        self.base.verify(self.strong.last().unwrap())
+        let ((strong_valid, base_valid), (carry_valid, certificate_valid)) = rayon::join(
+            || {
+                rayon::join(
+                    || {
+                        self.strong
+                            .par_iter()
+                            .enumerate()
+                            .all(|(round, proof)| proof.round == round && proof.verify())
+                    },
+                    || self.base.verify(self.strong.last().unwrap()),
+                )
+            },
+            || {
+                rayon::join(
+                    || self.carryopen.verify(self.carryopen.terminal_source_root),
+                    || verify_certificate_core(&self.certificate, certificate_root),
+                )
+            },
+        );
+        strong_valid && base_valid && carry_valid && certificate_valid
+    }
+
+    #[cfg(test)]
+    fn verify_sequential_components_for_benchmark(&self) -> bool {
+        if self.strong.len() != STRONG_ROUNDS || self.certificate.len() != LEVELS.len() {
+            return false;
+        }
+        let certificate_root = self.certificate.last().unwrap().next_source_root;
+        if self.strong[0].source_root()
+            != Some(parent(
+                certificate_root,
+                self.carryopen.terminal_source_root,
+            ))
+            || self
+                .strong
+                .windows(2)
+                .any(|pair| pair[1].source_root() != Some(pair[0].terminal_source_root))
+        {
+            return false;
+        }
+        self.strong
+            .par_iter()
+            .enumerate()
+            .all(|(round, proof)| proof.round == round && proof.verify())
+            && self.base.verify(self.strong.last().unwrap())
             && self.carryopen.verify(self.carryopen.terminal_source_root)
             && verify_certificate_core(&self.certificate, certificate_root)
     }
@@ -14701,6 +14737,106 @@ mod tests {
             redundant_first_time.as_secs_f64() * 1_000.0,
             redundant_second_time.as_secs_f64() * 1_000.0,
             payload.len(),
+        );
+    }
+
+    #[test]
+    #[ignore = "production sequential versus top-level parallel canonical semantic verifier"]
+    fn canonical_verifier_benchmarks_parallel_components() {
+        let carry = run_production_carryopen(1, false);
+        let certificate = run_semantic_certificate_only(64, false);
+        let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
+        let payload = proof.serialize();
+        assert_eq!(payload.len(), 296_112);
+        preprocess_canonical_fixed_generators();
+
+        let parallel_verify = || proof.verify();
+        clear_virtual_index_factor_cache();
+        assert!(proof.verify_sequential_components_for_benchmark());
+        clear_virtual_index_factor_cache();
+        assert!(parallel_verify());
+        let mut mutations = Vec::with_capacity(4);
+        let mut changed = proof.clone();
+        changed.base.private_f_rows[0] += Field192::ONE;
+        mutations.push(changed);
+        let mut changed = proof.clone();
+        changed.carryopen.component_roots[CARRYOPEN_INVERSE_RATE][0] ^= 1;
+        mutations.push(changed);
+        let mut changed = proof.clone();
+        changed.certificate[0].component_roots[LEVELS[0].inverse_rate][0] ^= 1;
+        mutations.push(changed);
+        let mut changed = proof.clone();
+        changed.strong[1].terminal_source_root[0] ^= 1;
+        mutations.push(changed);
+        for changed in &mutations {
+            clear_virtual_index_factor_cache();
+            let sequential = changed.verify_sequential_components_for_benchmark();
+            clear_virtual_index_factor_cache();
+            let parallel = changed.verify();
+            assert_eq!(parallel, sequential);
+            assert!(!parallel);
+        }
+
+        let mut sequential_ms = Vec::with_capacity(16);
+        let mut parallel_ms = Vec::with_capacity(16);
+        let mut midpoint_wins = 0_usize;
+        for trial in 0..8 {
+            let order = if trial % 2 == 0 {
+                [false, true, true, false]
+            } else {
+                [true, false, false, true]
+            };
+            let mut trial_sequential = Vec::with_capacity(2);
+            let mut trial_parallel = Vec::with_capacity(2);
+            for parallel in order {
+                clear_virtual_index_factor_cache();
+                let start = Instant::now();
+                let valid = if parallel {
+                    parallel_verify()
+                } else {
+                    proof.verify_sequential_components_for_benchmark()
+                };
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+                assert!(valid);
+                if parallel {
+                    parallel_ms.push(elapsed_ms);
+                    trial_parallel.push(elapsed_ms);
+                } else {
+                    sequential_ms.push(elapsed_ms);
+                    trial_sequential.push(elapsed_ms);
+                }
+            }
+            let sequential_midpoint = (trial_sequential[0] + trial_sequential[1]) / 2.0;
+            let parallel_midpoint = (trial_parallel[0] + trial_parallel[1]) / 2.0;
+            midpoint_wins += usize::from(parallel_midpoint < sequential_midpoint);
+            eprintln!(
+                "canonical-parallel-components trial={} sequential={:.3}/{:.3} ms parallel={:.3}/{:.3} ms midpoint={sequential_midpoint:.3}/{parallel_midpoint:.3} ms",
+                trial + 1,
+                trial_sequential[0],
+                trial_sequential[1],
+                trial_parallel[0],
+                trial_parallel[1],
+            );
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        let mean = |samples: &[f64]| samples.iter().sum::<f64>() / samples.len() as f64;
+        let trim_two = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[2..sorted.len() - 2].iter().sum::<f64>() / (sorted.len() - 4) as f64
+        };
+        eprintln!(
+            "canonical-parallel-components sequential-ms={sequential_ms:?} parallel-ms={parallel_ms:?} sequential-median={:.3} parallel-median={:.3} sequential-mean={:.3} parallel-mean={:.3} sequential-trim2={:.3} parallel-trim2={:.3} midpoint-wins={midpoint_wins}/8",
+            median(&sequential_ms),
+            median(&parallel_ms),
+            mean(&sequential_ms),
+            mean(&parallel_ms),
+            trim_two(&sequential_ms),
+            trim_two(&parallel_ms),
         );
     }
 
