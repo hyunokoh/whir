@@ -1551,6 +1551,23 @@ fn evaluate_power_of_two_message_with_scratch(
     fold_message_at_point(scratch, point)
 }
 
+fn evaluate_power_of_two_message_direct_first_round(
+    message: &[Field192],
+    point: &[Field192],
+    scratch: &mut [Field192],
+) -> Field192 {
+    assert!(!point.is_empty());
+    assert_eq!(message.len(), scratch.len());
+    assert_eq!(message.len(), 1_usize << point.len());
+    let half = message.len() / 2;
+    let (low, high) = message.split_at(half);
+    scratch[..half]
+        .par_iter_mut()
+        .zip(low.par_iter().zip(high.par_iter()))
+        .for_each(|(output, (low, high))| *output = *low + (*high - *low) * point[0]);
+    fold_message_at_point(&mut scratch[..half], &point[1..])
+}
+
 fn fold_message_at_point(scratch: &mut [Field192], point: &[Field192]) -> Field192 {
     assert_eq!(scratch.len(), 1_usize << point.len());
     let mut active = scratch.len();
@@ -1893,6 +1910,14 @@ fn build_production_precarry_in_codeword(
     codeword: &mut Vec<Field192>,
     commitment_root: Digest,
 ) -> ProductionPreCarryProof {
+    build_production_precarry_in_codeword_with_evaluation_mode(codeword, commitment_root, true)
+}
+
+fn build_production_precarry_in_codeword_with_evaluation_mode(
+    codeword: &mut Vec<Field192>,
+    commitment_root: Digest,
+    direct_first_round: bool,
+) -> ProductionPreCarryProof {
     assert_eq!(codeword.len(), CARRYOPEN_FIELDS);
     assert!(codeword.capacity() >= 4 * CARRYOPEN_FIELDS);
     let points = precarry_opening_points(&commitment_root, 16);
@@ -1910,11 +1935,18 @@ fn build_production_precarry_in_codeword(
         let mut point_iter = points.iter();
         let first_point = point_iter.next().expect("pre-Carry has fixed openings");
         let mut claims = Vec::with_capacity(points.len());
-        claims.push(fold_message_at_point(scratch, first_point));
-        claims.extend(
-            point_iter
-                .map(|point| evaluate_power_of_two_message_with_scratch(message, point, scratch)),
-        );
+        claims.push(if direct_first_round {
+            evaluate_power_of_two_message_direct_first_round(message, first_point, scratch)
+        } else {
+            fold_message_at_point(scratch, first_point)
+        });
+        claims.extend(point_iter.map(|point| {
+            if direct_first_round {
+                evaluate_power_of_two_message_direct_first_round(message, point, scratch)
+            } else {
+                evaluate_power_of_two_message_with_scratch(message, point, scratch)
+            }
+        }));
         let statement = precarry_statement_root(&commitment_root, &points, &claims);
         let coefficients = precarry_coefficients(&statement, claims.len());
         let claimed = claims
@@ -3504,13 +3536,12 @@ fn run_production_carryopen(
         tail.as_ref()
             .map_or(terminal_source_root, |tail| tail.commitment_root),
     );
-    let phi_point = (0..terminal_source.len().next_power_of_two().trailing_zeros() as usize)
-        .map(|index| semantic_challenge(b"CarryOpen-Phi-link", 10, index, &final_roots))
-        .collect::<Vec<_>>();
-    let phi_link = prove_local_product_relation(
-        vec![Field192::ZERO; terminal_source.len()],
-        equality_weights(&phi_point)[..terminal_source.len()].to_vec(),
-        local_relation_roots(b"CarryOpen-Phi-link", 10, &final_roots),
+    let phi_link = zero_weighted_relation_proof(
+        b"CarryOpen-Phi-link",
+        b"CarryOpen-Phi-link",
+        10,
+        terminal_source.len(),
+        &final_roots,
     );
     let terminal = start.elapsed();
     let proof = ProductionCarryOpenProof {
@@ -9763,6 +9794,27 @@ mod tests {
     }
 
     #[test]
+    fn direct_first_evaluation_round_matches_copy_then_fold() {
+        for variables in 1..=12 {
+            let fields = 1usize << variables;
+            let message = (0..fields)
+                .map(|index| Field192::from((17 * index + 9) as u64))
+                .collect::<Vec<_>>();
+            let point = (0..variables)
+                .map(|index| fixed_challenge(b"direct-first-evaluation-round", variables, index))
+                .collect::<Vec<_>>();
+            let mut copied = vec![Field192::ZERO; fields];
+            let expected =
+                evaluate_power_of_two_message_with_scratch(&message, &point, &mut copied);
+            let mut direct = vec![Field192::ONE; fields];
+            let actual =
+                evaluate_power_of_two_message_direct_first_round(&message, &point, &mut direct);
+            assert_eq!(actual, expected);
+            assert_eq!(direct[0], copied[0]);
+        }
+    }
+
+    #[test]
     fn symbolic_zero_relation_matches_materialized_sumcheck() {
         let transcript_roots = (0..9).map(|index| [index as u8; 32]).collect::<Vec<_>>();
         for fields in [2_usize, 3, 7, 8, 19, 64, 583, 823, 1_369, 2_438] {
@@ -9795,6 +9847,85 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    #[test]
+    #[ignore = "production CarryOpen Phi materialized-versus-symbolic A/B"]
+    fn carryopen_phi_uses_symbolic_zero_relation() {
+        let final_roots = (0..10).map(|index| [index as u8; 32]).collect::<Vec<_>>();
+        let fields = CARRYOPEN_TERMINAL_FIELDS;
+        let variables = fields.next_power_of_two().trailing_zeros() as usize;
+        let point = (0..variables)
+            .map(|index| semantic_challenge(b"CarryOpen-Phi-link", 10, index, &final_roots))
+            .collect::<Vec<_>>();
+        let expected = prove_local_product_relation(
+            vec![Field192::ZERO; fields],
+            equality_weights(&point)[..fields].to_vec(),
+            local_relation_roots(b"CarryOpen-Phi-link", 10, &final_roots),
+        );
+        let run = |symbolic: bool| {
+            let start = Instant::now();
+            let proof = if symbolic {
+                zero_weighted_relation_proof(
+                    b"CarryOpen-Phi-link",
+                    b"CarryOpen-Phi-link",
+                    10,
+                    fields,
+                    &final_roots,
+                )
+            } else {
+                prove_local_product_relation(
+                    vec![Field192::ZERO; fields],
+                    equality_weights(&point)[..fields].to_vec(),
+                    local_relation_roots(b"CarryOpen-Phi-link", 10, &final_roots),
+                )
+            };
+            let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+            assert_eq!(proof, expected);
+            elapsed
+        };
+        let mut materialized_ms = Vec::with_capacity(16);
+        let mut symbolic_ms = Vec::with_capacity(16);
+        for trial in 0..8 {
+            let order = if trial % 2 == 0 {
+                [false, true, true, false]
+            } else {
+                [true, false, false, true]
+            };
+            let mut trial_materialized = Vec::with_capacity(2);
+            let mut trial_symbolic = Vec::with_capacity(2);
+            for symbolic in order {
+                let elapsed = run(symbolic);
+                if symbolic {
+                    symbolic_ms.push(elapsed);
+                    trial_symbolic.push(elapsed);
+                } else {
+                    materialized_ms.push(elapsed);
+                    trial_materialized.push(elapsed);
+                }
+            }
+            eprintln!(
+                "carryopen-phi trial={} materialized={:.3}/{:.3} ms symbolic={:.3}/{:.3} ms",
+                trial + 1,
+                trial_materialized[0],
+                trial_materialized[1],
+                trial_symbolic[0],
+                trial_symbolic[1],
+            );
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        let mean = |samples: &[f64]| samples.iter().sum::<f64>() / samples.len() as f64;
+        eprintln!(
+            "carryopen-phi materialized-ms={materialized_ms:?} symbolic-ms={symbolic_ms:?} materialized-median={:.3} symbolic-median={:.3} materialized-mean={:.3} symbolic-mean={:.3}",
+            median(&materialized_ms),
+            median(&symbolic_ms),
+            mean(&materialized_ms),
+            mean(&symbolic_ms),
+        );
     }
 
     #[test]
@@ -12201,6 +12332,87 @@ mod tests {
             fused_second_time.as_secs_f64() * 1_000.0,
             separate_first_time.as_secs_f64() * 1_000.0,
             separate_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "production direct-first-round pre-Carry evaluation A/B"]
+    fn direct_first_round_benchmarks_precarry_evaluations() {
+        let mut original = Vec::with_capacity(4 * CARRYOPEN_FIELDS);
+        original.resize(CARRYOPEN_FIELDS, Field192::ZERO);
+        original
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, value)| *value = precarry_message_value(index));
+        let commitment_root = prefix_root(
+            &original,
+            CARRYOPEN_FIELDS,
+            &zero_roots(CARRYOPEN_FIELDS.trailing_zeros() as usize),
+        );
+        let expected = {
+            let mut codeword = original.clone();
+            codeword.reserve_exact(3 * CARRYOPEN_FIELDS);
+            build_production_precarry_in_codeword_with_evaluation_mode(
+                &mut codeword,
+                commitment_root,
+                false,
+            )
+        };
+        let run = |direct_first_round: bool| {
+            let mut codeword = original.clone();
+            codeword.reserve_exact(3 * CARRYOPEN_FIELDS);
+            let start = Instant::now();
+            let proof = build_production_precarry_in_codeword_with_evaluation_mode(
+                &mut codeword,
+                commitment_root,
+                direct_first_round,
+            );
+            let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+            assert_eq!(proof, expected);
+            assert_eq!(codeword, original);
+            elapsed
+        };
+        let mut copied_ms = Vec::with_capacity(16);
+        let mut direct_ms = Vec::with_capacity(16);
+        for trial in 0..8 {
+            let order = if trial % 2 == 0 {
+                [false, true, true, false]
+            } else {
+                [true, false, false, true]
+            };
+            let mut trial_copied = Vec::with_capacity(2);
+            let mut trial_direct = Vec::with_capacity(2);
+            for direct_first_round in order {
+                let elapsed = run(direct_first_round);
+                if direct_first_round {
+                    direct_ms.push(elapsed);
+                    trial_direct.push(elapsed);
+                } else {
+                    copied_ms.push(elapsed);
+                    trial_copied.push(elapsed);
+                }
+            }
+            eprintln!(
+                "precarry-evaluation trial={} copied={:.3}/{:.3} ms direct={:.3}/{:.3} ms",
+                trial + 1,
+                trial_copied[0],
+                trial_copied[1],
+                trial_direct[0],
+                trial_direct[1],
+            );
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        let mean = |samples: &[f64]| samples.iter().sum::<f64>() / samples.len() as f64;
+        eprintln!(
+            "precarry-evaluation copied-ms={copied_ms:?} direct-ms={direct_ms:?} copied-median={:.3} direct-median={:.3} copied-mean={:.3} direct-mean={:.3}",
+            median(&copied_ms),
+            median(&direct_ms),
+            mean(&copied_ms),
+            mean(&direct_ms),
         );
     }
 
