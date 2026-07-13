@@ -52,11 +52,12 @@ const _: () = {
 mod neon4 {
     use super::{Digest, BLAKE3_IV, BLAKE3_MSG_SCHEDULE};
     use core::arch::aarch64::{
-        uint32x4_t, vaddq_u32, vdupq_n_u32, veorq_u32, vld1q_u32, vld1q_u8, vorrq_u32, vqtbl1q_u8,
-        vreinterpretq_u32_u64, vreinterpretq_u32_u8, vreinterpretq_u64_u32, vreinterpretq_u8_u32,
-        vshlq_n_u32, vshrq_n_u32, vst1q_u32, vtrn1q_u32, vtrn1q_u64, vtrn2q_u32, vtrn2q_u64,
-        vuzp1q_u32, vuzp2q_u32,
+        uint32x4_t, vaddq_u32, vdupq_n_u32, veorq_u32, vld1q_u32, vorrq_u32, vreinterpretq_u32_u64,
+        vreinterpretq_u64_u32, vshlq_n_u32, vshrq_n_u32, vst1q_u32, vtrn1q_u32, vtrn1q_u64,
+        vtrn2q_u32, vtrn2q_u64, vuzp1q_u32, vuzp2q_u32,
     };
+    #[cfg(target_endian = "little")]
+    use core::arch::aarch64::{vld1q_u8, vqtbl1q_u8, vreinterpretq_u32_u8, vreinterpretq_u8_u32};
 
     // On little-endian AArch64 this turns each four-byte word into its
     // rotate-right-by-eight layout with one TBL instruction.  The shift path
@@ -81,15 +82,16 @@ mod neon4 {
 
     #[inline(always)]
     unsafe fn rotr8(value: uint32x4_t) -> uint32x4_t {
-        if cfg!(target_endian = "little") {
-            unsafe {
-                vreinterpretq_u32_u8(vqtbl1q_u8(
-                    vreinterpretq_u8_u32(value),
-                    vld1q_u8(ROTR8_BYTE_INDICES.as_ptr()),
-                ))
-            }
-        } else {
-            unsafe { vorrq_u32(vshrq_n_u32::<8>(value), vshlq_n_u32::<24>(value)) }
+        #[cfg(target_endian = "little")]
+        unsafe {
+            return vreinterpretq_u32_u8(vqtbl1q_u8(
+                vreinterpretq_u8_u32(value),
+                vld1q_u8(ROTR8_BYTE_INDICES.as_ptr()),
+            ));
+        }
+        #[cfg(not(target_endian = "little"))]
+        unsafe {
+            vorrq_u32(vshrq_n_u32::<8>(value), vshlq_n_u32::<24>(value))
         }
     }
 
