@@ -1,7 +1,11 @@
 use ark_ff::PrimeField;
+#[cfg(target_arch = "aarch64")]
+use ark_ff::{biginteger::arithmetic::mac_with_carry, MontConfig};
 use rayon::prelude::*;
 use std::{cell::RefCell, sync::OnceLock};
 
+#[cfg(target_arch = "aarch64")]
+use crate::algebra::fields::FConfig192;
 use crate::algebra::fields::Field192;
 
 pub type Digest = [u8; 32];
@@ -1364,6 +1368,61 @@ fn field_leaves8_materialized(values: &[Field192; 8]) -> [Digest; 8] {
     )
 }
 
+/// Convert four independent Montgomery residues to canonical limbs in
+/// reduction-step order. Interleaving four carry chains exposes instruction
+/// parallelism without the spills measured for an eight-chain schedule.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn canonical_limbs4_interleaved(values: &[Field192; 4]) -> [[u64; 3]; 4] {
+    let modulus = <FConfig192 as MontConfig<3>>::MODULUS.0;
+    let inverse = <FConfig192 as MontConfig<3>>::INV;
+    let mut residues = std::array::from_fn(|lane| values[lane].0 .0);
+    for index in 0..3 {
+        let factors =
+            std::array::from_fn::<_, 4, _>(|lane| residues[lane][index].wrapping_mul(inverse));
+        let mut carries = [0_u64; 4];
+        for lane in 0..4 {
+            let _ = mac_with_carry(
+                residues[lane][index],
+                factors[lane],
+                modulus[0],
+                &mut carries[lane],
+            );
+        }
+        for limb in 1..3 {
+            let position = (limb + index) % 3;
+            for lane in 0..4 {
+                residues[lane][position] = mac_with_carry(
+                    residues[lane][position],
+                    factors[lane],
+                    modulus[limb],
+                    &mut carries[lane],
+                );
+            }
+        }
+        for lane in 0..4 {
+            residues[lane][index] = carries[lane];
+        }
+    }
+    residues
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn canonical_limbs8_interleaved_four(values: &[Field192; 8]) -> [[u64; 3]; 8] {
+    let first: &[Field192; 4] = values[..4].try_into().unwrap();
+    let second: &[Field192; 4] = values[4..].try_into().unwrap();
+    let first = canonical_limbs4_interleaved(first);
+    let second = canonical_limbs4_interleaved(second);
+    std::array::from_fn(|lane| {
+        if lane < 4 {
+            first[lane]
+        } else {
+            second[lane - 4]
+        }
+    })
+}
+
 #[inline]
 fn field_leaves8(values: &[Field192; 8]) -> [Digest; 8] {
     #[cfg(target_arch = "aarch64")]
@@ -1789,16 +1848,38 @@ fn field_level2_one_block_v2(values: &[Field192; 32]) -> [Digest; 8] {
 fn field_level2_one_block_v2_word_major(values: &[Field192; 32]) -> [Digest; 8] {
     #[cfg(target_arch = "aarch64")]
     {
-        let first = std::array::from_fn(|index| values[index].into_bigint().0);
-        let second = std::array::from_fn(|index| values[8 + index].into_bigint().0);
-        let third = std::array::from_fn(|index| values[16 + index].into_bigint().0);
-        let fourth = std::array::from_fn(|index| values[24 + index].into_bigint().0);
-        // SAFETY: AArch64 guarantees NEON support.
+        let first: &[Field192; 8] = values[..8].try_into().unwrap();
+        let second: &[Field192; 8] = values[8..16].try_into().unwrap();
+        let third: &[Field192; 8] = values[16..24].try_into().unwrap();
+        let fourth: &[Field192; 8] = values[24..].try_into().unwrap();
+        let first = canonical_limbs8_interleaved_four(first);
+        let second = canonical_limbs8_interleaved_four(second);
+        let third = canonical_limbs8_interleaved_four(third);
+        let fourth = canonical_limbs8_interleaved_four(fourth);
+        // SAFETY: AArch64 guarantees NEON support and the four-lane
+        // Montgomery reductions reproduce canonical arkworks limbs exactly.
         unsafe { neon4::compress_field_level2_v2_word_major_8(&first, &second, &third, &fourth) }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
         field_level2_one_block_v2(values)
+    }
+}
+
+fn field_level2_one_block_v2_word_major_scalar_canonical(values: &[Field192; 32]) -> [Digest; 8] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let first = std::array::from_fn(|index| values[index].into_bigint().0);
+        let second = std::array::from_fn(|index| values[8 + index].into_bigint().0);
+        let third = std::array::from_fn(|index| values[16 + index].into_bigint().0);
+        let fourth = std::array::from_fn(|index| values[24 + index].into_bigint().0);
+        // SAFETY: AArch64 guarantees NEON support. This is the former
+        // per-element canonicalization path retained as a benchmark oracle.
+        unsafe { neon4::compress_field_level2_v2_word_major_8(&first, &second, &third, &fourth) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        field_level2_one_block_v2_word_major(values)
     }
 }
 
@@ -2253,6 +2334,19 @@ fn extend_field_level2_batched_word_major_v2(values: &[Field192], scratch: &mut 
     }
 }
 
+fn extend_field_level2_batched_word_major_scalar_canonical_v2(
+    values: &[Field192],
+    scratch: &mut Vec<Digest>,
+) {
+    assert!(values.len() >= 32 && values.len().is_power_of_two());
+    for chunk in values.chunks_exact(32) {
+        let values: &[Field192; 32] = chunk.try_into().unwrap();
+        scratch.extend_from_slice(&field_level2_one_block_v2_word_major_scalar_canonical(
+            values,
+        ));
+    }
+}
+
 fn extend_field_level1_batched_one_block_v2(values: &[Field192], scratch: &mut Vec<Digest>) {
     assert!(values.len() >= 16 && values.len().is_power_of_two());
     for chunk in values.chunks_exact(16) {
@@ -2371,6 +2465,35 @@ pub fn exact_prefix_root_with_scratch(values: &[Field192], scratch: &mut Vec<Dig
         extend_field_leaves_batched(values, scratch, |value| value);
         reduce_exact_digests(scratch)
     }
+}
+
+/// Reproduce the former per-element Montgomery canonicalization schedule for
+/// crossed benchmarks against the production four-lane interleaving.
+#[doc(hidden)]
+pub fn exact_prefix_root_scalar_canonical_for_benchmark(
+    values: &[Field192],
+    scratch: &mut Vec<Digest>,
+) -> Digest {
+    assert!(values.len() >= 32 && values.len().is_power_of_two());
+    scratch.clear();
+    extend_field_level2_batched_word_major_scalar_canonical_v2(values, scratch);
+    reduce_exact_digests_pretransposed_word_major_v2(scratch)
+}
+
+#[doc(hidden)]
+pub fn prefix_root_scalar_canonical_for_benchmark(
+    values: &[Field192],
+    capacity: usize,
+    zeros: &[Digest],
+) -> Digest {
+    assert!(values.len() <= capacity && capacity.is_power_of_two());
+    if values.len() == capacity && values.len() >= 32 {
+        return EXACT_ROOT_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            exact_prefix_root_scalar_canonical_for_benchmark(values, &mut scratch)
+        });
+    }
+    prefix_root(values, capacity, zeros)
 }
 
 /// Reproduce the former field-level-1 schedule for the production v2 layout.
@@ -3282,6 +3405,98 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn four_lane_canonicalization_matches_scalar_roots() {
+        let values = (0..4096_u64)
+            .map(|index| {
+                let seed = blake3::hash(&(index + 947).to_le_bytes());
+                Field192::from_le_bytes_mod_order(seed.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        for size in [32, 64, 256, 1024, 4096] {
+            let mut production_scratch = Vec::new();
+            let mut scalar_scratch = Vec::new();
+            assert_eq!(
+                exact_prefix_root_with_scratch(&values[..size], &mut production_scratch),
+                exact_prefix_root_scalar_canonical_for_benchmark(
+                    &values[..size],
+                    &mut scalar_scratch,
+                )
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn four_lane_canonical_limbs_match_arkworks() {
+        let values = (0..4096_u64)
+            .map(|index| {
+                let seed = blake3::hash(&(index + 953).to_le_bytes());
+                Field192::from_le_bytes_mod_order(seed.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        for values in values.chunks_exact(8) {
+            let values: &[Field192; 8] = values.try_into().unwrap();
+            assert_eq!(
+                canonical_limbs8_interleaved_four(values),
+                std::array::from_fn(|lane| values[lane].into_bigint().0),
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "production four-lane versus scalar Field192 canonicalization benchmark"]
+    fn four_lane_canonicalization_benchmarks_scalar_root() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let values = (0..1024_u64)
+            .map(|index| {
+                let seed = blake3::hash(&(index + 967).to_le_bytes());
+                Field192::from_le_bytes_mod_order(seed.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        let mut production_scratch = Vec::new();
+        let mut scalar_scratch = Vec::new();
+        assert_eq!(
+            exact_prefix_root_with_scratch(&values, &mut production_scratch),
+            exact_prefix_root_scalar_canonical_for_benchmark(&values, &mut scalar_scratch,)
+        );
+
+        let iterations = 20_000;
+        let run = |production: bool| {
+            let mut scratch = Vec::with_capacity(values.len() / 4);
+            let start = Instant::now();
+            for _ in 0..iterations {
+                let root = if black_box(production) {
+                    exact_prefix_root_with_scratch(black_box(&values), &mut scratch)
+                } else {
+                    exact_prefix_root_scalar_canonical_for_benchmark(
+                        black_box(&values),
+                        &mut scratch,
+                    )
+                };
+                black_box(root);
+            }
+            start.elapsed().as_secs_f64() * 1_000.0
+        };
+        let mut production = Vec::with_capacity(8);
+        let mut scalar = Vec::with_capacity(8);
+        for trial in 0..8 {
+            if trial % 2 == 0 {
+                scalar.push(run(false));
+                production.push(run(true));
+            } else {
+                production.push(run(true));
+                scalar.push(run(false));
+            }
+        }
+        eprintln!(
+            "four-lane-canonical exact-root-1024 iterations={iterations} scalar-ms={scalar:?} production-ms={production:?}"
+        );
     }
 
     #[test]

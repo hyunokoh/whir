@@ -37,7 +37,8 @@ use whir::lilac_merkle::{
     prefix_root_copied_parents_for_benchmark, prefix_root_fused_field_level2_v2_for_benchmark,
     prefix_root_materialized_blocks_for_benchmark, prefix_root_materialized_cv_for_benchmark,
     prefix_root_materialized_leaves_for_benchmark, prefix_root_materialized_parents_for_benchmark,
-    prefix_root_one_block_nodes_v2_for_benchmark, prefix_root_scalar_leaf_messages_for_benchmark,
+    prefix_root_one_block_nodes_v2_for_benchmark, prefix_root_scalar_canonical_for_benchmark,
+    prefix_root_scalar_leaf_messages_for_benchmark,
     prefix_root_scalar_parent_messages_for_benchmark, prefix_root_scatter_for_benchmark,
     prefix_root_two_block_nodes_v1_for_benchmark, prefix_root_unfused_for_benchmark,
     prefix_root_unfused_leaf_parent_io_for_benchmark,
@@ -11492,6 +11493,77 @@ mod tests {
             parent_second_time.as_secs_f64() * 1_000.0,
             baseline_first_time.as_secs_f64() * 1_000.0,
             baseline_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "production tensor roots with four-lane interleaved Field192 canonicalization"]
+    fn four_lane_canonicalization_benchmarks_scalar_tensor_roots() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let (_, message_row_roots) =
+            exact_root_with_row_subtrees(&message, CARRYOPEN_WIDTH, &zeros);
+        let vertical_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|block| generator_spectrum(11, block, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &message, &mut proof_codeword, &vertical_spectra, 64);
+
+        let run = |candidate: bool| {
+            let root = if candidate {
+                prefix_root as fn(&[Field192], usize, &[Digest]) -> Digest
+            } else {
+                prefix_root_scalar_canonical_for_benchmark
+                    as fn(&[Field192], usize, &[Digest]) -> Digest
+            };
+            let start = Instant::now();
+            let commitments = tensor_row_commitments_with_root(
+                &proof_codeword,
+                &message_row_roots,
+                &horizontal_spectra,
+                &zeros,
+                root,
+                combine_equal_subtrees,
+            );
+            (commitments, start.elapsed().as_secs_f64() * 1_000.0)
+        };
+        let assert_same = |candidate: &[MatrixCommitment], expected: &[MatrixCommitment]| {
+            assert_eq!(candidate.len(), expected.len());
+            for (candidate, expected) in candidate.iter().zip(expected) {
+                assert_eq!(candidate.root, expected.root);
+                assert_eq!(candidate.row_roots, expected.row_roots);
+            }
+        };
+
+        let reference = run(false).0;
+        let mut scalar = Vec::with_capacity(8);
+        let mut production = Vec::with_capacity(8);
+        for trial in 0..4 {
+            let order = if trial % 2 == 0 {
+                [false, true, true, false]
+            } else {
+                [true, false, false, true]
+            };
+            for candidate in order {
+                let result = run(candidate);
+                assert_same(&result.0, &reference);
+                if candidate {
+                    production.push(result.1);
+                } else {
+                    scalar.push(result.1);
+                }
+            }
+        }
+        eprintln!(
+            "four-lane-canonical tensor-roots scalar-ms={scalar:?} production-ms={production:?}"
         );
     }
 
