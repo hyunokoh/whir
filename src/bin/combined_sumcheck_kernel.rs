@@ -1723,6 +1723,73 @@ fn accumulate_scaled_equality_weights(
         });
 }
 
+fn fill_scaled_equality_suffix_sequential(
+    point: &[Field192],
+    scale: Field192,
+    target: &mut [Field192],
+) {
+    assert_eq!(target.len(), 1usize << point.len());
+    target[0] = scale;
+    let mut active = 1;
+    for coordinate in point.iter().rev() {
+        for index in 0..active {
+            let value = target[index];
+            let high = value * *coordinate;
+            target[index] = value - high;
+            target[active + index] = high;
+        }
+        active *= 2;
+    }
+}
+
+/// Accumulate a small batch of equality tables block by block.  Each target
+/// block remains cache-local while all points contribute, so the full target
+/// is written once instead of streamed once per point.
+fn accumulate_equality_weights_block_local(
+    points: &[Vec<Field192>],
+    coefficients: &[Field192],
+    target: &mut [Field192],
+) {
+    const BLOCK_FIELDS: usize = 1 << 10;
+    assert!(!points.is_empty() && points.len() == coefficients.len());
+    assert!(target.len().is_power_of_two() && target.len() >= BLOCK_FIELDS);
+    let variables = target.len().trailing_zeros() as usize;
+    assert!(points.iter().all(|point| point.len() == variables));
+    let suffix_variables = BLOCK_FIELDS.trailing_zeros() as usize;
+    let prefix_variables = variables - suffix_variables;
+    target
+        .par_chunks_mut(BLOCK_FIELDS)
+        .enumerate()
+        .for_each_init(
+            || vec![Field192::ZERO; BLOCK_FIELDS],
+            |scratch, (block_index, output)| {
+                for (point, coefficient) in points.iter().zip(coefficients) {
+                    let scale = point[..prefix_variables].iter().enumerate().fold(
+                        *coefficient,
+                        |weight, (coordinate, value)| {
+                            let bit = (block_index >> (prefix_variables - 1 - coordinate)) & 1;
+                            weight
+                                * if bit == 0 {
+                                    Field192::ONE - *value
+                                } else {
+                                    *value
+                                }
+                        },
+                    );
+                    fill_scaled_equality_suffix_sequential(
+                        &point[prefix_variables..],
+                        scale,
+                        scratch,
+                    );
+                    output
+                        .iter_mut()
+                        .zip(scratch.iter())
+                        .for_each(|(output, value)| *output += *value);
+                }
+            },
+        );
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProductionPreCarryProof {
     commitment_root: Digest,
@@ -1910,13 +1977,14 @@ fn build_production_precarry_in_codeword(
     codeword: &mut Vec<Field192>,
     commitment_root: Digest,
 ) -> ProductionPreCarryProof {
-    build_production_precarry_in_codeword_with_evaluation_mode(codeword, commitment_root, true)
+    build_production_precarry_in_codeword_with_modes(codeword, commitment_root, true, true)
 }
 
-fn build_production_precarry_in_codeword_with_evaluation_mode(
+fn build_production_precarry_in_codeword_with_modes(
     codeword: &mut Vec<Field192>,
     commitment_root: Digest,
     direct_first_round: bool,
+    block_local_weights: bool,
 ) -> ProductionPreCarryProof {
     assert_eq!(codeword.len(), CARRYOPEN_FIELDS);
     assert!(codeword.capacity() >= 4 * CARRYOPEN_FIELDS);
@@ -1954,8 +2022,12 @@ fn build_production_precarry_in_codeword_with_evaluation_mode(
             .zip(&coefficients)
             .map(|(claim, coefficient)| *claim * coefficient)
             .sum::<Field192>();
-        for (point, coefficient) in points.iter().zip(coefficients) {
-            accumulate_scaled_equality_weights(point, coefficient, scratch, combined_weight);
+        if block_local_weights {
+            accumulate_equality_weights_block_local(&points, &coefficients, combined_weight);
+        } else {
+            for (point, coefficient) in points.iter().zip(coefficients) {
+                accumulate_scaled_equality_weights(point, coefficient, scratch, combined_weight);
+            }
         }
         sumcheck_message.copy_from_slice(message);
         let sumcheck = prove_local_product_relation_with_claim_slices(
@@ -9815,6 +9887,42 @@ mod tests {
     }
 
     #[test]
+    fn block_local_equality_accumulation_matches_global_tables() {
+        for variables in [10_usize, 11, 12] {
+            let fields = 1usize << variables;
+            let points = (0..5)
+                .map(|opening| {
+                    (0..variables)
+                        .map(|coordinate| {
+                            fixed_challenge(
+                                b"block-local-equality-accumulation",
+                                opening,
+                                coordinate,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let coefficients = (0..points.len())
+                .map(|index| Field192::from((13 * index + 7) as u64))
+                .collect::<Vec<_>>();
+            let mut scratch = vec![Field192::ZERO; fields];
+            let mut expected = vec![Field192::ZERO; fields];
+            for (point, coefficient) in points.iter().zip(&coefficients) {
+                accumulate_scaled_equality_weights(
+                    point,
+                    *coefficient,
+                    &mut scratch,
+                    &mut expected,
+                );
+            }
+            let mut block_local = vec![Field192::ZERO; fields];
+            accumulate_equality_weights_block_local(&points, &coefficients, &mut block_local);
+            assert_eq!(block_local, expected);
+        }
+    }
+
+    #[test]
     fn symbolic_zero_relation_matches_materialized_sumcheck() {
         let transcript_roots = (0..9).map(|index| [index as u8; 32]).collect::<Vec<_>>();
         for fields in [2_usize, 3, 7, 8, 19, 64, 583, 823, 1_369, 2_438] {
@@ -12352,9 +12460,10 @@ mod tests {
         let expected = {
             let mut codeword = original.clone();
             codeword.reserve_exact(3 * CARRYOPEN_FIELDS);
-            build_production_precarry_in_codeword_with_evaluation_mode(
+            build_production_precarry_in_codeword_with_modes(
                 &mut codeword,
                 commitment_root,
+                false,
                 false,
             )
         };
@@ -12362,10 +12471,11 @@ mod tests {
             let mut codeword = original.clone();
             codeword.reserve_exact(3 * CARRYOPEN_FIELDS);
             let start = Instant::now();
-            let proof = build_production_precarry_in_codeword_with_evaluation_mode(
+            let proof = build_production_precarry_in_codeword_with_modes(
                 &mut codeword,
                 commitment_root,
                 direct_first_round,
+                false,
             );
             let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
             assert_eq!(proof, expected);
@@ -12413,6 +12523,113 @@ mod tests {
             median(&direct_ms),
             mean(&copied_ms),
             mean(&direct_ms),
+        );
+    }
+
+    #[test]
+    #[ignore = "production block-local equality-weight accumulation A/B"]
+    fn block_local_weights_benchmark_global_precarry_tables() {
+        let mut original = Vec::with_capacity(4 * CARRYOPEN_FIELDS);
+        original.resize(CARRYOPEN_FIELDS, Field192::ZERO);
+        original
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, value)| *value = precarry_message_value(index));
+        let commitment_root = prefix_root(
+            &original,
+            CARRYOPEN_FIELDS,
+            &zero_roots(CARRYOPEN_FIELDS.trailing_zeros() as usize),
+        );
+        let global_proof = {
+            let mut codeword = original.clone();
+            codeword.reserve_exact(3 * CARRYOPEN_FIELDS);
+            build_production_precarry_in_codeword_with_modes(
+                &mut codeword,
+                commitment_root,
+                true,
+                false,
+            )
+        };
+        let block_local_proof = {
+            let mut codeword = original.clone();
+            codeword.reserve_exact(3 * CARRYOPEN_FIELDS);
+            build_production_precarry_in_codeword_with_modes(
+                &mut codeword,
+                commitment_root,
+                true,
+                true,
+            )
+        };
+        assert_eq!(block_local_proof, global_proof);
+
+        let points = precarry_opening_points(&commitment_root, 16);
+        let coefficients = precarry_coefficients(&[0x71_u8; 32], points.len());
+        let mut scratch = vec![Field192::ZERO; CARRYOPEN_FIELDS];
+        let mut target = vec![Field192::ZERO; CARRYOPEN_FIELDS];
+        let mut expected = vec![Field192::ZERO; CARRYOPEN_FIELDS];
+        for (point, coefficient) in points.iter().zip(&coefficients) {
+            accumulate_scaled_equality_weights(point, *coefficient, &mut scratch, &mut expected);
+        }
+        let mut run = |block_local: bool| {
+            target.fill(Field192::ZERO);
+            let start = Instant::now();
+            if block_local {
+                accumulate_equality_weights_block_local(&points, &coefficients, &mut target);
+            } else {
+                for (point, coefficient) in points.iter().zip(&coefficients) {
+                    accumulate_scaled_equality_weights(
+                        point,
+                        *coefficient,
+                        &mut scratch,
+                        &mut target,
+                    );
+                }
+            }
+            let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+            assert_eq!(target, expected);
+            elapsed
+        };
+        let mut global_ms = Vec::with_capacity(16);
+        let mut block_local_ms = Vec::with_capacity(16);
+        for trial in 0..8 {
+            let order = if trial % 2 == 0 {
+                [false, true, true, false]
+            } else {
+                [true, false, false, true]
+            };
+            let mut trial_global = Vec::with_capacity(2);
+            let mut trial_block_local = Vec::with_capacity(2);
+            for block_local in order {
+                let elapsed = run(block_local);
+                if block_local {
+                    block_local_ms.push(elapsed);
+                    trial_block_local.push(elapsed);
+                } else {
+                    global_ms.push(elapsed);
+                    trial_global.push(elapsed);
+                }
+            }
+            eprintln!(
+                "precarry-weight trial={} global={:.3}/{:.3} ms block-local={:.3}/{:.3} ms",
+                trial + 1,
+                trial_global[0],
+                trial_global[1],
+                trial_block_local[0],
+                trial_block_local[1],
+            );
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        let mean = |samples: &[f64]| samples.iter().sum::<f64>() / samples.len() as f64;
+        eprintln!(
+            "precarry-weight global-ms={global_ms:?} block-local-ms={block_local_ms:?} global-median={:.3} block-local-median={:.3} global-mean={:.3} block-local-mean={:.3}",
+            median(&global_ms),
+            median(&block_local_ms),
+            mean(&global_ms),
+            mean(&block_local_ms),
         );
     }
 
