@@ -257,6 +257,71 @@ fn prove_local_product_relation_with_claim_slices(
     proof
 }
 
+/// Run the first product-sumcheck round from an immutable left oracle and
+/// materialize only its folded half. This is transcript-identical to copying
+/// the full left oracle and calling `prove_local_product_relation_with_claim_slices`.
+fn prove_local_product_relation_with_immutable_left_first_round(
+    left: &[Field192],
+    folded_left_spare: &mut [MaybeUninit<Field192>],
+    right: &mut [Field192],
+    roots: Vec<Digest>,
+    claimed_sum: Field192,
+) -> PackedSumcheckProof {
+    assert!(left.len() > 1 && left.len() == right.len() && left.len().is_power_of_two());
+    assert!(folded_left_spare.len() >= left.len() / 2);
+    assert_eq!(dot(left, right), claimed_sum);
+    let fields = left.len();
+    let variables = fields.trailing_zeros() as usize;
+    let mut claim = claimed_sum;
+    let mut pairs = Vec::with_capacity(variables);
+
+    let (constant, quadratic) = compute_sumcheck_polynomial(left, right);
+    pairs.push((constant, quadratic));
+    let challenge = transcript_challenge(fields, variables, &roots, claimed_sum, &pairs);
+    let linear = claim - constant.double() - quadratic;
+    let half = fields / 2;
+    let (left_low, left_high) = left.split_at(half);
+    folded_left_spare[..half]
+        .par_iter_mut()
+        .zip(left_low.par_iter().zip(left_high.par_iter()))
+        .for_each(|(target, (low, high))| {
+            target.write(*low + (*high - *low) * challenge);
+        });
+    let next_right = fold_active(right, fields, challenge);
+    assert_eq!(next_right, half);
+    claim = (quadratic * challenge + linear) * challenge + constant;
+
+    // SAFETY: the parallel partition above writes every cell in the first
+    // `half` positions exactly once before this slice is exposed.
+    let folded_left = unsafe {
+        std::slice::from_raw_parts_mut(folded_left_spare.as_mut_ptr().cast::<Field192>(), half)
+    };
+    let mut active = half;
+    for _ in 1..variables {
+        let (constant, quadratic) =
+            compute_sumcheck_polynomial(&folded_left[..active], &right[..active]);
+        pairs.push((constant, quadratic));
+        let challenge = transcript_challenge(fields, variables, &roots, claimed_sum, &pairs);
+        let linear = claim - constant.double() - quadratic;
+        let next_left = fold_active(folded_left, active, challenge);
+        let next_right = fold_active(right, active, challenge);
+        assert_eq!(next_left, next_right);
+        active = next_left;
+        claim = (quadratic * challenge + linear) * challenge + constant;
+    }
+    assert_eq!(active, 1);
+    let proof = PackedSumcheckProof {
+        fields,
+        roots,
+        claimed_sum,
+        pairs,
+        terminal_left: folded_left[0],
+        terminal_right: right[0],
+    };
+    assert!(proof.challenges().is_some());
+    proof
+}
+
 #[derive(Debug)]
 struct TensorProductProof {
     proof: PackedSumcheckProof,
@@ -2056,18 +2121,20 @@ fn build_production_precarry(
 
 /// Build the pre-Carry batch inside the allocation already reserved for the
 /// four-quarter vertical codeword. The message occupies the first quarter;
-/// only two spare quarters are initialized for evaluation/combined weights
-/// and the product-sumcheck copy. Keeping the original first quarter intact
-/// avoids regenerating it before vertical encoding, while leaving the fourth
-/// quarter untouched avoids one full-message copy. Once the sumcheck finishes,
-/// truncating back to the message retains the allocation for vertical parity.
+/// one spare quarter holds the combined equality weights and half a quarter
+/// receives the left oracle after the first sumcheck fold. Keeping the original
+/// first quarter intact avoids regenerating it before vertical encoding, while
+/// deriving the folded half directly avoids a full-message sumcheck copy. Once
+/// the sumcheck finishes, truncating back to the message retains the allocation
+/// for vertical parity.
 fn build_production_precarry_in_codeword(
     codeword: &mut Vec<Field192>,
     commitment_root: Digest,
 ) -> ProductionPreCarryProof {
-    build_production_precarry_in_codeword_compact(codeword, commitment_root)
+    build_production_precarry_in_codeword_folded_left(codeword, commitment_root)
 }
 
+#[cfg(test)]
 fn build_production_precarry_in_codeword_compact(
     codeword: &mut Vec<Field192>,
     commitment_root: Digest,
@@ -2080,7 +2147,8 @@ fn build_production_precarry_in_codeword_compact(
         let spare = &mut codeword.spare_capacity_mut()[..2 * CARRYOPEN_FIELDS];
         let (combined_spare, sumcheck_spare) = spare.split_at_mut(CARRYOPEN_FIELDS);
         // SAFETY: the immutable message occupies the initialized Vec prefix;
-        // both mutable spare slices begin after that prefix and are disjoint.
+        // both mutable spare slices begin after that prefix, and the reserved
+        // vector cannot reallocate while these borrows are live.
         let message = unsafe { std::slice::from_raw_parts(message_pointer, CARRYOPEN_FIELDS) };
         let claims = points
             .iter()
@@ -2103,8 +2171,8 @@ fn build_production_precarry_in_codeword_compact(
         combined_spare.par_iter_mut().for_each(|value| {
             value.write(Field192::ZERO);
         });
-        // SAFETY: every combined-weight cell was initialized immediately
-        // above. A panic before this point leaves it outside Vec length.
+        // SAFETY: every combined-weight cell was initialized to zero above. A
+        // panic before this point leaves the cells outside the Vec length.
         let combined_weight = unsafe {
             std::slice::from_raw_parts_mut(
                 combined_spare.as_mut_ptr().cast::<Field192>(),
@@ -2138,6 +2206,75 @@ fn build_production_precarry_in_codeword_compact(
     // SAFETY: both spare quarters are fully initialized. Extending only now
     // keeps an unwinding path from ever exposing partially initialized cells.
     unsafe { codeword.set_len(3 * CARRYOPEN_FIELDS) };
+    codeword.truncate(CARRYOPEN_FIELDS);
+    let proof = ProductionPreCarryProof {
+        commitment_root,
+        points,
+        claims,
+        sumcheck,
+    };
+    assert!(proof.verify());
+    proof
+}
+
+fn build_production_precarry_in_codeword_folded_left(
+    codeword: &mut Vec<Field192>,
+    commitment_root: Digest,
+) -> ProductionPreCarryProof {
+    assert_eq!(codeword.len(), CARRYOPEN_FIELDS);
+    assert!(codeword.capacity() >= 4 * CARRYOPEN_FIELDS);
+    let points = precarry_opening_points(&commitment_root, 16);
+    let message_pointer = codeword.as_ptr();
+    let initialized_spare = CARRYOPEN_FIELDS + CARRYOPEN_FIELDS / 2;
+    let (claims, sumcheck) = {
+        let spare = &mut codeword.spare_capacity_mut()[..initialized_spare];
+        let (combined_spare, folded_left_spare) = spare.split_at_mut(CARRYOPEN_FIELDS);
+        // SAFETY: `message_pointer` addresses the initialized prefix and the
+        // spare borrow begins after it; sufficient reserved capacity prevents
+        // reallocation while both views are live.
+        let message = unsafe { std::slice::from_raw_parts(message_pointer, CARRYOPEN_FIELDS) };
+        let claims = points
+            .iter()
+            .map(|point| {
+                evaluate_power_of_two_message_direct_first_round_in_spare(
+                    message,
+                    point,
+                    combined_spare,
+                )
+            })
+            .collect::<Vec<_>>();
+        let statement = precarry_statement_root(&commitment_root, &points, &claims);
+        let coefficients = precarry_coefficients(&statement, claims.len());
+        let claimed = claims
+            .iter()
+            .zip(&coefficients)
+            .map(|(claim, coefficient)| *claim * coefficient)
+            .sum::<Field192>();
+
+        combined_spare.par_iter_mut().for_each(|value| {
+            value.write(Field192::ZERO);
+        });
+        // SAFETY: every cell in this spare quarter was initialized immediately
+        // above, and it remains outside the Vec length while borrowed here.
+        let combined_weight = unsafe {
+            std::slice::from_raw_parts_mut(
+                combined_spare.as_mut_ptr().cast::<Field192>(),
+                CARRYOPEN_FIELDS,
+            )
+        };
+        accumulate_equality_weights_block_local(&points, &coefficients, combined_weight);
+        let sumcheck = prove_local_product_relation_with_immutable_left_first_round(
+            message,
+            folded_left_spare,
+            combined_weight,
+            local_relation_roots(b"pre-Carry-batch", 0, &[commitment_root, statement]),
+            claimed,
+        );
+        (claims, sumcheck)
+    };
+    // SAFETY: the full combined quarter and folded half-quarter were written
+    // before this point; the prefix was initialized on entry.
+    unsafe { codeword.set_len(CARRYOPEN_FIELDS + initialized_spare) };
     codeword.truncate(CARRYOPEN_FIELDS);
     let proof = ProductionPreCarryProof {
         commitment_root,
@@ -9228,7 +9365,7 @@ fn main() {
             "- production CarryOpen code: vertical and horizontal systematic QA rate 1/4, 2^16 x 2^8 message, 1024-field tensor rows, q={CARRYOPEN_QUERIES}"
         );
         println!(
-            "- pre-Carry touches three quarters of the reserved 1.500-GiB codeword allocation: message, scratch/weight, and sumcheck copy; the fourth remains uninitialized"
+            "- pre-Carry initializes 2.5 quarters of the reserved 1.500-GiB codeword allocation: message, combined weights, and a folded-left half; the final 1.5 quarters remain uninitialized"
         );
         println!(
             "- CarryOpen M+systematic-root/pre-Carry/encode+commit/algebra/terminal medians: {:.3}/{:.3}/{:.3}/{:.3}/{:.3} ms",
@@ -9573,6 +9710,35 @@ mod tests {
         );
         assert_eq!(actual, expected);
         assert_eq!(actual.serialize(), expected.serialize());
+    }
+
+    #[test]
+    fn immutable_left_first_round_sumcheck_matches_full_copy() {
+        let left = (0..64)
+            .map(|index| Field192::from((7 * index + 3) as u64))
+            .collect::<Vec<_>>();
+        let right = (0..64)
+            .map(|index| Field192::from((11 * index + 5) as u64))
+            .collect::<Vec<_>>();
+        let claimed_sum = dot(&left, &right);
+        let roots = vec![[29_u8; 32], [31_u8; 32]];
+        let expected = prove_local_product_relation_with_claim(
+            left.clone(),
+            right.clone(),
+            roots.clone(),
+            claimed_sum,
+        );
+        let mut folded_left = vec![MaybeUninit::<Field192>::uninit(); left.len() / 2];
+        let mut candidate_right = right;
+        let candidate = prove_local_product_relation_with_immutable_left_first_round(
+            &left,
+            &mut folded_left,
+            &mut candidate_right,
+            roots,
+            claimed_sum,
+        );
+        assert_eq!(candidate, expected);
+        assert_eq!(candidate.serialize(), expected.serialize());
     }
 
     #[test]
@@ -13648,6 +13814,87 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "production pre-Carry folded-left versus full-copy sumcheck crossed A/B"]
+    fn folded_left_precarry_benchmarks_full_copy() {
+        let mut original = Vec::with_capacity(4 * CARRYOPEN_FIELDS);
+        original.resize(CARRYOPEN_FIELDS, Field192::ZERO);
+        original
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, value)| *value = precarry_message_value(index));
+        let commitment_root = prefix_root(
+            &original,
+            CARRYOPEN_FIELDS,
+            &zero_roots(CARRYOPEN_FIELDS.trailing_zeros() as usize),
+        );
+        let expected = {
+            let mut codeword = original.clone();
+            codeword.reserve_exact(3 * CARRYOPEN_FIELDS);
+            build_production_precarry_in_codeword_compact(&mut codeword, commitment_root)
+        };
+        let run = |folded_left: bool| {
+            let mut codeword = original.clone();
+            codeword.reserve_exact(3 * CARRYOPEN_FIELDS);
+            let start = Instant::now();
+            let proof = if folded_left {
+                build_production_precarry_in_codeword_folded_left(&mut codeword, commitment_root)
+            } else {
+                build_production_precarry_in_codeword_compact(&mut codeword, commitment_root)
+            };
+            let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+            assert_eq!(proof, expected);
+            assert_eq!(codeword, original);
+            elapsed
+        };
+        let mut folded_ms = Vec::with_capacity(16);
+        let mut copied_ms = Vec::with_capacity(16);
+        let mut folded_midpoints = 0_usize;
+        for trial in 0..8 {
+            let order = if trial % 2 == 0 {
+                [false, true, true, false]
+            } else {
+                [true, false, false, true]
+            };
+            let mut trial_folded = Vec::with_capacity(2);
+            let mut trial_copied = Vec::with_capacity(2);
+            for folded_left in order {
+                let elapsed = run(folded_left);
+                if folded_left {
+                    folded_ms.push(elapsed);
+                    trial_folded.push(elapsed);
+                } else {
+                    copied_ms.push(elapsed);
+                    trial_copied.push(elapsed);
+                }
+            }
+            let folded_midpoint = (trial_folded[0] + trial_folded[1]) / 2.0;
+            let copied_midpoint = (trial_copied[0] + trial_copied[1]) / 2.0;
+            folded_midpoints += usize::from(folded_midpoint < copied_midpoint);
+            eprintln!(
+                "precarry-folded-left trial={} folded={:.3}/{:.3} ms copied={:.3}/{:.3} ms",
+                trial + 1,
+                trial_folded[0],
+                trial_folded[1],
+                trial_copied[0],
+                trial_copied[1],
+            );
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        let mean = |samples: &[f64]| samples.iter().sum::<f64>() / samples.len() as f64;
+        eprintln!(
+            "precarry-folded-left folded-ms={folded_ms:?} copied-ms={copied_ms:?} folded-median={:.3} copied-median={:.3} folded-mean={:.3} copied-mean={:.3} folded-midpoints={folded_midpoints}/8 initialized-spare-mib=576/768",
+            median(&folded_ms),
+            median(&copied_ms),
+            mean(&folded_ms),
+            mean(&copied_ms),
+        );
+    }
+
+    #[test]
     #[ignore = "production four-quarter pre-Carry workspace memory profile"]
     fn four_quarter_precarry_workspace_memory_profile() {
         let mut codeword = Vec::with_capacity(4 * CARRYOPEN_FIELDS);
@@ -13687,6 +13934,27 @@ mod tests {
             &zero_roots(CARRYOPEN_FIELDS.trailing_zeros() as usize),
         );
         let proof = build_production_precarry_in_codeword_compact(&mut codeword, commitment_root);
+        assert!(proof.verify());
+        assert_eq!(codeword.len(), CARRYOPEN_FIELDS);
+        std::hint::black_box((&codeword, proof));
+    }
+
+    #[test]
+    #[ignore = "production folded-left pre-Carry workspace memory profile"]
+    fn folded_left_precarry_workspace_memory_profile() {
+        let mut codeword = Vec::with_capacity(4 * CARRYOPEN_FIELDS);
+        codeword.resize(CARRYOPEN_FIELDS, Field192::ZERO);
+        codeword
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, value)| *value = precarry_message_value(index));
+        let commitment_root = prefix_root(
+            &codeword,
+            CARRYOPEN_FIELDS,
+            &zero_roots(CARRYOPEN_FIELDS.trailing_zeros() as usize),
+        );
+        let proof =
+            build_production_precarry_in_codeword_folded_left(&mut codeword, commitment_root);
         assert!(proof.verify());
         assert_eq!(codeword.len(), CARRYOPEN_FIELDS);
         std::hint::black_box((&codeword, proof));
