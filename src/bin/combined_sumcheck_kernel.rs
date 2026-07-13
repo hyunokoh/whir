@@ -1532,9 +1532,9 @@ const STRONG_QUERIES: usize = 31;
 const STRONG_NEXT_BLOCKS: usize = STRONG_QUERIES + 1;
 // The sixth switch is already tiny.  Paying a lower rate here reduces both
 // authenticated rows and the explicit base while preserving the per-event
-// soundness margin: 0.024^25 < 0.05^31.
-const STRONG_FINAL_INVERSE_RATE: usize = 64;
-const STRONG_FINAL_QUERIES: usize = 25;
+// soundness margin: 0.0277^26 < 0.024^25 < 0.05^31.
+const STRONG_FINAL_INVERSE_RATE: usize = 51;
+const STRONG_FINAL_QUERIES: usize = 26;
 const STRONG_FINAL_NEXT_BLOCKS: usize = STRONG_FINAL_QUERIES + 1;
 const STRONG_SOURCE_FIELDS: usize = STRONG_GROUP * STRONG_WIDTH;
 const STRONG_TERMINAL_FIELDS: usize = 2 * STRONG_NEXT_BLOCKS * STRONG_WIDTH;
@@ -9639,7 +9639,7 @@ fn main() {
                 CARRYOPEN_TERMINAL_FIELDS
             );
                 println!(
-                    "- strong late-switch schedule: five rate-1/{STRONG_INVERSE_RATE}, distance-0.95, q={STRONG_QUERIES} rounds; final rate-1/{STRONG_FINAL_INVERSE_RATE}, distance-0.976, q={STRONG_FINAL_QUERIES} round; source/final-private fields {}/{}",
+                    "- strong late-switch schedule: five rate-1/{STRONG_INVERSE_RATE}, distance-0.95, q={STRONG_QUERIES} rounds; final rate-1/{STRONG_FINAL_INVERSE_RATE}, distance-0.9723, q={STRONG_FINAL_QUERIES} round; source/final-private fields {}/{}",
                     STRONG_SOURCE_FIELDS,
                     STRONG_FINAL_NEXT_BLOCKS * strong_round_level(STRONG_ROUNDS - 1).unwrap().width,
                 );
@@ -10375,9 +10375,9 @@ mod tests {
 
     #[test]
     fn fixed_generator_preprocessing_matches_direct_spectra() {
-        assert_eq!(canonical_fixed_generator_fields(), 258_048);
-        assert_eq!(canonical_fixed_generator_root_count(), 190);
-        assert_eq!(canonical_fixed_generator_bytes(), 6_199_232);
+        assert_eq!(canonical_fixed_generator_fields(), 256_384);
+        assert_eq!(canonical_fixed_generator_root_count(), 177);
+        assert_eq!(canonical_fixed_generator_bytes(), 6_158_880);
         let zeros = zero_roots(30);
         for (level_index, level) in LEVELS
             .iter()
@@ -11664,12 +11664,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "final strong rate-1/64 q=25 versus uniform rate-1/24 q=31 crossed A/B"]
-    fn final_strong_rate_switch_benchmarks_uniform_schedule() {
+    #[ignore = "final strong rate-1/51 q=26 versus rate-1/64 q=25 crossed A/B"]
+    fn final_strong_rate51_benchmarks_rate64() {
         let candidate = strong_round_level(STRONG_ROUNDS - 1).unwrap();
         let baseline = Level {
-            inverse_rate: STRONG_INVERSE_RATE,
-            next_blocks: STRONG_NEXT_BLOCKS,
+            inverse_rate: 64,
+            next_blocks: 26,
             ..candidate
         };
         let relation_level = 12 + STRONG_ROUNDS - 1;
@@ -11782,6 +11782,133 @@ mod tests {
             candidate_expected.2,
             candidate_expected.3,
         );
+    }
+
+    #[test]
+    #[ignore = "exact canonical-prefix sweep over soundness-threshold final rates"]
+    fn final_strong_rate_query_threshold_sweep() {
+        let carry = run_production_carryopen(1, false);
+        let certificate = run_semantic_certificate_only(64, false);
+        let certificate_root = certificate
+            .transition_proofs
+            .as_ref()
+            .unwrap()
+            .last()
+            .unwrap()
+            .next_source_root;
+        let mut source = materialize_strong_source(
+            certificate.terminal_tail.as_ref().unwrap(),
+            &carry.terminal_source,
+        );
+        let mut expected_root = parent(certificate_root, carry.proof.terminal_source_root);
+        for round in 0..STRONG_ROUNDS - 1 {
+            let measurement = run_strong_round(round, source, expected_root, false, 1);
+            source = measurement.terminal_source;
+            expected_root = measurement.core.terminal_source_root;
+        }
+
+        let current = strong_round_level(STRONG_ROUNDS - 1).unwrap();
+        assert_eq!(source.len(), current.raw);
+        let zeros = zero_roots(30);
+        let relation_level = 12 + STRONG_ROUNDS - 1;
+        let fixed_prefix_bytes = 276_692_usize;
+        let run = |inverse_rate: usize, queries: usize| {
+            let level = Level {
+                inverse_rate,
+                next_blocks: queries + 1,
+                ..current
+            };
+            assert_eq!(splice_root(level, &source, &zeros), expected_root);
+            let start = Instant::now();
+            let spectra = fixed_generator_spectra(relation_level, level);
+            let generator_roots = fixed_generator_roots(relation_level, level);
+            let codeword = encode_full_systematic_codeword(level, &source, spectra.as_ref(), 64);
+            let (mut component_roots, commitments) =
+                level_commitment(level, &source, &codeword, generator_roots.as_ref(), &zeros);
+            assert_eq!(component_roots[level.inverse_rate - 1], expected_root);
+            let index_oracle =
+                materialize_index_oracle(relation_level, level, spectra.as_ref(), &component_roots);
+            component_roots.push(virtual_index_descriptor(
+                relation_level,
+                level,
+                &component_roots,
+            ));
+            let selected = selected_rows(
+                relation_level,
+                level.inverse_rate * level.group,
+                queries,
+                &component_roots,
+            );
+            let (front, _, _) = selected_row_front(level, &commitments, &selected);
+            let mut selected_values = Vec::with_capacity(2 * queries * level.width);
+            for row in &selected {
+                let row_start = row * level.width;
+                selected_values.extend_from_slice(&codeword[row_start..row_start + level.width]);
+                selected_values
+                    .extend_from_slice(&index_oracle[row_start..row_start + level.width]);
+            }
+            let qa = prove_tensor_product_relation(
+                index_oracle,
+                codeword,
+                level.inverse_rate * level.group,
+                level.width,
+                local_relation_roots(b"strong-QA-membership", relation_level, &component_roots),
+            );
+            assert_eq!(qa.proof.claimed_sum, Field192::ZERO);
+            let mut terminal = Vec::with_capacity(2 * level.next_blocks * level.width);
+            terminal.extend_from_slice(&qa.right_ood_row);
+            terminal.extend_from_slice(&qa.left_ood_row);
+            terminal.extend_from_slice(&selected_values);
+            assert_eq!(terminal.len(), 2 * level.next_blocks * level.width);
+            let ood_root = standard_ood_block_root(level, &terminal, &zeros);
+            assert!(derived_terminal_root_for_level(
+                relation_level,
+                level,
+                &component_roots,
+                &front,
+                ood_root,
+                (2 * level.next_blocks * level.group).next_power_of_two(),
+                &zeros,
+            )
+            .is_some());
+            let fixed_generator_count = level.inverse_rate - 1;
+            let wire_roots = component_roots.len() - fixed_generator_count;
+            assert_eq!(wire_roots, level.inverse_rate + 2);
+            let front_bytes = front.serialize().len();
+            let membership_bytes = qa.proof.serialize().len();
+            let core_bytes = 32 + wire_roots * 32 + 64 + front_bytes + membership_bytes;
+            let framed_core_bytes = 4 + core_bytes;
+            let base_bytes = 12 + level.next_blocks * level.width * 24;
+            let total_bytes = fixed_prefix_bytes + framed_core_bytes + base_bytes;
+            eprintln!(
+                "final-threshold-sweep rate=1/{inverse_rate} q={queries} total-bytes={total_bytes} core-framed-bytes={framed_core_bytes} base-bytes={base_bytes} front-bytes={front_bytes} membership-bytes={membership_bytes} elapsed-ms={:.3}",
+                start.elapsed().as_secs_f64() * 1_000.0,
+            );
+            total_bytes
+        };
+
+        let candidates = [
+            (24, 31),
+            (28, 30),
+            (31, 29),
+            (36, 28),
+            (43, 27),
+            (51, 26),
+            (63, 25),
+            (64, 25),
+            (80, 24),
+            (108, 23),
+            (158, 22),
+        ];
+        let totals = candidates.map(|(inverse_rate, queries)| run(inverse_rate, queries));
+        assert_eq!(totals[5], 296_112);
+        let best = totals
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, total)| **total)
+            .map(|(index, total)| (index, *total));
+        assert_eq!(best, Some((5, 296_112)));
+        eprintln!("final-threshold-sweep-best={best:?}");
     }
 
     #[test]
@@ -14455,12 +14582,12 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 296_412);
+        assert_eq!(payload.len(), 296_112);
 
         let breakdown = proof.byte_breakdown(payload.len());
         assert_eq!(breakdown.total, payload.len());
-        assert_eq!(breakdown.base_total, 9_996);
-        assert_eq!(breakdown.terminal_witness, 9_984);
+        assert_eq!(breakdown.base_total, 10_380);
+        assert_eq!(breakdown.terminal_witness, 10_368);
         assert_eq!(breakdown.terminal_pcs, 0);
 
         let mut changed_base = proof.clone();
@@ -14586,7 +14713,7 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 296_412);
+        assert_eq!(payload.len(), 296_112);
 
         let mut fronts = Vec::<(&SelectedRowFront, Level, &[Digest])>::with_capacity(11);
         fronts.push((
@@ -14656,7 +14783,7 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 296_412);
+        assert_eq!(payload.len(), 296_112);
 
         clear_fixed_generator_spectra_cache();
         let preprocessing_start = Instant::now();
@@ -14902,7 +15029,7 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 296_412);
+        assert_eq!(payload.len(), 296_112);
 
         let strong_sizes = proof
             .strong
@@ -14910,11 +15037,11 @@ mod tests {
             .map(|core| 4 + core.serialize_unchecked().len())
             .collect::<Vec<_>>();
         let current_base = proof.base.serialize_unchecked().len();
-        let brakedown_distance = 0.976_f64;
+        let brakedown_distance = 0.9723_f64;
         let brakedown_target_bits = 131.228_f64;
         let brakedown_columns =
             (brakedown_target_bits / -(1.0 - brakedown_distance / 3.0).log2()).ceil() as usize;
-        assert_eq!(brakedown_columns, 232);
+        assert_eq!(brakedown_columns, 233);
         eprintln!("strong-core-framed-bytes={strong_sizes:?}");
         eprintln!(
             "brakedown-equal-security-target={brakedown_target_bits:.3} bits distance={brakedown_distance:.2} columns={brakedown_columns}"
@@ -14968,15 +15095,15 @@ mod tests {
             payload.len(),
             digest.to_hex()
         );
-        assert_eq!(payload.len(), 296_412);
-        assert_eq!(canonical_fixed_generator_root_count(), 190);
-        assert_eq!(payload.len() + 190 * 32, 302_492);
+        assert_eq!(payload.len(), 296_112);
+        assert_eq!(canonical_fixed_generator_root_count(), 177);
+        assert_eq!(payload.len() + 177 * 32, 301_776);
         let restored = RecursiveStrongEndToEndProof::deserialize(&payload)
             .expect("public-index roots must reconstruct a valid logical proof");
         assert_eq!(restored, proof);
         assert_eq!(
             digest.as_bytes(),
-            &hex::decode("e0feaa1c11bcb141b8122e413f6d113a4920ac7fb7c8b9fecd5ff0edcbdb459b")
+            &hex::decode("88d26347691b4bec86733835ab6f27519e3f196ba884fa25460d41150948e68d")
                 .unwrap()[..]
         );
     }
