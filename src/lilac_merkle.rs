@@ -1667,6 +1667,43 @@ pub fn parent(left: Digest, right: Digest) -> Digest {
     parent_one_block_v2(left, right)
 }
 
+/// Hash independent ordered parent pairs with the architecture's widest
+/// exact fixed-block kernel.  Output order matches input order.
+pub fn parent_pairs_batched(pairs: &[(Digest, Digest)]) -> Vec<Digest> {
+    let mut output = Vec::with_capacity(pairs.len());
+    let mut chunks8 = pairs.chunks_exact(8);
+    for chunk in &mut chunks8 {
+        let children = std::array::from_fn(|index| {
+            let (left, right) = chunk[index / 2];
+            if index & 1 == 0 {
+                left
+            } else {
+                right
+            }
+        });
+        output.extend_from_slice(&parent8_one_block_v2(&children));
+    }
+    let mut chunks4 = chunks8.remainder().chunks_exact(4);
+    for chunk in &mut chunks4 {
+        let children = std::array::from_fn(|index| {
+            let (left, right) = chunk[index / 2];
+            if index & 1 == 0 {
+                left
+            } else {
+                right
+            }
+        });
+        output.extend_from_slice(&parent4_one_block_v2(&children));
+    }
+    output.extend(
+        chunks4
+            .remainder()
+            .iter()
+            .map(|(left, right)| parent_one_block_v2(*left, *right)),
+    );
+    output
+}
+
 fn parent4_one_block_v2(children: &[Digest; 8]) -> [Digest; 4] {
     let blocks = std::array::from_fn(|index| {
         let mut block = [0_u8; 64];
@@ -3717,6 +3754,27 @@ mod tests {
             let scalar =
                 std::array::from_fn(|index| parent(children[2 * index], children[2 * index + 1]));
             assert_eq!(batched, scalar);
+        }
+    }
+
+    #[test]
+    fn batched_parent_pairs_match_scalar_parents() {
+        let pairs = (0..37_u64)
+            .map(|index| {
+                (
+                    *blake3::hash(&(2 * index).to_le_bytes()).as_bytes(),
+                    *blake3::hash(&(2 * index + 1).to_le_bytes()).as_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for count in 0..=pairs.len() {
+            assert_eq!(
+                parent_pairs_batched(&pairs[..count]),
+                pairs[..count]
+                    .iter()
+                    .map(|(left, right)| parent(*left, *right))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 

@@ -21,8 +21,8 @@ use whir::{
     bits::Bits,
     hash::{BLAKE3, HASH_COUNTER},
     lilac_merkle::{
-        combine_equal_subtrees, exact_prefix_root_with_scratch, parent, prefix_root,
-        scaled_prefix_root, zero_roots, Digest, MerkleAccumulator,
+        combine_equal_subtrees, exact_prefix_root_with_scratch, parent, parent_pairs_batched,
+        prefix_root, scaled_prefix_root, zero_roots, Digest, MerkleAccumulator,
     },
     parameters::ProtocolParameters,
     transcript::{codecs::Empty, DomainSeparator, Proof, ProverState, VerifierState},
@@ -5515,7 +5515,8 @@ impl RowSubtreeMultiProof {
         })
     }
 
-    fn verify(&self, expected_root: Digest, row_domain: usize) -> bool {
+    #[cfg(test)]
+    fn verify_scalar(&self, expected_root: Digest, row_domain: usize) -> bool {
         if self.indices.is_empty()
             || self.indices.len() != self.roots.len()
             || self.indices.windows(2).any(|pair| pair[0] >= pair[1])
@@ -5566,6 +5567,63 @@ impl RowSubtreeMultiProof {
         frontier_position == self.frontier.len()
             && active.len() == 1
             && active.get(&0) == Some(&expected_root)
+    }
+
+    fn verify(&self, expected_root: Digest, row_domain: usize) -> bool {
+        if self.indices.is_empty()
+            || self.indices.len() != self.roots.len()
+            || self.indices.windows(2).any(|pair| pair[0] >= pair[1])
+            || self
+                .indices
+                .last()
+                .is_some_and(|index| *index >= row_domain)
+        {
+            return false;
+        }
+        let mut active = self
+            .indices
+            .iter()
+            .copied()
+            .zip(self.roots.iter().copied())
+            .collect::<Vec<_>>();
+        let mut frontier_position = 0;
+        let mut width = row_domain;
+        while width > 1 {
+            let mut parent_indices = Vec::with_capacity(active.len());
+            let mut child_pairs = Vec::with_capacity(active.len());
+            let mut position = 0;
+            while position < active.len() {
+                let (index, root) = active[position];
+                let sibling = index ^ 1;
+                let sibling_root = if index & 1 == 0
+                    && active
+                        .get(position + 1)
+                        .is_some_and(|(next, _)| *next == sibling)
+                {
+                    position += 1;
+                    active[position].1
+                } else {
+                    let Some(value) = self.frontier.get(frontier_position) else {
+                        return false;
+                    };
+                    frontier_position += 1;
+                    *value
+                };
+                parent_indices.push(index >> 1);
+                child_pairs.push(if index & 1 == 0 {
+                    (root, sibling_root)
+                } else {
+                    (sibling_root, root)
+                });
+                position += 1;
+            }
+            let parent_roots = parent_pairs_batched(&child_pairs);
+            active = parent_indices.into_iter().zip(parent_roots).collect();
+            width >>= 1;
+        }
+        frontier_position == self.frontier.len()
+            && active.len() == 1
+            && active[0] == (0, expected_root)
     }
 }
 
@@ -13471,6 +13529,78 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "production scalar versus batched row-subtree path verifier benchmark"]
+    fn canonical_row_subtree_paths_benchmark_batched_parents() {
+        use std::hint::black_box;
+
+        let carry = run_production_carryopen(1, false);
+        let certificate = run_semantic_certificate_only(64, false);
+        let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
+        let payload = proof.serialize();
+        assert_eq!(payload.len(), 303_204);
+
+        let mut fronts = Vec::<(&SelectedRowFront, Level, &[Digest])>::with_capacity(11);
+        fronts.push((
+            &proof.carryopen.selected_front,
+            carryopen_level(),
+            &proof.carryopen.component_roots,
+        ));
+        fronts.extend(proof.certificate.iter().map(|transition| {
+            (
+                &transition.selected_front,
+                LEVELS[transition.level],
+                transition.component_roots.as_slice(),
+            )
+        }));
+        fronts.extend(proof.strong.iter().map(|transition| {
+            (
+                &transition.selected_front,
+                transition.level().unwrap(),
+                transition.component_roots.as_slice(),
+            )
+        }));
+        assert_eq!(fronts.len(), 11);
+
+        let check = |batched: bool| {
+            fronts.iter().all(|(front, level, roots)| {
+                let proof_roots = &roots[level.inverse_rate..2 * level.inverse_rate];
+                front.proof_blocks.iter().all(|(block, path)| {
+                    if batched {
+                        path.verify(proof_roots[*block], level.group)
+                    } else {
+                        path.verify_scalar(proof_roots[*block], level.group)
+                    }
+                })
+            })
+        };
+        assert!(check(false));
+        assert!(check(true));
+
+        let repetitions = 200;
+        let run = |batched| {
+            let start = Instant::now();
+            for _ in 0..repetitions {
+                assert!(black_box(check(black_box(batched))));
+            }
+            start.elapsed().as_secs_f64() * 1_000.0
+        };
+        let mut scalar = Vec::with_capacity(8);
+        let mut batched = Vec::with_capacity(8);
+        for trial in 0..8 {
+            if trial % 2 == 0 {
+                scalar.push(run(false));
+                batched.push(run(true));
+            } else {
+                batched.push(run(true));
+                scalar.push(run(false));
+            }
+        }
+        eprintln!(
+            "canonical-row-paths repetitions={repetitions} scalar-ms={scalar:?} batched-ms={batched:?}"
+        );
+    }
+
+    #[test]
     #[ignore = "production canonical verifier stage profile"]
     fn canonical_verifier_reports_stage_profile() {
         let carry = run_production_carryopen(1, false);
@@ -13880,6 +14010,7 @@ mod tests {
         let commitment = compact_matrix_commitment(&values, 6, 3, 8, 8, &zeros);
         let proof = open_row_subtrees(&commitment, &[1, 4, 5]);
         assert!(proof.verify(commitment.root, commitment.row_domain));
+        assert!(proof.verify_scalar(commitment.root, commitment.row_domain));
         assert!(!proof.frontier.is_empty());
         let payload = proof.serialize();
         assert_eq!(
@@ -13891,9 +14022,11 @@ mod tests {
         let parsed = RowSubtreeMultiProof::deserialize(&changed_payload, vec![1, 4, 5])
             .expect("mutated proof remains syntactically parseable");
         assert!(!parsed.verify(commitment.root, commitment.row_domain));
+        assert!(!parsed.verify_scalar(commitment.root, commitment.row_domain));
         let mut changed = proof;
         changed.frontier[0][0] ^= 1;
         assert!(!changed.verify(commitment.root, commitment.row_domain));
+        assert!(!changed.verify_scalar(commitment.root, commitment.row_domain));
     }
 
     fn semantic_value_for_test(index: usize) -> Field192 {
