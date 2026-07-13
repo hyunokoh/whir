@@ -896,6 +896,43 @@ fn local_relation_roots(relation: &[u8], level: usize, transcript_roots: &[Diges
     roots
 }
 
+fn zero_weighted_relation_proof(
+    challenge_label: &[u8],
+    relation_label: &[u8],
+    level: usize,
+    fields: usize,
+    transcript_roots: &[Digest],
+) -> PackedSumcheckProof {
+    assert!(fields > 1);
+    let variables = fields.next_power_of_two().trailing_zeros() as usize;
+    let point = (0..variables)
+        .map(|index| semantic_challenge(challenge_label, level, index, transcript_roots))
+        .collect::<Vec<_>>();
+    let roots = local_relation_roots(relation_label, level, transcript_roots);
+    let mut pairs = Vec::with_capacity(variables);
+    let mut challenges = Vec::with_capacity(variables);
+    for _ in 0..variables {
+        pairs.push((Field192::ZERO, Field192::ZERO));
+        challenges.push(transcript_challenge(
+            fields,
+            variables,
+            &roots,
+            Field192::ZERO,
+            &pairs,
+        ));
+    }
+    let proof = PackedSumcheckProof {
+        fields,
+        roots,
+        claimed_sum: Field192::ZERO,
+        pairs,
+        terminal_left: Field192::ZERO,
+        terminal_right: equality_prefix_inner_product(&point, &challenges, fields),
+    };
+    assert_eq!(proof.challenges().as_deref(), Some(challenges.as_slice()));
+    proof
+}
+
 fn zero_phi_link_proof(
     challenge_label: &[u8],
     relation_label: &[u8],
@@ -903,13 +940,12 @@ fn zero_phi_link_proof(
     fields: usize,
     transcript_roots: &[Digest],
 ) -> PackedSumcheckProof {
-    let point = (0..fields.next_power_of_two().trailing_zeros() as usize)
-        .map(|index| semantic_challenge(challenge_label, level, index, transcript_roots))
-        .collect::<Vec<_>>();
-    prove_local_product_relation(
-        vec![Field192::ZERO; fields],
-        equality_weights(&point)[..fields].to_vec(),
-        local_relation_roots(relation_label, level, transcript_roots),
+    zero_weighted_relation_proof(
+        challenge_label,
+        relation_label,
+        level,
+        fields,
+        transcript_roots,
     )
 }
 
@@ -1348,6 +1384,46 @@ fn equality_weights_prefix(point: &[Field192], length: usize) -> Vec<Field192> {
     append_prefix(point, Field192::ONE, length, &mut output);
     assert_eq!(output.len(), length);
     output
+}
+
+/// Evaluate the inner product of two equality tables over their canonical
+/// leading `length` entries without materializing either table.
+fn equality_prefix_inner_product(
+    left_point: &[Field192],
+    right_point: &[Field192],
+    length: usize,
+) -> Field192 {
+    assert_eq!(left_point.len(), right_point.len());
+    let domain = 1usize << left_point.len();
+    assert!(length <= domain);
+    fn recurse(left: &[Field192], right: &[Field192], length: usize) -> Field192 {
+        if length == 0 {
+            return Field192::ZERO;
+        }
+        if left.is_empty() {
+            assert_eq!(length, 1);
+            return Field192::ONE;
+        }
+        if length == 1usize << left.len() {
+            return left
+                .iter()
+                .zip(right)
+                .fold(Field192::ONE, |product, (a, b)| {
+                    product * ((Field192::ONE - *a) * (Field192::ONE - *b) + *a * *b)
+                });
+        }
+        let half = 1usize << (left.len() - 1);
+        let low_length = length.min(half);
+        let low = (Field192::ONE - left[0])
+            * (Field192::ONE - right[0])
+            * recurse(&left[1..], &right[1..], low_length);
+        if length <= half {
+            low
+        } else {
+            low + left[0] * right[0] * recurse(&left[1..], &right[1..], length - half)
+        }
+    }
+    recurse(left_point, right_point, length)
 }
 
 const CARRYOPEN_ROWS: usize = 1 << 16;
@@ -6063,24 +6139,17 @@ fn semantic_certificate_objects(
         breakdown.transition_sumchecks += start.elapsed();
 
         let start = Instant::now();
-        relation_left.resize(level.view_capacity(), Field192::ZERO);
-        relation_right.resize(level.view_capacity(), Field192::ZERO);
-        relation_left.fill(Field192::ZERO);
-        relation_right.fill(Field192::ZERO);
-        populate_copy_relation(
-            level_index,
-            level,
-            &source,
-            &mut relation_left,
-            &mut relation_right,
-            &transcript_roots,
-        );
         let start_sumcheck = Instant::now();
-        let dual_view_copy = prove_local_product_relation_with_claim_reusing(
-            &mut relation_left,
-            &mut relation_right,
-            local_relation_roots(b"dual-view-copy", level_index, &transcript_roots),
-            Field192::ZERO,
+        // Both full views are deterministic permutations of the same source,
+        // so their honest residual is identically zero.  Generate the exact
+        // zero-relation transcript without materializing either view, its
+        // residual, or the equality table.
+        let dual_view_copy = zero_weighted_relation_proof(
+            b"copy",
+            b"dual-view-copy",
+            level_index,
+            level.view_capacity(),
+            &transcript_roots,
         );
         breakdown.transition_sumchecks += start_sumcheck.elapsed();
 
@@ -9694,6 +9763,41 @@ mod tests {
     }
 
     #[test]
+    fn symbolic_zero_relation_matches_materialized_sumcheck() {
+        let transcript_roots = (0..9).map(|index| [index as u8; 32]).collect::<Vec<_>>();
+        for fields in [2_usize, 3, 7, 8, 19, 64, 583, 823, 1_369, 2_438] {
+            let variables = fields.next_power_of_two().trailing_zeros() as usize;
+            let point = (0..variables)
+                .map(|index| semantic_challenge(b"copy", 2, index, &transcript_roots))
+                .collect::<Vec<_>>();
+            let roots = local_relation_roots(b"dual-view-copy", 2, &transcript_roots);
+            let materialized = prove_local_product_relation(
+                vec![Field192::ZERO; fields],
+                equality_weights_prefix(&point, fields),
+                roots,
+            );
+            let symbolic = zero_weighted_relation_proof(
+                b"copy",
+                b"dual-view-copy",
+                2,
+                fields,
+                &transcript_roots,
+            );
+            assert_eq!(symbolic, materialized);
+
+            let challenges = symbolic.challenges().unwrap();
+            let expected = dot(
+                &equality_weights_prefix(&point, fields),
+                &equality_weights_prefix(&challenges, fields),
+            );
+            assert_eq!(
+                equality_prefix_inner_product(&point, &challenges, fields),
+                expected,
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "production CarryOpen parallel-versus-sequential factor benchmark"]
     fn parallel_parity_factors_benchmark_sequential_carryopen() {
         let level = carryopen_level();
@@ -10609,6 +10713,161 @@ mod tests {
             median(&direct_ms),
             mean(&initialized_ms),
             mean(&direct_ms),
+        );
+    }
+
+    #[test]
+    #[ignore = "production four-level materialized-versus-symbolic zero relations"]
+    fn certificate_zero_relations_avoid_materialized_residuals() {
+        let inputs = LEVELS
+            .into_iter()
+            .enumerate()
+            .map(|(level_index, level)| {
+                let source = (0..level.raw)
+                    .into_par_iter()
+                    .map(|index| semantic_value(level_index, index))
+                    .collect::<Vec<_>>();
+                let roots = (0..2 * level.inverse_rate + 1)
+                    .map(|index| {
+                        *blake3::hash(
+                            &[
+                                b"LiLAC/copy-relation-benchmark/v1".as_slice(),
+                                &level_index.to_le_bytes(),
+                                &index.to_le_bytes(),
+                            ]
+                            .concat(),
+                        )
+                        .as_bytes()
+                    })
+                    .collect::<Vec<_>>();
+                (level_index, level, source, roots)
+            })
+            .collect::<Vec<_>>();
+        let expected = inputs
+            .iter()
+            .map(|(level_index, level, _, roots)| {
+                (
+                    zero_weighted_relation_proof(
+                        b"copy",
+                        b"dual-view-copy",
+                        *level_index,
+                        level.view_capacity(),
+                        roots,
+                    ),
+                    zero_weighted_relation_proof(
+                        b"Phi-link",
+                        b"Phi-link",
+                        *level_index,
+                        2 * level.next_blocks * level.width,
+                        roots,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let run = |symbolic: bool| {
+            let mut left = Vec::new();
+            let mut right = Vec::new();
+            let start = Instant::now();
+            let proofs = inputs
+                .iter()
+                .map(|(level_index, level, source, roots)| {
+                    let copy = if symbolic {
+                        zero_weighted_relation_proof(
+                            b"copy",
+                            b"dual-view-copy",
+                            *level_index,
+                            level.view_capacity(),
+                            roots,
+                        )
+                    } else {
+                        left.resize(level.view_capacity(), Field192::ZERO);
+                        right.resize(level.view_capacity(), Field192::ZERO);
+                        left.fill(Field192::ZERO);
+                        right.fill(Field192::ZERO);
+                        populate_copy_relation(
+                            *level_index,
+                            *level,
+                            source,
+                            &mut left,
+                            &mut right,
+                            roots,
+                        );
+                        prove_local_product_relation_with_claim_reusing(
+                            &mut left,
+                            &mut right,
+                            local_relation_roots(b"dual-view-copy", *level_index, roots),
+                            Field192::ZERO,
+                        )
+                    };
+                    let phi_fields = 2 * level.next_blocks * level.width;
+                    let phi = if symbolic {
+                        zero_weighted_relation_proof(
+                            b"Phi-link",
+                            b"Phi-link",
+                            *level_index,
+                            phi_fields,
+                            roots,
+                        )
+                    } else {
+                        let point = (0..phi_fields.next_power_of_two().trailing_zeros() as usize)
+                            .map(|index| {
+                                semantic_challenge(b"Phi-link", *level_index, index, roots)
+                            })
+                            .collect::<Vec<_>>();
+                        prove_local_product_relation(
+                            vec![Field192::ZERO; phi_fields],
+                            equality_weights_prefix(&point, phi_fields),
+                            local_relation_roots(b"Phi-link", *level_index, roots),
+                        )
+                    };
+                    (copy, phi)
+                })
+                .collect::<Vec<_>>();
+            let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+            assert_eq!(proofs, expected);
+            elapsed
+        };
+        let mut materialized_ms = Vec::with_capacity(16);
+        let mut symbolic_ms = Vec::with_capacity(16);
+        for trial in 0..8 {
+            let order = if trial % 2 == 0 {
+                [false, true, true, false]
+            } else {
+                [true, false, false, true]
+            };
+            let mut trial_materialized = Vec::with_capacity(2);
+            let mut trial_symbolic = Vec::with_capacity(2);
+            for symbolic in order {
+                let elapsed = run(symbolic);
+                if symbolic {
+                    symbolic_ms.push(elapsed);
+                    trial_symbolic.push(elapsed);
+                } else {
+                    materialized_ms.push(elapsed);
+                    trial_materialized.push(elapsed);
+                }
+            }
+            eprintln!(
+                "zero-relations trial={} materialized={:.3}/{:.3} ms symbolic={:.3}/{:.3} ms",
+                trial + 1,
+                trial_materialized[0],
+                trial_materialized[1],
+                trial_symbolic[0],
+                trial_symbolic[1],
+            );
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        let mean = |samples: &[f64]| samples.iter().sum::<f64>() / samples.len() as f64;
+        eprintln!(
+            "zero-relations materialized-ms={materialized_ms:?} symbolic-ms={symbolic_ms:?} materialized-median={:.3} symbolic-median={:.3} materialized-mean={:.3} symbolic-mean={:.3}",
+            median(&materialized_ms),
+            median(&symbolic_ms),
+            mean(&materialized_ms),
+            mean(&symbolic_ms),
         );
     }
 
