@@ -1350,6 +1350,22 @@ fn equality_weights(point: &[Field192]) -> Vec<Field192> {
     weights
 }
 
+/// Return the unnormalized Walsh--Hadamard spectrum of a scaled Boolean
+/// equality table without first materializing and transforming that table.
+/// For chi_r(x), each frequency bit contributes either 1 or 1 - 2 r_i.
+fn scaled_equality_walsh_spectrum(point: &[Field192], scale: Field192) -> Vec<Field192> {
+    let mut spectrum = Vec::with_capacity(1_usize << point.len());
+    spectrum.push(scale);
+    for coordinate in point.iter().rev() {
+        let factor = Field192::ONE - (*coordinate + *coordinate);
+        let active = spectrum.len();
+        for index in 0..active {
+            spectrum.push(spectrum[index] * factor);
+        }
+    }
+    spectrum
+}
+
 /// Return the canonical leading equality-table entries without expanding the
 /// unused suffix. The recursive order is identical to `equality_weights`:
 /// each coordinate's zero branch precedes its one branch.
@@ -5027,7 +5043,7 @@ fn index_oracle_factors_outer_parallel_for_benchmark(
     spectra: &[Vec<Field192>],
     transcript_roots: &[Digest],
 ) -> (Vec<Field192>, Vec<Field192>) {
-    index_oracle_factors_with_wht_mode(level_index, level, spectra, transcript_roots, false)
+    index_oracle_factors_with_wht_mode(level_index, level, spectra, transcript_roots, false, false)
 }
 
 #[cfg(test)]
@@ -5076,25 +5092,49 @@ fn index_oracle_factors_with_wht_mode(
     spectra: &[Vec<Field192>],
     transcript_roots: &[Digest],
     inner_parallel_wht: bool,
+    direct_equality_spectrum: bool,
 ) -> (Vec<Field192>, Vec<Field192>) {
     let codeword_rows = level.inverse_rate * level.group;
     let position_domain = codeword_rows.next_power_of_two();
-    let beta = equality_weights(
-        &(0..position_domain.trailing_zeros() as usize)
-            .map(|index| semantic_challenge(b"qa-row", level_index, index, transcript_roots))
-            .collect::<Vec<_>>(),
-    );
+    let beta_point = (0..position_domain.trailing_zeros() as usize)
+        .map(|index| semantic_challenge(b"qa-row", level_index, index, transcript_roots))
+        .collect::<Vec<_>>();
+    let beta = equality_weights(&beta_point);
     let alpha_point = (0..level.group.trailing_zeros() as usize)
         .map(|index| semantic_challenge(b"qa-lane", level_index, index, transcript_roots))
         .collect::<Vec<_>>();
     let alpha = equality_weights_prefix(&alpha_point, level.width);
+    let row_variables = level.group.trailing_zeros() as usize;
+    let block_variables = beta_point.len() - row_variables;
+    let block_weights = equality_weights(&beta_point[..block_variables]);
     let transformed_parity = spectra
         .par_iter()
         .enumerate()
         .map(|(block, spectrum)| {
             let start = (block + 1) * level.group;
-            let mut transformed = beta[start..start + level.group].to_vec();
-            if inner_parallel_wht {
+            let mut transformed = if direct_equality_spectrum {
+                scaled_equality_walsh_spectrum(
+                    &beta_point[block_variables..],
+                    block_weights[block + 1],
+                )
+            } else {
+                beta[start..start + level.group].to_vec()
+            };
+            if direct_equality_spectrum {
+                if inner_parallel_wht {
+                    transformed
+                        .par_iter_mut()
+                        .zip(spectrum.par_iter())
+                        .for_each(|(value, multiplier)| *value *= multiplier);
+                    wht_parallel_for_factors(&mut transformed);
+                } else {
+                    transformed
+                        .iter_mut()
+                        .zip(spectrum)
+                        .for_each(|(value, multiplier)| *value *= multiplier);
+                    wht(&mut transformed);
+                }
+            } else if inner_parallel_wht {
                 apply_encoder_parallel_for_factors(&mut transformed, spectrum);
             } else {
                 apply_encoder(&mut transformed, spectrum);
@@ -5131,13 +5171,16 @@ fn index_oracle_factors(
 ) -> (Vec<Field192>, Vec<Field192>) {
     // CarryOpen has only three parity spectra, leaving enough worker capacity
     // for profitable nested WHT parallelism.  Smaller certificate and strong
-    // levels retain the lower-overhead outer-parallel encoder.
+    // levels retain the lower-overhead outer-parallel encoder.  Equality-table
+    // spectra are generated directly at groups of at least 256; below that
+    // size the saved forward WHT is within scheduling noise.
     index_oracle_factors_with_wht_mode(
         level_index,
         level,
         spectra,
         transcript_roots,
         level.group >= 1 << 14,
+        level.group >= 1 << 8,
     )
 }
 
@@ -10096,6 +10139,20 @@ mod tests {
     }
 
     #[test]
+    fn direct_equality_walsh_spectrum_matches_transform() {
+        for variables in 0..=12 {
+            let point = (0..variables)
+                .map(|index| fixed_challenge(b"direct-equality-WHT", variables, index))
+                .collect::<Vec<_>>();
+            let scale = fixed_challenge(b"direct-equality-WHT-scale", variables, 0);
+            let mut expected = equality_weights(&point);
+            expected.iter_mut().for_each(|value| *value *= scale);
+            wht(&mut expected);
+            assert_eq!(scaled_equality_walsh_spectrum(&point, scale), expected);
+        }
+    }
+
+    #[test]
     fn direct_first_evaluation_round_matches_copy_then_fold() {
         for variables in 1..=12 {
             let fields = 1usize << variables;
@@ -10359,9 +10416,15 @@ mod tests {
     #[test]
     fn parallel_wht_factors_match_outer_parallel() {
         let (level, spectra, roots) = parallel_wht_factor_fixture();
+        let expected =
+            index_oracle_factors_outer_parallel_for_benchmark(10, level, spectra.as_ref(), &roots);
         assert_eq!(
             index_oracle_factors(10, level, spectra.as_ref(), &roots),
-            index_oracle_factors_outer_parallel_for_benchmark(10, level, spectra.as_ref(), &roots)
+            expected
+        );
+        assert_eq!(
+            index_oracle_factors_with_wht_mode(10, level, spectra.as_ref(), &roots, true, true),
+            expected
         );
     }
 
@@ -10372,7 +10435,8 @@ mod tests {
         let outer = || {
             index_oracle_factors_outer_parallel_for_benchmark(10, level, spectra.as_ref(), &roots)
         };
-        let nested = || index_oracle_factors(10, level, spectra.as_ref(), &roots);
+        let nested =
+            || index_oracle_factors_with_wht_mode(10, level, spectra.as_ref(), &roots, true, false);
         let expected = outer();
         assert_eq!(nested(), expected);
         let mut outer_ms = Vec::with_capacity(8);
@@ -10396,6 +10460,108 @@ mod tests {
             }
         }
         eprintln!("carryopen-parallel-WHT-factors outer-ms={outer_ms:?} nested-ms={nested_ms:?}");
+    }
+
+    #[test]
+    #[ignore = "production CarryOpen direct equality-spectrum factor benchmark"]
+    fn direct_equality_spectrum_benchmarks_nested_forward_wht() {
+        let (level, spectra, roots) = parallel_wht_factor_fixture();
+        let nested =
+            || index_oracle_factors_with_wht_mode(10, level, spectra.as_ref(), &roots, true, false);
+        let direct =
+            || index_oracle_factors_with_wht_mode(10, level, spectra.as_ref(), &roots, true, true);
+        let expected = nested();
+        assert_eq!(direct(), expected);
+        let mut nested_ms = Vec::with_capacity(8);
+        let mut direct_ms = Vec::with_capacity(8);
+        for trial in 0..4 {
+            let order = if trial % 2 == 0 {
+                [false, true, true, false]
+            } else {
+                [true, false, false, true]
+            };
+            for use_direct in order {
+                let start = Instant::now();
+                let factors = std::hint::black_box(if use_direct { direct() } else { nested() });
+                let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+                assert_eq!(factors, expected);
+                if use_direct {
+                    direct_ms.push(elapsed);
+                } else {
+                    nested_ms.push(elapsed);
+                }
+            }
+        }
+        eprintln!(
+            "carryopen-direct-equality-spectrum nested-ms={nested_ms:?} direct-ms={direct_ms:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "certificate and strong direct equality-spectrum threshold benchmark"]
+    fn direct_equality_spectrum_benchmarks_smaller_levels() {
+        let levels = LEVELS
+            .iter()
+            .copied()
+            .enumerate()
+            .chain((0..STRONG_ROUNDS).map(|round| {
+                (
+                    12 + round,
+                    strong_round_level(round).expect("strong round must have a level"),
+                )
+            }));
+        for (level_index, level) in levels {
+            let spectra = fixed_generator_spectra(level_index, level);
+            let roots = (0..2 * level.inverse_rate)
+                .map(|index| {
+                    *blake3::hash(
+                        &[
+                            b"LiLAC/direct-equality-small-level/v1".as_slice(),
+                            &level_index.to_le_bytes(),
+                            &index.to_le_bytes(),
+                        ]
+                        .concat(),
+                    )
+                    .as_bytes()
+                })
+                .collect::<Vec<_>>();
+            let run = |direct: bool| {
+                index_oracle_factors_with_wht_mode(
+                    level_index,
+                    level,
+                    spectra.as_ref(),
+                    &roots,
+                    false,
+                    direct,
+                )
+            };
+            let expected = run(false);
+            assert_eq!(run(true), expected);
+            let mut wht_ms = Vec::with_capacity(8);
+            let mut direct_ms = Vec::with_capacity(8);
+            for trial in 0..4 {
+                let order = if trial % 2 == 0 {
+                    [false, true, true, false]
+                } else {
+                    [true, false, false, true]
+                };
+                for direct in order {
+                    let start = Instant::now();
+                    assert_eq!(std::hint::black_box(run(direct)), expected);
+                    let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+                    if direct {
+                        direct_ms.push(elapsed);
+                    } else {
+                        wht_ms.push(elapsed);
+                    }
+                }
+            }
+            eprintln!(
+                "direct-equality-small-level level={level_index} group={} spectra={} wht-ms={wht_ms:?} direct-ms={direct_ms:?}",
+                level.group,
+                spectra.len()
+            );
+        }
     }
 
     #[test]
@@ -10423,6 +10589,7 @@ mod tests {
                     spectra.as_ref(),
                     &roots,
                     nested,
+                    false,
                 )
             };
             let expected = run(false);
