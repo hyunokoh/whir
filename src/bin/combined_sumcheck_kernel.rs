@@ -12267,6 +12267,86 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "production-scale direct word-major field-level-2 handoff benchmark"]
+    fn direct_word_major_field2_benchmarks_transposed_tensor_roots() {
+        let level = carryopen_level();
+        let zeros = zero_roots(30);
+        let message = (0..CARRYOPEN_FIELDS)
+            .into_par_iter()
+            .map(precarry_message_value)
+            .collect::<Vec<_>>();
+        let message_row_roots = message
+            .par_chunks_exact(CARRYOPEN_WIDTH)
+            .map(|row| prefix_root(row, CARRYOPEN_WIDTH, &zeros))
+            .collect::<Vec<_>>();
+        let vertical_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(10, component, CARRYOPEN_ROWS))
+            .collect::<Vec<_>>();
+        let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
+            .map(|component| generator_spectrum(11, component, CARRYOPEN_WIDTH))
+            .collect::<Vec<_>>();
+        let mut proof_codeword = vec![Field192::ZERO; level.qa_fields()];
+        populate_proof_codeword(level, &message, &mut proof_codeword, &vertical_spectra, 64);
+        let run = |row_root: fn(&[Field192], usize, &[Digest]) -> Digest| {
+            let start = Instant::now();
+            let commitments = tensor_row_commitments_with_root(
+                &proof_codeword,
+                &message_row_roots,
+                &horizontal_spectra,
+                &zeros,
+                row_root,
+                combine_equal_subtrees,
+            );
+            (commitments, start.elapsed())
+        };
+        let direct_first_order = std::env::var_os("LILAC_DIRECT_WORD_MAJOR_FIELD2_FIRST").is_some();
+        let (
+            (transposed_first, transposed_first_time),
+            (direct_first, direct_first_time),
+            (direct_second, direct_second_time),
+            (transposed_second, transposed_second_time),
+        ) = if direct_first_order {
+            let direct_first = run(prefix_root);
+            let transposed_first = run(prefix_root_word_major_upper_v2_for_benchmark);
+            let transposed_second = run(prefix_root_word_major_upper_v2_for_benchmark);
+            let direct_second = run(prefix_root);
+            (
+                transposed_first,
+                direct_first,
+                direct_second,
+                transposed_second,
+            )
+        } else {
+            let transposed_first = run(prefix_root_word_major_upper_v2_for_benchmark);
+            let direct_first = run(prefix_root);
+            let direct_second = run(prefix_root);
+            let transposed_second = run(prefix_root_word_major_upper_v2_for_benchmark);
+            (
+                transposed_first,
+                direct_first,
+                direct_second,
+                transposed_second,
+            )
+        };
+        for candidate in [&direct_first, &direct_second, &transposed_second] {
+            assert_eq!(candidate.len(), transposed_first.len());
+            for (candidate, expected) in candidate.iter().zip(&transposed_first) {
+                assert_eq!(candidate.root, expected.root);
+                assert_eq!(candidate.row_roots, expected.row_roots);
+                assert_eq!(candidate.row_domain, expected.row_domain);
+                assert_eq!(candidate.zero_row_root, expected.zero_row_root);
+            }
+        }
+        eprintln!(
+            "direct-word-major-field2-first={direct_first_order} transposed={:.3}/{:.3} ms direct={:.3}/{:.3} ms",
+            transposed_first_time.as_secs_f64() * 1_000.0,
+            transposed_second_time.as_secs_f64() * 1_000.0,
+            direct_first_time.as_secs_f64() * 1_000.0,
+            direct_second_time.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
     #[ignore = "production-scale matrix-local versus flat row-root staging benchmark"]
     fn matrix_local_row_roots_benchmark_flat_staging() {
         let level = carryopen_level();

@@ -951,6 +951,25 @@ mod neon4 {
         unsafe { compress_parent_v2_digests8(&left, &right) }
     }
 
+    /// Return the same eight level-2 digests in the word-major scratch layout
+    /// consumed by the upper reducer. Keeping this representation avoids a
+    /// lane-major store followed immediately by the inverse transpose.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn compress_field_level2_v2_word_major_8(
+        first: &[[u64; 3]; 8],
+        second: &[[u64; 3]; 8],
+        third: &[[u64; 3]; 8],
+        fourth: &[[u64; 3]; 8],
+    ) -> [Digest; 8] {
+        let first_parents = unsafe { compress_field_level1_v2_words8(first, second) };
+        let second_parents = unsafe { compress_field_level1_v2_words8(third, fourth) };
+        let (left, right) = unsafe { pair_child_words8(&first_parents, &second_parents) };
+        let parents = unsafe { compress_parent_v2_words8(&left, &right) };
+        let mut output = [[0_u8; 32]; 8];
+        unsafe { store_word_major_group8(&mut output, &parents) };
+        output
+    }
+
     #[target_feature(enable = "neon")]
     pub unsafe fn compress_parent_level2_v2_8(
         first: &[Digest; 16],
@@ -962,14 +981,18 @@ mod neon4 {
         unsafe { compress_parent_v2_digests8(&left, &right) }
     }
 
-    #[target_feature(enable = "neon")]
-    pub unsafe fn reduce_word_major_parent_groups_v2(scratch: &mut [Digest]) {
+    #[inline(always)]
+    unsafe fn reduce_word_major_parent_groups_v2_impl<const INPUT_WORD_MAJOR: bool>(
+        scratch: &mut [Digest],
+    ) {
         assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
         assert_eq!(scratch.len() % 8, 0);
-        for chunk in scratch.chunks_exact_mut(8) {
-            let chunk: &mut [Digest; 8] = chunk.try_into().unwrap();
-            let words = unsafe { load_contiguous_digest_words8(chunk) };
-            unsafe { store_word_major_group8(chunk, &words) };
+        if !INPUT_WORD_MAJOR {
+            for chunk in scratch.chunks_exact_mut(8) {
+                let chunk: &mut [Digest; 8] = chunk.try_into().unwrap();
+                let words = unsafe { load_contiguous_digest_words8(chunk) };
+                unsafe { store_word_major_group8(chunk, &words) };
+            }
         }
         let mut groups = scratch.len() / 8;
         while groups > 1 {
@@ -999,6 +1022,16 @@ mod neon4 {
         };
         let final_group: &mut [Digest; 8] = (&mut scratch[..8]).try_into().unwrap();
         unsafe { store_lane_major_digests8(final_group, &words) };
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn reduce_word_major_parent_groups_v2(scratch: &mut [Digest]) {
+        unsafe { reduce_word_major_parent_groups_v2_impl::<false>(scratch) }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub unsafe fn reduce_pretransposed_word_major_parent_groups_v2(scratch: &mut [Digest]) {
+        unsafe { reduce_word_major_parent_groups_v2_impl::<true>(scratch) }
     }
 
     #[inline(always)]
@@ -1696,6 +1729,25 @@ fn field_level2_one_block_v2(values: &[Field192; 32]) -> [Digest; 8] {
     }
 }
 
+/// Produce eight level-2 outputs in the opaque word-major layout expected by
+/// the AArch64 upper reducer. The non-AArch64 fallback remains lane-major and
+/// is consumed by its ordinary reducer.
+fn field_level2_one_block_v2_word_major(values: &[Field192; 32]) -> [Digest; 8] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let first = std::array::from_fn(|index| values[index].into_bigint().0);
+        let second = std::array::from_fn(|index| values[8 + index].into_bigint().0);
+        let third = std::array::from_fn(|index| values[16 + index].into_bigint().0);
+        let fourth = std::array::from_fn(|index| values[24 + index].into_bigint().0);
+        // SAFETY: AArch64 guarantees NEON support.
+        unsafe { neon4::compress_field_level2_v2_word_major_8(&first, &second, &third, &fourth) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        field_level2_one_block_v2(values)
+    }
+}
+
 fn parent_level2_one_block_v2(children: &[Digest; 32]) -> [Digest; 8] {
     #[cfg(target_arch = "aarch64")]
     {
@@ -2079,6 +2131,21 @@ fn reduce_exact_digests_word_major_v2(scratch: &mut [Digest]) -> Digest {
     }
 }
 
+fn reduce_exact_digests_pretransposed_word_major_v2(scratch: &mut [Digest]) -> Digest {
+    assert!(scratch.len() >= 8 && scratch.len().is_power_of_two());
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: the field-level-2 producer stored every eight-digest group
+        // in the word-major layout required by this reducer.
+        unsafe { neon4::reduce_pretransposed_word_major_parent_groups_v2(scratch) };
+        reduce_exact_digests_unfused_parent_levels(&mut scratch[..8])
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        reduce_exact_digests(scratch)
+    }
+}
+
 fn extend_field_leaves_batched<F>(values: &[Field192], scratch: &mut Vec<Digest>, transform: F)
 where
     F: Fn(Field192) -> Field192,
@@ -2121,6 +2188,14 @@ fn extend_field_level2_batched_v2(values: &[Field192], scratch: &mut Vec<Digest>
     for chunk in values.chunks_exact(32) {
         let values: &[Field192; 32] = chunk.try_into().unwrap();
         scratch.extend_from_slice(&field_level2_one_block_v2(values));
+    }
+}
+
+fn extend_field_level2_batched_word_major_v2(values: &[Field192], scratch: &mut Vec<Digest>) {
+    assert!(values.len() >= 32 && values.len().is_power_of_two());
+    for chunk in values.chunks_exact(32) {
+        let values: &[Field192; 32] = chunk.try_into().unwrap();
+        scratch.extend_from_slice(&field_level2_one_block_v2_word_major(values));
     }
 }
 
@@ -2233,8 +2308,8 @@ pub fn exact_prefix_root_with_scratch(values: &[Field192], scratch: &mut Vec<Dig
     assert!(values.len() >= 8 && values.len().is_power_of_two());
     scratch.clear();
     if values.len() >= 32 {
-        extend_field_level2_batched_v2(values, scratch);
-        reduce_exact_digests_word_major_v2(scratch)
+        extend_field_level2_batched_word_major_v2(values, scratch);
+        reduce_exact_digests_pretransposed_word_major_v2(scratch)
     } else if values.len() >= 16 {
         extend_field_level1_batched(values, scratch);
         reduce_exact_digests(scratch)
@@ -3186,6 +3261,64 @@ mod tests {
             lane_second.as_secs_f64() * 1_000.0,
             word_first.as_secs_f64() * 1_000.0,
             word_second.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "direct word-major field-level-2 exact-root benchmark"]
+    fn direct_word_major_field2_benchmarks_transposed_handoff() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let values = (0..1024_u64)
+            .map(|index| {
+                let seed = blake3::hash(&(index + 1009).to_le_bytes());
+                Field192::from_le_bytes_mod_order(seed.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        let zeros = zero_roots(10);
+        let expected = prefix_root_word_major_upper_v2_for_benchmark(&values, values.len(), &zeros);
+        assert_eq!(expected, prefix_root(&values, values.len(), &zeros));
+        let iterations = 20_000;
+        let run = |root: fn(&[Field192], usize, &[Digest]) -> Digest| {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(root(black_box(&values), values.len(), &zeros));
+            }
+            start.elapsed()
+        };
+        let direct_first_order =
+            std::env::var_os("LILAC_DIRECT_WORD_MAJOR_FIELD2_MICRO_FIRST").is_some();
+        let (transposed_first, direct_first, direct_second, transposed_second) =
+            if direct_first_order {
+                let direct_first = run(prefix_root);
+                let transposed_first = run(prefix_root_word_major_upper_v2_for_benchmark);
+                let transposed_second = run(prefix_root_word_major_upper_v2_for_benchmark);
+                let direct_second = run(prefix_root);
+                (
+                    transposed_first,
+                    direct_first,
+                    direct_second,
+                    transposed_second,
+                )
+            } else {
+                let transposed_first = run(prefix_root_word_major_upper_v2_for_benchmark);
+                let direct_first = run(prefix_root);
+                let direct_second = run(prefix_root);
+                let transposed_second = run(prefix_root_word_major_upper_v2_for_benchmark);
+                (
+                    transposed_first,
+                    direct_first,
+                    direct_second,
+                    transposed_second,
+                )
+            };
+        eprintln!(
+            "direct-word-major-field2-first={direct_first_order} exact_root_1024 iterations={iterations} transposed={:.3}/{:.3} ms direct={:.3}/{:.3} ms",
+            transposed_first.as_secs_f64() * 1_000.0,
+            transposed_second.as_secs_f64() * 1_000.0,
+            direct_first.as_secs_f64() * 1_000.0,
+            direct_second.as_secs_f64() * 1_000.0,
         );
     }
 
