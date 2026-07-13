@@ -4090,6 +4090,37 @@ fn wht(values: &mut [Field192]) {
     }
 }
 
+fn wht_parallel_for_factors(values: &mut [Field192]) {
+    let mut half = 1;
+    while half < values.len() {
+        values.par_chunks_mut(2 * half).for_each(|block| {
+            let (left, right) = block.split_at_mut(half);
+            let mut index = 0;
+            while index + 4 <= half {
+                wht_butterfly(left, right, index);
+                wht_butterfly(left, right, index + 1);
+                wht_butterfly(left, right, index + 2);
+                wht_butterfly(left, right, index + 3);
+                index += 4;
+            }
+            while index < half {
+                wht_butterfly(left, right, index);
+                index += 1;
+            }
+        });
+        half *= 2;
+    }
+}
+
+fn apply_encoder_parallel_for_factors(message: &mut [Field192], spectrum: &[Field192]) {
+    wht_parallel_for_factors(message);
+    message
+        .par_iter_mut()
+        .zip(spectrum.par_iter())
+        .for_each(|(value, multiplier)| *value *= multiplier);
+    wht_parallel_for_factors(message);
+}
+
 #[cfg(test)]
 fn wht_iterator(values: &mut [Field192]) {
     let mut half = 1;
@@ -4989,52 +5020,14 @@ fn materialize_index_oracle(
 /// Return the public rank-one factorization W[row,lane] = c[row] * alpha[lane].
 /// The generator is fixed preprocessing and `transcript_roots` is already fixed
 /// before the virtual-W descriptor enters Fiat--Shamir.
-fn index_oracle_factors(
+#[cfg(test)]
+fn index_oracle_factors_outer_parallel_for_benchmark(
     level_index: usize,
     level: Level,
     spectra: &[Vec<Field192>],
     transcript_roots: &[Digest],
 ) -> (Vec<Field192>, Vec<Field192>) {
-    let codeword_rows = level.inverse_rate * level.group;
-    let position_domain = codeword_rows.next_power_of_two();
-    let beta = equality_weights(
-        &(0..position_domain.trailing_zeros() as usize)
-            .map(|index| semantic_challenge(b"qa-row", level_index, index, transcript_roots))
-            .collect::<Vec<_>>(),
-    );
-    let alpha_point = (0..level.group.trailing_zeros() as usize)
-        .map(|index| semantic_challenge(b"qa-lane", level_index, index, transcript_roots))
-        .collect::<Vec<_>>();
-    let alpha = equality_weights_prefix(&alpha_point, level.width);
-    let transformed_parity = spectra
-        .par_iter()
-        .enumerate()
-        .map(|(block, spectrum)| {
-            let start = (block + 1) * level.group;
-            let mut transformed = beta[start..start + level.group].to_vec();
-            apply_encoder(&mut transformed, spectrum);
-            transformed
-        })
-        .collect::<Vec<_>>();
-    let mut message_weights = beta[..level.group].to_vec();
-    message_weights
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(row, target)| {
-            for transformed in &transformed_parity {
-                *target += transformed[row];
-            }
-        });
-    let coefficients = (0..codeword_rows)
-        .map(|row| {
-            if row < level.group {
-                beta[row] - message_weights[row]
-            } else {
-                beta[row]
-            }
-        })
-        .collect();
-    (coefficients, alpha)
+    index_oracle_factors_with_wht_mode(level_index, level, spectra, transcript_roots, false)
 }
 
 #[cfg(test)]
@@ -5075,6 +5068,77 @@ fn index_oracle_factors_sequential_parity_for_benchmark(
         })
         .collect();
     (coefficients, alpha)
+}
+
+fn index_oracle_factors_with_wht_mode(
+    level_index: usize,
+    level: Level,
+    spectra: &[Vec<Field192>],
+    transcript_roots: &[Digest],
+    inner_parallel_wht: bool,
+) -> (Vec<Field192>, Vec<Field192>) {
+    let codeword_rows = level.inverse_rate * level.group;
+    let position_domain = codeword_rows.next_power_of_two();
+    let beta = equality_weights(
+        &(0..position_domain.trailing_zeros() as usize)
+            .map(|index| semantic_challenge(b"qa-row", level_index, index, transcript_roots))
+            .collect::<Vec<_>>(),
+    );
+    let alpha_point = (0..level.group.trailing_zeros() as usize)
+        .map(|index| semantic_challenge(b"qa-lane", level_index, index, transcript_roots))
+        .collect::<Vec<_>>();
+    let alpha = equality_weights_prefix(&alpha_point, level.width);
+    let transformed_parity = spectra
+        .par_iter()
+        .enumerate()
+        .map(|(block, spectrum)| {
+            let start = (block + 1) * level.group;
+            let mut transformed = beta[start..start + level.group].to_vec();
+            if inner_parallel_wht {
+                apply_encoder_parallel_for_factors(&mut transformed, spectrum);
+            } else {
+                apply_encoder(&mut transformed, spectrum);
+            }
+            transformed
+        })
+        .collect::<Vec<_>>();
+    let mut message_weights = beta[..level.group].to_vec();
+    message_weights
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(row, target)| {
+            for transformed in &transformed_parity {
+                *target += transformed[row];
+            }
+        });
+    let coefficients = (0..codeword_rows)
+        .map(|row| {
+            if row < level.group {
+                beta[row] - message_weights[row]
+            } else {
+                beta[row]
+            }
+        })
+        .collect();
+    (coefficients, alpha)
+}
+
+fn index_oracle_factors(
+    level_index: usize,
+    level: Level,
+    spectra: &[Vec<Field192>],
+    transcript_roots: &[Digest],
+) -> (Vec<Field192>, Vec<Field192>) {
+    // CarryOpen has only three parity spectra, leaving enough worker capacity
+    // for profitable nested WHT parallelism.  Smaller certificate and strong
+    // levels retain the lower-overhead outer-parallel encoder.
+    index_oracle_factors_with_wht_mode(
+        level_index,
+        level,
+        spectra,
+        transcript_roots,
+        level.group >= 1 << 14,
+    )
 }
 
 fn virtual_index_descriptor(
@@ -10224,7 +10288,9 @@ mod tests {
                 .as_bytes()
             })
             .collect::<Vec<_>>();
-        let parallel = || index_oracle_factors(10, level, spectra.as_ref(), &roots);
+        let parallel = || {
+            index_oracle_factors_outer_parallel_for_benchmark(10, level, spectra.as_ref(), &roots)
+        };
         let sequential = || {
             index_oracle_factors_sequential_parity_for_benchmark(
                 10,
@@ -10270,6 +10336,122 @@ mod tests {
             median(&parallel_ms),
             median(&sequential_ms),
         );
+    }
+
+    fn parallel_wht_factor_fixture() -> (Level, Arc<Vec<Vec<Field192>>>, Vec<Digest>) {
+        let level = carryopen_level();
+        let spectra = fixed_generator_spectra(10, level);
+        let roots = (0..2 * level.inverse_rate)
+            .map(|index| {
+                *blake3::hash(
+                    &[
+                        b"LiLAC/parallel-WHT-factor-benchmark/v1".as_slice(),
+                        &index.to_le_bytes(),
+                    ]
+                    .concat(),
+                )
+                .as_bytes()
+            })
+            .collect::<Vec<_>>();
+        (level, spectra, roots)
+    }
+
+    #[test]
+    fn parallel_wht_factors_match_outer_parallel() {
+        let (level, spectra, roots) = parallel_wht_factor_fixture();
+        assert_eq!(
+            index_oracle_factors(10, level, spectra.as_ref(), &roots),
+            index_oracle_factors_outer_parallel_for_benchmark(10, level, spectra.as_ref(), &roots)
+        );
+    }
+
+    #[test]
+    #[ignore = "production CarryOpen nested-parallel WHT factor benchmark"]
+    fn parallel_wht_factors_benchmark_outer_parallel() {
+        let (level, spectra, roots) = parallel_wht_factor_fixture();
+        let outer = || {
+            index_oracle_factors_outer_parallel_for_benchmark(10, level, spectra.as_ref(), &roots)
+        };
+        let nested = || index_oracle_factors(10, level, spectra.as_ref(), &roots);
+        let expected = outer();
+        assert_eq!(nested(), expected);
+        let mut outer_ms = Vec::with_capacity(8);
+        let mut nested_ms = Vec::with_capacity(8);
+        for trial in 0..4 {
+            let order = if trial % 2 == 0 {
+                [false, true, true, false]
+            } else {
+                [true, false, false, true]
+            };
+            for use_nested in order {
+                let start = Instant::now();
+                let factors = std::hint::black_box(if use_nested { nested() } else { outer() });
+                let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+                assert_eq!(factors, expected);
+                if use_nested {
+                    nested_ms.push(elapsed);
+                } else {
+                    outer_ms.push(elapsed);
+                }
+            }
+        }
+        eprintln!("carryopen-parallel-WHT-factors outer-ms={outer_ms:?} nested-ms={nested_ms:?}");
+    }
+
+    #[test]
+    #[ignore = "small certificate-level nested-parallel WHT threshold benchmark"]
+    fn parallel_wht_factors_benchmark_certificate_threshold() {
+        for (level_index, level) in LEVELS.iter().copied().enumerate() {
+            let spectra = fixed_generator_spectra(level_index, level);
+            let roots = (0..2 * level.inverse_rate)
+                .map(|index| {
+                    *blake3::hash(
+                        &[
+                            b"LiLAC/certificate-WHT-threshold/v1".as_slice(),
+                            &level_index.to_le_bytes(),
+                            &index.to_le_bytes(),
+                        ]
+                        .concat(),
+                    )
+                    .as_bytes()
+                })
+                .collect::<Vec<_>>();
+            let run = |nested: bool| {
+                index_oracle_factors_with_wht_mode(
+                    level_index,
+                    level,
+                    spectra.as_ref(),
+                    &roots,
+                    nested,
+                )
+            };
+            let expected = run(false);
+            assert_eq!(run(true), expected);
+            let mut outer_ms = Vec::with_capacity(8);
+            let mut nested_ms = Vec::with_capacity(8);
+            for trial in 0..4 {
+                let order = if trial % 2 == 0 {
+                    [false, true, true, false]
+                } else {
+                    [true, false, false, true]
+                };
+                for nested in order {
+                    let start = Instant::now();
+                    assert_eq!(std::hint::black_box(run(nested)), expected);
+                    let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+                    if nested {
+                        nested_ms.push(elapsed);
+                    } else {
+                        outer_ms.push(elapsed);
+                    }
+                }
+            }
+            eprintln!(
+                "certificate-parallel-WHT level={level_index} group={} spectra={} outer-ms={outer_ms:?} nested-ms={nested_ms:?}",
+                level.group,
+                spectra.len()
+            );
+        }
     }
 
     #[test]
