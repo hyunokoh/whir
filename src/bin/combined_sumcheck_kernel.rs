@@ -3609,13 +3609,16 @@ fn run_production_carryopen(
         .enumerate()
         .for_each(|(index, value)| *value = precarry_message_value(index));
     let horizontal_setup_start = Instant::now();
-    let horizontal_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
-        .map(|block| generator_spectrum(11, block, CARRYOPEN_WIDTH))
-        .collect::<Vec<_>>();
+    let horizontal_spectra =
+        fixed_generator_spectra_for_shape(11, CARRYOPEN_INVERSE_RATE, CARRYOPEN_WIDTH);
     let horizontal_setup = horizontal_setup_start.elapsed();
     let start = Instant::now();
     let (message_root, message_row_roots, systematic_matrix_commitment) =
-        message_and_systematic_tensor_commitment(&proof_codeword, &horizontal_spectra, &zeros);
+        message_and_systematic_tensor_commitment(
+            &proof_codeword,
+            horizontal_spectra.as_ref(),
+            &zeros,
+        );
     let message_and_systematic_commitment = start.elapsed();
 
     let start = Instant::now();
@@ -3623,21 +3626,16 @@ fn run_production_carryopen(
     let precarry_time = start.elapsed();
 
     let start = Instant::now();
-    let spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
-        .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
-        .collect::<Vec<_>>();
-    let generator_roots = spectra
-        .iter()
-        .map(|spectrum| prefix_root(spectrum, CARRYOPEN_ROWS, &zeros))
-        .collect::<Vec<_>>();
+    let spectra = fixed_generator_spectra(10, level);
+    let generator_roots = fixed_generator_roots(10, level);
     let generator_setup = horizontal_setup + start.elapsed();
     let vertical_start = Instant::now();
     assert!(proof_codeword.capacity() >= level.qa_fields());
     let parity_commitments = populate_parity_and_commit_in_spare_capacity(
         level,
         &mut proof_codeword,
-        &spectra,
-        &horizontal_spectra,
+        spectra.as_ref(),
+        horizontal_spectra.as_ref(),
         64,
         &zeros,
     );
@@ -3648,11 +3646,11 @@ fn run_production_carryopen(
     // The final commitments own the row roots needed by the selected front.
     drop(message_row_roots);
     let front_start = Instant::now();
-    let mut component_roots = generator_roots;
+    let mut component_roots = generator_roots.as_ref().clone();
     component_roots.push(message_root);
     component_roots.extend(proof_commitments.iter().map(|commitment| commitment.root));
     let (index_coefficients, index_alpha) =
-        index_oracle_factors(10, level, &spectra, &component_roots);
+        index_oracle_factors(10, level, spectra.as_ref(), &component_roots);
     drop(spectra);
     let index_descriptor = virtual_index_descriptor(10, level, &component_roots);
     component_roots.push(index_descriptor);
@@ -3670,7 +3668,7 @@ fn run_production_carryopen(
         &proof_codeword,
         &index_coefficients,
         &index_alpha,
-        &horizontal_spectra,
+        horizontal_spectra.as_ref(),
         &selected,
     );
     let front_and_selected_rows = front_start.elapsed();
@@ -3702,7 +3700,7 @@ fn run_production_carryopen(
     let terminal_source = derive_tensor_carry_source_from_folds(
         &membership_result,
         &evaluation_result,
-        &horizontal_spectra,
+        horizontal_spectra.as_ref(),
         selected_rows,
     );
     let membership = membership_result.proof;
@@ -3712,7 +3710,7 @@ fn run_production_carryopen(
         &component_roots,
         &selected_front,
         &terminal_source,
-        &horizontal_spectra,
+        horizontal_spectra.as_ref(),
         &membership,
         &evaluation,
         &zeros,
@@ -3811,21 +3809,17 @@ fn run_strong_round(
     assert_eq!(splice_root(level, &source, &zeros), expected_source_root);
 
     let start = Instant::now();
-    let spectra = (0..STRONG_INVERSE_RATE - 1)
-        .map(|block| generator_spectrum(relation_level, block, level.group))
-        .collect::<Vec<_>>();
-    let generator_roots = spectra
-        .iter()
-        .map(|spectrum| prefix_root(spectrum, level.group, &zeros))
-        .collect::<Vec<_>>();
-    let codeword = encode_full_systematic_codeword(level, &source, &spectra, 64);
+    let spectra = fixed_generator_spectra(relation_level, level);
+    let generator_roots = fixed_generator_roots(relation_level, level);
+    let codeword = encode_full_systematic_codeword(level, &source, spectra.as_ref(), 64);
     let (mut component_roots, proof_commitments) =
-        level_commitment(level, &source, &codeword, &generator_roots, &zeros);
+        level_commitment(level, &source, &codeword, generator_roots.as_ref(), &zeros);
     assert_eq!(
         component_roots[STRONG_INVERSE_RATE - 1],
         expected_source_root
     );
-    let index_oracle = materialize_index_oracle(relation_level, level, &spectra, &component_roots);
+    let index_oracle =
+        materialize_index_oracle(relation_level, level, spectra.as_ref(), &component_roots);
     let index_descriptor = virtual_index_descriptor(relation_level, level, &component_roots);
     component_roots.push(index_descriptor);
     let selected = selected_rows(
@@ -5209,17 +5203,28 @@ fn virtual_index_descriptor(
 type VirtualIndexFactors = Arc<(Vec<Field192>, Vec<Field192>)>;
 type FixedGeneratorSpectra = Arc<Vec<Vec<Field192>>>;
 type FixedGeneratorCache = Mutex<BTreeMap<(usize, usize, usize), FixedGeneratorSpectra>>;
+type FixedGeneratorRoots = Arc<Vec<Digest>>;
+type FixedGeneratorRootCache = Mutex<BTreeMap<(usize, usize, usize), FixedGeneratorRoots>>;
 
 fn fixed_generator_spectra_cache() -> &'static FixedGeneratorCache {
     static CACHE: OnceLock<FixedGeneratorCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-/// Return fixed-code generator spectra from verifier preprocessing.  They do
-/// not depend on a statement or transcript and therefore belong in the public
-/// parameters rather than in the online verification path.
-fn fixed_generator_spectra(level_index: usize, level: Level) -> FixedGeneratorSpectra {
-    let key = (level_index, level.inverse_rate, level.group);
+fn fixed_generator_roots_cache() -> &'static FixedGeneratorRootCache {
+    static CACHE: OnceLock<FixedGeneratorRootCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Return fixed-code generator spectra from shared index preprocessing.  They
+/// do not depend on a statement or transcript and therefore belong in the
+/// public parameters rather than either online proving or verification.
+fn fixed_generator_spectra_for_shape(
+    level_index: usize,
+    inverse_rate: usize,
+    group: usize,
+) -> FixedGeneratorSpectra {
+    let key = (level_index, inverse_rate, group);
     let cached = {
         let cache = fixed_generator_spectra_cache()
             .lock()
@@ -5230,9 +5235,9 @@ fn fixed_generator_spectra(level_index: usize, level: Level) -> FixedGeneratorSp
         return spectra;
     }
     let spectra = Arc::new(
-        (0..level.inverse_rate - 1)
+        (0..inverse_rate - 1)
             .into_par_iter()
-            .map(|block| generator_spectrum(level_index, block, level.group))
+            .map(|block| generator_spectrum(level_index, block, group))
             .collect::<Vec<_>>(),
     );
     fixed_generator_spectra_cache()
@@ -5242,31 +5247,79 @@ fn fixed_generator_spectra(level_index: usize, level: Level) -> FixedGeneratorSp
     spectra
 }
 
-fn preprocess_canonical_verifier_generators() {
-    for (level_index, level) in LEVELS.iter().copied().enumerate() {
-        fixed_generator_spectra(level_index, level);
+fn fixed_generator_spectra(level_index: usize, level: Level) -> FixedGeneratorSpectra {
+    fixed_generator_spectra_for_shape(level_index, level.inverse_rate, level.group)
+}
+
+fn fixed_generator_roots(level_index: usize, level: Level) -> FixedGeneratorRoots {
+    let key = (level_index, level.inverse_rate, level.group);
+    let cached = {
+        let cache = fixed_generator_roots_cache()
+            .lock()
+            .expect("fixed-generator root cache mutex must not be poisoned");
+        cache.get(&key).cloned()
+    };
+    if let Some(roots) = cached {
+        return roots;
     }
-    fixed_generator_spectra(10, carryopen_level());
+    let spectra = fixed_generator_spectra(level_index, level);
+    let roots = Arc::new(
+        spectra
+            .par_iter()
+            .map_init(Vec::new, |scratch, spectrum| {
+                exact_prefix_root_with_scratch(spectrum, scratch)
+            })
+            .collect::<Vec<_>>(),
+    );
+    fixed_generator_roots_cache()
+        .lock()
+        .expect("fixed-generator root cache mutex must not be poisoned")
+        .insert(key, roots.clone());
+    roots
+}
+
+fn preprocess_canonical_fixed_generators() {
+    for (level_index, level) in LEVELS.iter().copied().enumerate() {
+        fixed_generator_roots(level_index, level);
+    }
+    fixed_generator_roots(10, carryopen_level());
+    fixed_generator_spectra_for_shape(11, CARRYOPEN_INVERSE_RATE, CARRYOPEN_WIDTH);
     for round in 0..STRONG_ROUNDS {
-        fixed_generator_spectra(
+        fixed_generator_roots(
             12 + round,
             strong_round_level(round).expect("canonical strong round must have a level"),
         );
     }
 }
 
-fn canonical_verifier_fixed_generator_fields() -> usize {
+fn canonical_fixed_generator_fields() -> usize {
     LEVELS
         .iter()
         .map(|level| (level.inverse_rate - 1) * level.group)
         .sum::<usize>()
         + (CARRYOPEN_INVERSE_RATE - 1) * CARRYOPEN_ROWS
+        + (CARRYOPEN_INVERSE_RATE - 1) * CARRYOPEN_WIDTH
         + (0..STRONG_ROUNDS)
             .map(|round| {
                 let level = strong_round_level(round).unwrap();
                 (level.inverse_rate - 1) * level.group
             })
             .sum::<usize>()
+}
+
+fn canonical_fixed_generator_root_count() -> usize {
+    LEVELS
+        .iter()
+        .map(|level| level.inverse_rate - 1)
+        .sum::<usize>()
+        + (CARRYOPEN_INVERSE_RATE - 1)
+        + (0..STRONG_ROUNDS)
+            .map(|round| strong_round_level(round).unwrap().inverse_rate - 1)
+            .sum::<usize>()
+}
+
+fn canonical_fixed_generator_bytes() -> usize {
+    canonical_fixed_generator_fields() * 24 + canonical_fixed_generator_root_count() * 32
 }
 
 fn virtual_index_factor_cache() -> &'static Mutex<BTreeMap<Digest, VirtualIndexFactors>> {
@@ -5316,6 +5369,10 @@ fn validated_virtual_index_factors(
     if component_roots.len() != 2 * level.inverse_rate + 1 {
         return None;
     }
+    let fixed_roots = fixed_generator_roots(level_index, level);
+    if component_roots[..level.inverse_rate - 1] != fixed_roots[..] {
+        return None;
+    }
     let transcript_roots = &component_roots[..2 * level.inverse_rate];
     (component_roots[2 * level.inverse_rate]
         == virtual_index_descriptor(level_index, level, transcript_roots))
@@ -5354,6 +5411,10 @@ fn clear_fixed_generator_spectra_cache() {
     fixed_generator_spectra_cache()
         .lock()
         .expect("fixed-generator cache mutex must not be poisoned")
+        .clear();
+    fixed_generator_roots_cache()
+        .lock()
+        .expect("fixed-generator root cache mutex must not be poisoned")
         .clear();
 }
 
@@ -5417,22 +5478,13 @@ fn virtual_index_ood_row(
     component_roots: &[Digest],
     point: &[Field192],
 ) -> Option<Vec<Field192>> {
-    if component_roots.len() != 2 * level.inverse_rate + 1 {
-        return None;
-    }
-    let transcript_roots = &component_roots[..2 * level.inverse_rate];
-    if component_roots[2 * level.inverse_rate]
-        != virtual_index_descriptor(level_index, level, transcript_roots)
-    {
-        return None;
-    }
     let row_domain = (level.inverse_rate * level.group).next_power_of_two();
     let row_variables = row_domain.trailing_zeros() as usize;
     let lane_domain = level.width.next_power_of_two();
     if point.len() != row_variables + lane_domain.trailing_zeros() as usize {
         return None;
     }
-    let factors = cached_virtual_index_factors(level_index, level, transcript_roots);
+    let factors = validated_virtual_index_factors(level_index, level, component_roots)?;
     let (coefficients, alpha) = factors.as_ref();
     let row_weights = equality_weights(&point[..row_variables]);
     let coefficient = coefficients
@@ -6184,13 +6236,8 @@ fn semantic_vectors(
         let qa_end = offset + level.qa_fields();
 
         let start = Instant::now();
-        let spectra = (0..level.inverse_rate - 1)
-            .map(|block| generator_spectrum(level_index, block, level.group))
-            .collect::<Vec<_>>();
-        let generator_roots = spectra
-            .iter()
-            .map(|spectrum| prefix_root(spectrum, level.group, &zeros))
-            .collect::<Vec<_>>();
+        let spectra = fixed_generator_spectra(level_index, level);
+        let generator_roots = fixed_generator_roots(level_index, level);
         breakdown.generator_preprocessing += start.elapsed();
 
         let start = Instant::now();
@@ -6427,22 +6474,28 @@ fn semantic_certificate_objects(
         assert_eq!(source.len(), level.raw);
 
         let start = Instant::now();
-        let spectra = (0..level.inverse_rate - 1)
-            .map(|block| generator_spectrum(level_index, block, level.group))
-            .collect::<Vec<_>>();
-        let generator_roots = spectra
-            .iter()
-            .map(|spectrum| prefix_root(spectrum, level.group, &zeros))
-            .collect::<Vec<_>>();
+        let spectra = fixed_generator_spectra(level_index, level);
+        let generator_roots = fixed_generator_roots(level_index, level);
         breakdown.generator_preprocessing += start.elapsed();
 
         let start = Instant::now();
-        overwrite_padded_proof_codeword(level, &source, &mut relation_right, &spectra, batch_lanes);
+        overwrite_padded_proof_codeword(
+            level,
+            &source,
+            &mut relation_right,
+            spectra.as_ref(),
+            batch_lanes,
+        );
         breakdown.proof_encoding += start.elapsed();
 
         let start = Instant::now();
-        let (level_roots, proof_commitments) =
-            level_commitment(level, &source, &relation_right, &generator_roots, &zeros);
+        let (level_roots, proof_commitments) = level_commitment(
+            level,
+            &source,
+            &relation_right,
+            generator_roots.as_ref(),
+            &zeros,
+        );
         let mut current_component_roots = level_roots.clone();
         transcript_roots.extend(level_roots);
         breakdown.proof_commitment += start.elapsed();
@@ -6451,7 +6504,7 @@ fn semantic_certificate_objects(
         overwrite_index_oracle(
             level_index,
             level,
-            &spectra,
+            spectra.as_ref(),
             &current_component_roots,
             &mut relation_left,
         );
@@ -8668,11 +8721,11 @@ fn main() {
     assert!(!args.direct_whir_tail || args.semantic);
     assert!(!args.relation_whir || args.semantic);
     assert!(!args.final_only || (args.semantic && args.carryopen));
-    let verifier_preprocessing_start = Instant::now();
+    let fixed_generator_preprocessing_start = Instant::now();
     if args.semantic {
-        preprocess_canonical_verifier_generators();
+        preprocess_canonical_fixed_generators();
     }
-    let verifier_preprocessing = verifier_preprocessing_start.elapsed();
+    let fixed_generator_preprocessing = fixed_generator_preprocessing_start.elapsed();
     let variables = args.fields.next_power_of_two().trailing_zeros() as usize;
     if args.fields == PRODUCTION_FIELDS {
         assert_eq!(variables, PRODUCTION_VARIABLES);
@@ -9146,9 +9199,9 @@ fn main() {
     }
     if args.semantic {
         println!(
-            "- one-time canonical verifier fixed-G preprocessing: {:.3} ms, {:.3} MiB (excluded from online verification)",
-            verifier_preprocessing.as_secs_f64() * 1_000.0,
-            canonical_verifier_fixed_generator_fields() as f64 * 24.0 / (1_u64 << 20) as f64,
+            "- one-time canonical fixed-G preprocessing: {:.3} ms, {:.3} MiB (excluded from online proving and verification)",
+            fixed_generator_preprocessing.as_secs_f64() * 1_000.0,
+            canonical_fixed_generator_bytes() as f64 / (1_u64 << 20) as f64,
         );
         println!(
             "- fixed-G preprocessing median/p95: {:.3}/{:.3} ms",
@@ -10103,7 +10156,10 @@ mod tests {
 
     #[test]
     fn fixed_generator_preprocessing_matches_direct_spectra() {
-        assert_eq!(canonical_verifier_fixed_generator_fields(), 252_160);
+        assert_eq!(canonical_fixed_generator_fields(), 252_928);
+        assert_eq!(canonical_fixed_generator_root_count(), 150);
+        assert_eq!(canonical_fixed_generator_bytes(), 6_075_072);
+        let zeros = zero_roots(30);
         for (level_index, level) in LEVELS
             .iter()
             .copied()
@@ -10117,14 +10173,143 @@ mod tests {
             }))
         {
             let cached = fixed_generator_spectra(level_index, level);
+            let cached_roots = fixed_generator_roots(level_index, level);
             assert_eq!(cached.len(), level.inverse_rate - 1);
+            assert_eq!(cached_roots.len(), cached.len());
             for (block, spectrum) in cached.iter().enumerate() {
                 assert_eq!(
                     spectrum,
                     &generator_spectrum(level_index, block, level.group),
                 );
+                assert_eq!(
+                    cached_roots[block],
+                    prefix_root(spectrum, level.group, &zeros)
+                );
             }
         }
+        let horizontal =
+            fixed_generator_spectra_for_shape(11, CARRYOPEN_INVERSE_RATE, CARRYOPEN_WIDTH);
+        assert_eq!(horizontal.len(), CARRYOPEN_INVERSE_RATE - 1);
+        for (block, spectrum) in horizontal.iter().enumerate() {
+            assert_eq!(spectrum, &generator_spectrum(11, block, CARRYOPEN_WIDTH));
+        }
+    }
+
+    #[test]
+    fn verifier_enforces_preprocessed_generator_roots() {
+        let level_index = 12 + STRONG_ROUNDS - 1;
+        let level = strong_round_level(STRONG_ROUNDS - 1).unwrap();
+        let fixed_roots = fixed_generator_roots(level_index, level);
+        let mut transcript_roots = fixed_roots.as_ref().clone();
+        while transcript_roots.len() < 2 * level.inverse_rate {
+            transcript_roots.push([transcript_roots.len() as u8 + 1; 32]);
+        }
+        let descriptor = virtual_index_descriptor(level_index, level, &transcript_roots);
+        let mut component_roots = transcript_roots;
+        component_roots.push(descriptor);
+        assert!(validated_virtual_index_factors(level_index, level, &component_roots).is_some());
+
+        component_roots[0][0] ^= 1;
+        component_roots[2 * level.inverse_rate] = virtual_index_descriptor(
+            level_index,
+            level,
+            &component_roots[..2 * level.inverse_rate],
+        );
+        assert!(validated_virtual_index_factors(level_index, level, &component_roots).is_none());
+    }
+
+    #[test]
+    #[ignore = "canonical prover fixed-G cache versus online reconstruction benchmark"]
+    fn fixed_generator_cache_benchmarks_online_reconstruction() {
+        let levels = LEVELS
+            .iter()
+            .copied()
+            .enumerate()
+            .chain(std::iter::once((10, carryopen_level())))
+            .chain((0..STRONG_ROUNDS).map(|round| {
+                (
+                    12 + round,
+                    strong_round_level(round).expect("strong round must have a level"),
+                )
+            }))
+            .collect::<Vec<_>>();
+        let zeros = zero_roots(30);
+        clear_fixed_generator_spectra_cache();
+        preprocess_canonical_fixed_generators();
+
+        let reconstruct = || {
+            let data = levels
+                .iter()
+                .map(|(level_index, level)| {
+                    let spectra = (0..level.inverse_rate - 1)
+                        .map(|block| generator_spectrum(*level_index, block, level.group))
+                        .collect::<Vec<_>>();
+                    let roots = spectra
+                        .iter()
+                        .map(|spectrum| prefix_root(spectrum, level.group, &zeros))
+                        .collect::<Vec<_>>();
+                    (spectra, roots)
+                })
+                .collect::<Vec<_>>();
+            let horizontal = (0..CARRYOPEN_INVERSE_RATE - 1)
+                .map(|block| generator_spectrum(11, block, CARRYOPEN_WIDTH))
+                .collect::<Vec<_>>();
+            (data, horizontal)
+        };
+        let cached = || {
+            let data = levels
+                .iter()
+                .map(|(level_index, level)| {
+                    (
+                        fixed_generator_spectra(*level_index, *level),
+                        fixed_generator_roots(*level_index, *level),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let horizontal =
+                fixed_generator_spectra_for_shape(11, CARRYOPEN_INVERSE_RATE, CARRYOPEN_WIDTH);
+            (data, horizontal)
+        };
+
+        let expected = reconstruct();
+        let retained = cached();
+        for ((spectra, roots), (cached_spectra, cached_roots)) in
+            expected.0.iter().zip(retained.0.iter())
+        {
+            assert_eq!(spectra, cached_spectra.as_ref());
+            assert_eq!(roots, cached_roots.as_ref());
+        }
+        assert_eq!(&expected.1, retained.1.as_ref());
+
+        let run = |use_cache: bool| {
+            let start = Instant::now();
+            let result = std::hint::black_box(if use_cache {
+                let (data, horizontal) = cached();
+                (data.len(), horizontal.len())
+            } else {
+                let (data, horizontal) = reconstruct();
+                (data.len(), horizontal.len())
+            });
+            assert_eq!(result, (levels.len(), CARRYOPEN_INVERSE_RATE - 1));
+            start.elapsed().as_secs_f64() * 1_000.0
+        };
+        let mut online = Vec::with_capacity(8);
+        let mut preprocessed = Vec::with_capacity(8);
+        for trial in 0..4 {
+            let order = if trial % 2 == 0 {
+                [false, true, true, false]
+            } else {
+                [true, false, false, true]
+            };
+            for use_cache in order {
+                if use_cache {
+                    preprocessed.push(run(true));
+                } else {
+                    online.push(run(false));
+                }
+            }
+        }
+        eprintln!("fixed-generator-prover online-ms={online:?} preprocessed-ms={preprocessed:?}");
     }
 
     #[test]
@@ -13651,7 +13836,8 @@ mod tests {
             next_blocks: 2,
         };
         let zeros = zero_roots(10);
-        let transcript_roots = vec![[7_u8; 32]; 2 * level.inverse_rate];
+        let mut transcript_roots = fixed_generator_roots(0, level).as_ref().clone();
+        transcript_roots.resize(2 * level.inverse_rate, [7_u8; 32]);
         let mut component_roots = transcript_roots.clone();
         component_roots.push(virtual_index_descriptor(0, level, &transcript_roots));
         let factors = validated_virtual_index_factors(0, level, &component_roots).unwrap();
@@ -14032,7 +14218,7 @@ mod tests {
 
         clear_fixed_generator_spectra_cache();
         let preprocessing_start = Instant::now();
-        preprocess_canonical_verifier_generators();
+        preprocess_canonical_fixed_generators();
         let preprocessing_ms = preprocessing_start.elapsed().as_secs_f64() * 1_000.0;
 
         let repetitions = 6;
@@ -14202,7 +14388,7 @@ mod tests {
         let transition = &transitions[0];
         let level = LEVELS[0];
         let zeros = zero_roots(PRODUCTION_VARIABLES);
-        preprocess_canonical_verifier_generators();
+        preprocess_canonical_fixed_generators();
         clear_virtual_index_factor_cache();
         let factors = validated_virtual_index_factors(0, level, &transition.component_roots)
             .expect("level-0 public-W factors must validate");
@@ -14479,9 +14665,10 @@ mod tests {
         };
         assert!(membership.challenges().is_some());
         assert!(evaluation.challenges().is_some());
-        let mut component_roots = (1..=2 * CARRYOPEN_INVERSE_RATE)
-            .map(|value| [value as u8; 32])
-            .collect::<Vec<_>>();
+        let mut component_roots = fixed_generator_roots(10, level).as_ref().clone();
+        component_roots.extend(
+            (component_roots.len()..2 * CARRYOPEN_INVERSE_RATE).map(|value| [value as u8 + 1; 32]),
+        );
         component_roots.push(virtual_index_descriptor(10, level, &component_roots));
         let vertical_spectra = (0..CARRYOPEN_INVERSE_RATE - 1)
             .map(|block| generator_spectrum(10, block, CARRYOPEN_ROWS))
