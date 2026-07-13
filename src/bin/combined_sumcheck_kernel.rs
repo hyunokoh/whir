@@ -4423,6 +4423,44 @@ fn encode_full_systematic_codeword(
     codeword
 }
 
+fn overwrite_padded_proof_codeword(
+    level: Level,
+    source: &[Field192],
+    codeword: &mut Vec<Field192>,
+    spectra: &[Vec<Field192>],
+    batch_lanes: usize,
+) {
+    assert_eq!(source.len(), level.raw);
+    assert_eq!(level.raw, level.blocks * level.block_semantic);
+    let systematic_fields = level.group * level.width;
+    codeword.clear();
+    if codeword.capacity() < level.qa_fields() {
+        codeword.reserve_exact(level.qa_fields());
+    }
+    {
+        let systematic = &mut codeword.spare_capacity_mut()[..systematic_fields];
+        systematic
+            .par_chunks_mut(level.width)
+            .enumerate()
+            .for_each(|(row, target)| {
+                let block = row / level.row_span;
+                let local_row = row % level.row_span;
+                for (lane, value) in target.iter_mut().enumerate() {
+                    let local = local_row * level.width + lane;
+                    value.write(if block < level.blocks && local < level.block_semantic {
+                        source[block * level.block_semantic + local]
+                    } else {
+                        Field192::ZERO
+                    });
+                }
+            });
+    }
+    // SAFETY: every systematic coordinate, including padding, is written by
+    // the disjoint row partition above; a panic leaves the Vec empty.
+    unsafe { codeword.set_len(systematic_fields) };
+    populate_parity_in_spare_capacity(level, codeword, spectra, batch_lanes);
+}
+
 #[cfg(test)]
 fn populate_parity_from_systematic_cloned_forward(
     level: Level,
@@ -4613,14 +4651,18 @@ fn populate_index_oracle(
         });
 }
 
-fn materialize_index_oracle(
+fn overwrite_index_oracle(
     level_index: usize,
     level: Level,
     spectra: &[Vec<Field192>],
     transcript_roots: &[Digest],
-) -> Vec<Field192> {
+    index_oracle: &mut Vec<Field192>,
+) {
     let (coefficients, alpha) = index_oracle_factors(level_index, level, spectra, transcript_roots);
-    let mut index_oracle = Vec::with_capacity(level.qa_fields());
+    index_oracle.clear();
+    if index_oracle.capacity() < level.qa_fields() {
+        index_oracle.reserve_exact(level.qa_fields());
+    }
     {
         let output = &mut index_oracle.spare_capacity_mut()[..level.qa_fields()];
         output
@@ -4638,6 +4680,22 @@ fn materialize_index_oracle(
     // SAFETY: the parallel row partition covers every output cell exactly
     // once, and a panic leaves the spare cells outside the vector length.
     unsafe { index_oracle.set_len(level.qa_fields()) };
+}
+
+fn materialize_index_oracle(
+    level_index: usize,
+    level: Level,
+    spectra: &[Vec<Field192>],
+    transcript_roots: &[Digest],
+) -> Vec<Field192> {
+    let mut index_oracle = Vec::with_capacity(level.qa_fields());
+    overwrite_index_oracle(
+        level_index,
+        level,
+        spectra,
+        transcript_roots,
+        &mut index_oracle,
+    );
     index_oracle
 }
 
@@ -5927,9 +5985,7 @@ fn semantic_certificate_objects(
         breakdown.generator_preprocessing += start.elapsed();
 
         let start = Instant::now();
-        relation_right.resize(level.qa_fields(), Field192::ZERO);
-        relation_right.fill(Field192::ZERO);
-        populate_proof_codeword(level, &source, &mut relation_right, &spectra, batch_lanes);
+        overwrite_padded_proof_codeword(level, &source, &mut relation_right, &spectra, batch_lanes);
         breakdown.proof_encoding += start.elapsed();
 
         let start = Instant::now();
@@ -5940,14 +5996,12 @@ fn semantic_certificate_objects(
         breakdown.proof_commitment += start.elapsed();
 
         let start = Instant::now();
-        relation_left.resize(level.qa_fields(), Field192::ZERO);
-        relation_left.fill(Field192::ZERO);
-        populate_index_oracle(
+        overwrite_index_oracle(
             level_index,
             level,
-            &mut relation_left,
             &spectra,
             &current_component_roots,
+            &mut relation_left,
         );
         breakdown.index_oracle += start.elapsed();
         assert_eq!(dot(&relation_left, &relation_right), Field192::ZERO);
@@ -9382,6 +9436,39 @@ mod tests {
             initialized_codeword
         );
 
+        let padded_level = Level {
+            raw: 10,
+            blocks: 2,
+            block_semantic: 5,
+            components: &[(5, 32)],
+            group: 8,
+            width: 3,
+            row_span: 4,
+            inverse_rate: 2,
+            next_blocks: 2,
+        };
+        let padded_source = (0..padded_level.raw)
+            .map(|index| Field192::from((11 * index + 5) as u64))
+            .collect::<Vec<_>>();
+        let padded_spectra = vec![generator_spectrum(22, 0, padded_level.group)];
+        let mut initialized_padded = vec![Field192::ZERO; padded_level.qa_fields()];
+        populate_proof_codeword(
+            padded_level,
+            &padded_source,
+            &mut initialized_padded,
+            &padded_spectra,
+            2,
+        );
+        let mut direct_padded = vec![Field192::ONE; 7];
+        overwrite_padded_proof_codeword(
+            padded_level,
+            &padded_source,
+            &mut direct_padded,
+            &padded_spectra,
+            2,
+        );
+        assert_eq!(direct_padded, initialized_padded);
+
         let roots = (0..2 * level.inverse_rate)
             .map(|index| [index as u8; 32])
             .collect::<Vec<_>>();
@@ -10410,6 +10497,114 @@ mod tests {
         let mean = |samples: &[f64]| samples.iter().sum::<f64>() / samples.len() as f64;
         eprintln!(
             "strong-initialization initialized-ms={initialized_ms:?} direct-ms={direct_ms:?} initialized-median={:.3} direct-median={:.3} initialized-mean={:.3} direct-mean={:.3}",
+            median(&initialized_ms),
+            median(&direct_ms),
+            mean(&initialized_ms),
+            mean(&direct_ms),
+        );
+    }
+
+    #[test]
+    #[ignore = "production four-level certificate codeword/index initialization A/B"]
+    fn certificate_schedule_avoids_zero_filled_codeword_and_index() {
+        let inputs = LEVELS
+            .into_iter()
+            .enumerate()
+            .map(|(level_index, level)| {
+                let source = (0..level.raw)
+                    .into_par_iter()
+                    .map(|index| semantic_value(level_index, index))
+                    .collect::<Vec<_>>();
+                let spectra = (0..level.inverse_rate - 1)
+                    .map(|block| generator_spectrum(level_index, block, level.group))
+                    .collect::<Vec<_>>();
+                let roots = (0..2 * level.inverse_rate)
+                    .map(|index| {
+                        *blake3::hash(
+                            &[
+                                b"LiLAC/certificate-initialization-benchmark/v1".as_slice(),
+                                &level_index.to_le_bytes(),
+                                &index.to_le_bytes(),
+                            ]
+                            .concat(),
+                        )
+                        .as_bytes()
+                    })
+                    .collect::<Vec<_>>();
+                (level, level_index, source, spectra, roots)
+            })
+            .collect::<Vec<_>>();
+        let expected = inputs
+            .iter()
+            .map(|(level, level_index, source, spectra, roots)| {
+                let mut codeword = vec![Field192::ZERO; level.qa_fields()];
+                populate_proof_codeword(*level, source, &mut codeword, spectra, 64);
+                let mut index_oracle = vec![Field192::ZERO; level.qa_fields()];
+                populate_index_oracle(*level_index, *level, &mut index_oracle, spectra, roots);
+                (codeword, index_oracle)
+            })
+            .collect::<Vec<_>>();
+        let run = |direct: bool| {
+            let mut codeword = Vec::new();
+            let mut index_oracle = Vec::new();
+            let mut elapsed = Duration::ZERO;
+            for (ordinal, (level, level_index, source, spectra, roots)) in inputs.iter().enumerate()
+            {
+                let start = Instant::now();
+                if direct {
+                    overwrite_padded_proof_codeword(*level, source, &mut codeword, spectra, 64);
+                    overwrite_index_oracle(*level_index, *level, spectra, roots, &mut index_oracle);
+                } else {
+                    codeword.resize(level.qa_fields(), Field192::ZERO);
+                    codeword.fill(Field192::ZERO);
+                    populate_proof_codeword(*level, source, &mut codeword, spectra, 64);
+                    index_oracle.resize(level.qa_fields(), Field192::ZERO);
+                    index_oracle.fill(Field192::ZERO);
+                    populate_index_oracle(*level_index, *level, &mut index_oracle, spectra, roots);
+                }
+                elapsed += start.elapsed();
+                assert_eq!(codeword, expected[ordinal].0);
+                assert_eq!(index_oracle, expected[ordinal].1);
+            }
+            elapsed.as_secs_f64() * 1_000.0
+        };
+        let mut initialized_ms = Vec::with_capacity(16);
+        let mut direct_ms = Vec::with_capacity(16);
+        for trial in 0..8 {
+            let order = if trial % 2 == 0 {
+                [false, true, true, false]
+            } else {
+                [true, false, false, true]
+            };
+            let mut trial_initialized = Vec::with_capacity(2);
+            let mut trial_direct = Vec::with_capacity(2);
+            for direct in order {
+                let elapsed = run(direct);
+                if direct {
+                    direct_ms.push(elapsed);
+                    trial_direct.push(elapsed);
+                } else {
+                    initialized_ms.push(elapsed);
+                    trial_initialized.push(elapsed);
+                }
+            }
+            eprintln!(
+                "certificate-initialization trial={} initialized={:.3}/{:.3} ms direct={:.3}/{:.3} ms",
+                trial + 1,
+                trial_initialized[0],
+                trial_initialized[1],
+                trial_direct[0],
+                trial_direct[1],
+            );
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        let mean = |samples: &[f64]| samples.iter().sum::<f64>() / samples.len() as f64;
+        eprintln!(
+            "certificate-initialization initialized-ms={initialized_ms:?} direct-ms={direct_ms:?} initialized-median={:.3} direct-median={:.3} initialized-mean={:.3} direct-mean={:.3}",
             median(&initialized_ms),
             median(&direct_ms),
             mean(&initialized_ms),
