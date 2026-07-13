@@ -1014,7 +1014,7 @@ struct ProductionTransitionProof {
 }
 
 impl ProductionTransitionProof {
-    const MAGIC: &'static [u8; 8] = b"LILPTP02";
+    const MAGIC: &'static [u8; 8] = b"LILPTP03";
 
     fn verify(&self) -> bool {
         if self.level >= LEVELS.len() {
@@ -1060,14 +1060,16 @@ impl ProductionTransitionProof {
     fn serialize_unchecked(&self) -> Vec<u8> {
         let front = self.selected_front.serialize();
         let algebra = self.algebra.serialize();
+        let level = LEVELS[self.level];
+        let wire_roots = &self.component_roots[level.inverse_rate - 1..];
         let mut output =
-            Vec::with_capacity(88 + self.component_roots.len() * 32 + front.len() + algebra.len());
+            Vec::with_capacity(88 + wire_roots.len() * 32 + front.len() + algebra.len());
         output.extend_from_slice(Self::MAGIC);
         output.extend_from_slice(&(self.level as u32).to_le_bytes());
-        output.extend_from_slice(&(self.component_roots.len() as u32).to_le_bytes());
+        output.extend_from_slice(&(wire_roots.len() as u32).to_le_bytes());
         output.extend_from_slice(&(front.len() as u32).to_le_bytes());
         output.extend_from_slice(&(algebra.len() as u32).to_le_bytes());
-        for root in &self.component_roots {
+        for root in wire_roots {
             output.extend_from_slice(root);
         }
         output.extend_from_slice(&self.ood_block_root);
@@ -1093,19 +1095,21 @@ impl ProductionTransitionProof {
         let front_size = u32::from_le_bytes(payload[16..20].try_into().ok()?) as usize;
         let algebra_size = u32::from_le_bytes(payload[20..24].try_into().ok()?) as usize;
         if level >= LEVELS.len()
-            || root_count != 2 * LEVELS[level].inverse_rate + 1
+            || root_count != LEVELS[level].inverse_rate + 2
             || payload.len() != 88 + root_count * 32 + front_size + algebra_size
         {
             return None;
         }
         let mut position = 24;
-        let component_roots = (0..root_count)
+        let wire_roots = (0..root_count)
             .map(|_| {
                 let root = payload.get(position..position + 32)?.try_into().ok()?;
                 position += 32;
                 Some(root)
             })
             .collect::<Option<Vec<Digest>>>()?;
+        let mut component_roots = fixed_generator_roots(level, LEVELS[level]).as_ref().clone();
+        component_roots.extend(wire_roots);
         let ood_block_root = payload.get(position..position + 32)?.try_into().ok()?;
         position += 32;
         let next_source_root = payload.get(position..position + 32)?.try_into().ok()?;
@@ -3413,7 +3417,7 @@ impl From<&ProductionCarryOpenProof> for CarryOpenCoreProof {
 }
 
 impl CarryOpenCoreProof {
-    const MAGIC: &'static [u8; 8] = b"LILCOR02";
+    const MAGIC: &'static [u8; 8] = b"LILCOR03";
 
     fn verify(&self, terminal_root: Digest) -> bool {
         let level = carryopen_level();
@@ -3474,10 +3478,11 @@ impl CarryOpenCoreProof {
         let membership = self.membership.serialize();
         let evaluation = self.evaluation.serialize();
         let phi = self.phi_link.serialize();
+        let wire_roots = &self.component_roots[CARRYOPEN_INVERSE_RATE - 1..];
         let mut output = Vec::with_capacity(
             36 + 96
                 + precarry.len()
-                + self.component_roots.len() * 32
+                + wire_roots.len() * 32
                 + front.len()
                 + membership.len()
                 + evaluation.len()
@@ -3486,7 +3491,7 @@ impl CarryOpenCoreProof {
         output.extend_from_slice(Self::MAGIC);
         for size in [
             precarry.len(),
-            self.component_roots.len(),
+            wire_roots.len(),
             front.len(),
             membership.len(),
             evaluation.len(),
@@ -3496,7 +3501,7 @@ impl CarryOpenCoreProof {
             output.extend_from_slice(&(size as u32).to_le_bytes());
         }
         output.extend_from_slice(&precarry);
-        for root in &self.component_roots {
+        for root in wire_roots {
             output.extend_from_slice(root);
         }
         output.extend_from_slice(&self.membership_ood_root);
@@ -3521,7 +3526,7 @@ impl CarryOpenCoreProof {
                     .ok()
             })
             .collect::<Option<Vec<usize>>>()?;
-        if sizes[1] != 2 * CARRYOPEN_INVERSE_RATE + 1
+        if sizes[1] != CARRYOPEN_INVERSE_RATE + 2
             || sizes[6] != 0
             || payload.len()
                 != HEADER
@@ -3540,13 +3545,17 @@ impl CarryOpenCoreProof {
             payload.get(position..position + sizes[0])?,
         )?;
         position += sizes[0];
-        let component_roots = (0..sizes[1])
+        let wire_roots = (0..sizes[1])
             .map(|_| {
                 let root = payload.get(position..position + 32)?.try_into().ok()?;
                 position += 32;
                 Some(root)
             })
             .collect::<Option<Vec<Digest>>>()?;
+        let mut component_roots = fixed_generator_roots(10, carryopen_level())
+            .as_ref()
+            .clone();
+        component_roots.extend(wire_roots);
         let membership_ood_root = payload.get(position..position + 32)?.try_into().ok()?;
         position += 32;
         let evaluation_ood_root = payload.get(position..position + 32)?.try_into().ok()?;
@@ -7282,7 +7291,7 @@ struct StrongTransitionCore {
 }
 
 impl StrongTransitionCore {
-    const MAGIC: &'static [u8; 8] = b"LILSTC01";
+    const MAGIC: &'static [u8; 8] = b"LILSTC02";
 
     fn level(&self) -> Option<Level> {
         strong_round_level(self.round)
@@ -7352,13 +7361,13 @@ impl StrongTransitionCore {
     fn serialize_unchecked(&self) -> Vec<u8> {
         let front = self.selected_front.serialize();
         let membership = self.membership.serialize();
-        let mut output = Vec::with_capacity(
-            32 + self.component_roots.len() * 32 + 64 + front.len() + membership.len(),
-        );
+        let wire_roots = &self.component_roots[STRONG_INVERSE_RATE - 1..];
+        let mut output =
+            Vec::with_capacity(32 + wire_roots.len() * 32 + 64 + front.len() + membership.len());
         output.extend_from_slice(Self::MAGIC);
         for value in [
             self.round,
-            self.component_roots.len(),
+            wire_roots.len(),
             front.len(),
             membership.len(),
             0,
@@ -7366,7 +7375,7 @@ impl StrongTransitionCore {
         ] {
             output.extend_from_slice(&(value as u32).to_le_bytes());
         }
-        for root in &self.component_roots {
+        for root in wire_roots {
             output.extend_from_slice(root);
         }
         output.extend_from_slice(&self.ood_block_root);
@@ -7392,7 +7401,7 @@ impl StrongTransitionCore {
             .collect::<Option<Vec<_>>>()?;
         let round = values[0];
         let level = strong_round_level(round)?;
-        if values[1] != 2 * STRONG_INVERSE_RATE + 1
+        if values[1] != STRONG_INVERSE_RATE + 2
             || values[4] != 0
             || values[5] != 0
             || payload.len() != HEADER + values[1] * 32 + 64 + values[2] + values[3]
@@ -7400,13 +7409,15 @@ impl StrongTransitionCore {
             return None;
         }
         let mut position = HEADER;
-        let component_roots = (0..values[1])
+        let wire_roots = (0..values[1])
             .map(|_| {
                 let root = payload.get(position..position + 32)?.try_into().ok()?;
                 position += 32;
                 Some(root)
             })
             .collect::<Option<Vec<Digest>>>()?;
+        let mut component_roots = fixed_generator_roots(12 + round, level).as_ref().clone();
+        component_roots.extend(wire_roots);
         let ood_block_root = payload.get(position..position + 32)?.try_into().ok()?;
         position += 32;
         let terminal_source_root = payload.get(position..position + 32)?.try_into().ok()?;
@@ -7970,7 +7981,7 @@ struct CanonicalProofByteBreakdown {
 }
 
 impl RecursiveStrongEndToEndProof {
-    const MAGIC: &'static [u8; 8] = b"LILRS301";
+    const MAGIC: &'static [u8; 8] = b"LILRS302";
 
     fn verify(&self) -> bool {
         if self.strong.len() != STRONG_ROUNDS || self.certificate.len() != LEVELS.len() {
@@ -14013,7 +14024,7 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 303_204);
+        assert_eq!(payload.len(), 298_404);
 
         let breakdown = proof.byte_breakdown(payload.len());
         assert_eq!(breakdown.total, payload.len());
@@ -14144,7 +14155,7 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 303_204);
+        assert_eq!(payload.len(), 298_404);
 
         let mut fronts = Vec::<(&SelectedRowFront, Level, &[Digest])>::with_capacity(11);
         fronts.push((
@@ -14214,7 +14225,7 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 303_204);
+        assert_eq!(payload.len(), 298_404);
 
         clear_fixed_generator_spectra_cache();
         let preprocessing_start = Instant::now();
@@ -14460,7 +14471,7 @@ mod tests {
         let certificate = run_semantic_certificate_only(64, false);
         let proof = build_recursive_strong_end_to_end(&carry, &certificate, 1);
         let payload = proof.serialize();
-        assert_eq!(payload.len(), 303_204);
+        assert_eq!(payload.len(), 298_404);
 
         let strong_sizes = proof
             .strong
@@ -14526,10 +14537,15 @@ mod tests {
             payload.len(),
             digest.to_hex()
         );
-        assert_eq!(payload.len(), 303_204);
+        assert_eq!(payload.len(), 298_404);
+        assert_eq!(canonical_fixed_generator_root_count(), 150);
+        assert_eq!(payload.len() + 150 * 32, 303_204);
+        let restored = RecursiveStrongEndToEndProof::deserialize(&payload)
+            .expect("public-index roots must reconstruct a valid logical proof");
+        assert_eq!(restored, proof);
         assert_eq!(
             digest.as_bytes(),
-            &hex::decode("20809657e67ec20c3db9096bd7abe05baae2b4840951b5b4a3b2a1b9ed83ae09")
+            &hex::decode("482849d734c858837ae4e3c68eafecaca281bb9c3d982fa18b429eb0a2adf594")
                 .unwrap()[..]
         );
     }
@@ -14546,7 +14562,7 @@ mod tests {
                 .iter()
                 .map(|proof| proof.serialize().len())
                 .sum::<usize>(),
-            180_156
+            179_868
         );
     }
 
@@ -14562,7 +14578,7 @@ mod tests {
                 .iter()
                 .map(|proof| proof.serialize().len())
                 .sum::<usize>(),
-            180_156
+            179_868
         );
     }
 
