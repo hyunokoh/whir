@@ -1540,6 +1540,7 @@ fn evaluate_power_of_two_message(message: &[Field192], point: &[Field192]) -> Fi
     fold_message_at_point(&mut scratch, point)
 }
 
+#[cfg(test)]
 fn evaluate_power_of_two_message_with_scratch(
     message: &[Field192],
     point: &[Field192],
@@ -1551,6 +1552,7 @@ fn evaluate_power_of_two_message_with_scratch(
     fold_message_at_point(scratch, point)
 }
 
+#[cfg(test)]
 fn evaluate_power_of_two_message_direct_first_round(
     message: &[Field192],
     point: &[Field192],
@@ -1566,6 +1568,29 @@ fn evaluate_power_of_two_message_direct_first_round(
         .zip(low.par_iter().zip(high.par_iter()))
         .for_each(|(output, (low, high))| *output = *low + (*high - *low) * point[0]);
     fold_message_at_point(&mut scratch[..half], &point[1..])
+}
+
+fn evaluate_power_of_two_message_direct_first_round_in_spare(
+    message: &[Field192],
+    point: &[Field192],
+    scratch: &mut [MaybeUninit<Field192>],
+) -> Field192 {
+    assert!(!point.is_empty());
+    assert_eq!(message.len(), scratch.len());
+    assert_eq!(message.len(), 1_usize << point.len());
+    let half = message.len() / 2;
+    let (low, high) = message.split_at(half);
+    scratch[..half]
+        .par_iter_mut()
+        .zip(low.par_iter().zip(high.par_iter()))
+        .for_each(|(output, (low, high))| {
+            output.write(*low + (*high - *low) * point[0]);
+        });
+    // SAFETY: the parallel loop above initialized every cell in the lower
+    // half. The upper half remains outside this slice and outside Vec length.
+    let initialized =
+        unsafe { std::slice::from_raw_parts_mut(scratch.as_mut_ptr().cast::<Field192>(), half) };
+    fold_message_at_point(initialized, &point[1..])
 }
 
 fn fold_message_at_point(scratch: &mut [Field192], point: &[Field192]) -> Field192 {
@@ -1677,6 +1702,7 @@ fn accumulate_scaled_equality_weights_one_round(
 /// Expand the final two equality coordinates directly into the four target
 /// quarters. This performs the same three multiplications per source value as
 /// two ordinary rounds while avoiding both intermediate scratch levels.
+#[cfg(test)]
 fn accumulate_scaled_equality_weights(
     point: &[Field192],
     scale: Field192,
@@ -1967,19 +1993,100 @@ fn build_production_precarry(
 
 /// Build the pre-Carry batch inside the allocation already reserved for the
 /// four-quarter vertical codeword. The message occupies the first quarter;
-/// the remaining quarters are the evaluation scratch, combined equality
-/// weight, and the product-sumcheck copy. Keeping the original first quarter
-/// intact avoids regenerating it before vertical encoding. Once the sumcheck
-/// finishes, truncating back to the message retains the same allocation for
-/// the three parity quarters instead of leaving three freed allocations in
-/// the allocator.
+/// only two spare quarters are initialized for evaluation/combined weights
+/// and the product-sumcheck copy. Keeping the original first quarter intact
+/// avoids regenerating it before vertical encoding, while leaving the fourth
+/// quarter untouched avoids one full-message copy. Once the sumcheck finishes,
+/// truncating back to the message retains the allocation for vertical parity.
 fn build_production_precarry_in_codeword(
     codeword: &mut Vec<Field192>,
     commitment_root: Digest,
 ) -> ProductionPreCarryProof {
-    build_production_precarry_in_codeword_with_modes(codeword, commitment_root, true, true)
+    build_production_precarry_in_codeword_compact(codeword, commitment_root)
 }
 
+fn build_production_precarry_in_codeword_compact(
+    codeword: &mut Vec<Field192>,
+    commitment_root: Digest,
+) -> ProductionPreCarryProof {
+    assert_eq!(codeword.len(), CARRYOPEN_FIELDS);
+    assert!(codeword.capacity() >= 4 * CARRYOPEN_FIELDS);
+    let points = precarry_opening_points(&commitment_root, 16);
+    let message_pointer = codeword.as_ptr();
+    let (claims, sumcheck) = {
+        let spare = &mut codeword.spare_capacity_mut()[..2 * CARRYOPEN_FIELDS];
+        let (combined_spare, sumcheck_spare) = spare.split_at_mut(CARRYOPEN_FIELDS);
+        // SAFETY: the immutable message occupies the initialized Vec prefix;
+        // both mutable spare slices begin after that prefix and are disjoint.
+        let message = unsafe { std::slice::from_raw_parts(message_pointer, CARRYOPEN_FIELDS) };
+        let claims = points
+            .iter()
+            .map(|point| {
+                evaluate_power_of_two_message_direct_first_round_in_spare(
+                    message,
+                    point,
+                    combined_spare,
+                )
+            })
+            .collect::<Vec<_>>();
+        let statement = precarry_statement_root(&commitment_root, &points, &claims);
+        let coefficients = precarry_coefficients(&statement, claims.len());
+        let claimed = claims
+            .iter()
+            .zip(&coefficients)
+            .map(|(claim, coefficient)| *claim * coefficient)
+            .sum::<Field192>();
+
+        combined_spare.par_iter_mut().for_each(|value| {
+            value.write(Field192::ZERO);
+        });
+        // SAFETY: every combined-weight cell was initialized immediately
+        // above. A panic before this point leaves it outside Vec length.
+        let combined_weight = unsafe {
+            std::slice::from_raw_parts_mut(
+                combined_spare.as_mut_ptr().cast::<Field192>(),
+                CARRYOPEN_FIELDS,
+            )
+        };
+        accumulate_equality_weights_block_local(&points, &coefficients, combined_weight);
+
+        sumcheck_spare
+            .par_iter_mut()
+            .zip(message.par_iter())
+            .for_each(|(target, value)| {
+                target.write(*value);
+            });
+        // SAFETY: the disjoint parallel copy initialized the complete second
+        // spare quarter. Both workspaces now contain valid Field192 values.
+        let sumcheck_message = unsafe {
+            std::slice::from_raw_parts_mut(
+                sumcheck_spare.as_mut_ptr().cast::<Field192>(),
+                CARRYOPEN_FIELDS,
+            )
+        };
+        let sumcheck = prove_local_product_relation_with_claim_slices(
+            sumcheck_message,
+            combined_weight,
+            local_relation_roots(b"pre-Carry-batch", 0, &[commitment_root, statement]),
+            claimed,
+        );
+        (claims, sumcheck)
+    };
+    // SAFETY: both spare quarters are fully initialized. Extending only now
+    // keeps an unwinding path from ever exposing partially initialized cells.
+    unsafe { codeword.set_len(3 * CARRYOPEN_FIELDS) };
+    codeword.truncate(CARRYOPEN_FIELDS);
+    let proof = ProductionPreCarryProof {
+        commitment_root,
+        points,
+        claims,
+        sumcheck,
+    };
+    assert!(proof.verify());
+    proof
+}
+
+#[cfg(test)]
 fn build_production_precarry_in_codeword_with_modes(
     codeword: &mut Vec<Field192>,
     commitment_root: Digest,
@@ -8847,7 +8954,7 @@ fn main() {
             "- production CarryOpen code: vertical and horizontal systematic QA rate 1/4, 2^16 x 2^8 message, 1024-field tensor rows, q={CARRYOPEN_QUERIES}"
         );
         println!(
-            "- pre-Carry message/scratch/weight/sumcheck copy reuse the four quarters of the reserved 1.500-GiB codeword allocation"
+            "- pre-Carry touches three quarters of the reserved 1.500-GiB codeword allocation: message, scratch/weight, and sumcheck copy; the fourth remains uninitialized"
         );
         println!(
             "- CarryOpen M+systematic-root/pre-Carry/encode+commit/algebra/terminal medians: {:.3}/{:.3}/{:.3}/{:.3}/{:.3} ms",
@@ -9883,6 +9990,11 @@ mod tests {
                 evaluate_power_of_two_message_direct_first_round(&message, &point, &mut direct);
             assert_eq!(actual, expected);
             assert_eq!(direct[0], copied[0]);
+            let mut spare = vec![MaybeUninit::<Field192>::uninit(); fields];
+            let spare_actual = evaluate_power_of_two_message_direct_first_round_in_spare(
+                &message, &point, &mut spare,
+            );
+            assert_eq!(spare_actual, expected);
         }
     }
 
@@ -12524,6 +12636,142 @@ mod tests {
             mean(&copied_ms),
             mean(&direct_ms),
         );
+    }
+
+    #[test]
+    #[ignore = "production compact versus four-quarter pre-Carry workspace A/B"]
+    fn compact_precarry_workspace_benchmarks_four_quarters() {
+        let mut original = Vec::with_capacity(4 * CARRYOPEN_FIELDS);
+        original.resize(CARRYOPEN_FIELDS, Field192::ZERO);
+        original
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, value)| *value = precarry_message_value(index));
+        let commitment_root = prefix_root(
+            &original,
+            CARRYOPEN_FIELDS,
+            &zero_roots(CARRYOPEN_FIELDS.trailing_zeros() as usize),
+        );
+        let expected = {
+            let mut codeword = original.clone();
+            codeword.reserve_exact(3 * CARRYOPEN_FIELDS);
+            build_production_precarry_in_codeword_with_modes(
+                &mut codeword,
+                commitment_root,
+                true,
+                true,
+            )
+        };
+        let run = |compact: bool| {
+            let mut codeword = original.clone();
+            codeword.reserve_exact(3 * CARRYOPEN_FIELDS);
+            let start = Instant::now();
+            let proof = if compact {
+                build_production_precarry_in_codeword_compact(&mut codeword, commitment_root)
+            } else {
+                build_production_precarry_in_codeword_with_modes(
+                    &mut codeword,
+                    commitment_root,
+                    true,
+                    true,
+                )
+            };
+            let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+            assert_eq!(proof, expected);
+            assert_eq!(codeword, original);
+            elapsed
+        };
+        let mut four_quarter_ms = Vec::with_capacity(16);
+        let mut compact_ms = Vec::with_capacity(16);
+        let mut compact_midpoints = 0_usize;
+        for trial in 0..8 {
+            let order = if trial % 2 == 0 {
+                [false, true, true, false]
+            } else {
+                [true, false, false, true]
+            };
+            let mut trial_four_quarter = Vec::with_capacity(2);
+            let mut trial_compact = Vec::with_capacity(2);
+            for compact in order {
+                let elapsed = run(compact);
+                if compact {
+                    compact_ms.push(elapsed);
+                    trial_compact.push(elapsed);
+                } else {
+                    four_quarter_ms.push(elapsed);
+                    trial_four_quarter.push(elapsed);
+                }
+            }
+            let four_quarter_midpoint = (trial_four_quarter[0] + trial_four_quarter[1]) / 2.0;
+            let compact_midpoint = (trial_compact[0] + trial_compact[1]) / 2.0;
+            compact_midpoints += usize::from(compact_midpoint < four_quarter_midpoint);
+            eprintln!(
+                "precarry-workspace trial={} four-quarter={:.3}/{:.3} ms compact={:.3}/{:.3} ms",
+                trial + 1,
+                trial_four_quarter[0],
+                trial_four_quarter[1],
+                trial_compact[0],
+                trial_compact[1],
+            );
+        }
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2.0
+        };
+        let mean = |samples: &[f64]| samples.iter().sum::<f64>() / samples.len() as f64;
+        eprintln!(
+            "precarry-workspace four-quarter-ms={four_quarter_ms:?} compact-ms={compact_ms:?} four-quarter-median={:.3} compact-median={:.3} four-quarter-mean={:.3} compact-mean={:.3} compact-midpoints={compact_midpoints}/8",
+            median(&four_quarter_ms),
+            median(&compact_ms),
+            mean(&four_quarter_ms),
+            mean(&compact_ms),
+        );
+    }
+
+    #[test]
+    #[ignore = "production four-quarter pre-Carry workspace memory profile"]
+    fn four_quarter_precarry_workspace_memory_profile() {
+        let mut codeword = Vec::with_capacity(4 * CARRYOPEN_FIELDS);
+        codeword.resize(CARRYOPEN_FIELDS, Field192::ZERO);
+        codeword
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, value)| *value = precarry_message_value(index));
+        let commitment_root = prefix_root(
+            &codeword,
+            CARRYOPEN_FIELDS,
+            &zero_roots(CARRYOPEN_FIELDS.trailing_zeros() as usize),
+        );
+        let proof = build_production_precarry_in_codeword_with_modes(
+            &mut codeword,
+            commitment_root,
+            true,
+            true,
+        );
+        assert!(proof.verify());
+        assert_eq!(codeword.len(), CARRYOPEN_FIELDS);
+        std::hint::black_box((&codeword, proof));
+    }
+
+    #[test]
+    #[ignore = "production compact pre-Carry workspace memory profile"]
+    fn compact_precarry_workspace_memory_profile() {
+        let mut codeword = Vec::with_capacity(4 * CARRYOPEN_FIELDS);
+        codeword.resize(CARRYOPEN_FIELDS, Field192::ZERO);
+        codeword
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, value)| *value = precarry_message_value(index));
+        let commitment_root = prefix_root(
+            &codeword,
+            CARRYOPEN_FIELDS,
+            &zero_roots(CARRYOPEN_FIELDS.trailing_zeros() as usize),
+        );
+        let proof = build_production_precarry_in_codeword_compact(&mut codeword, commitment_root);
+        assert!(proof.verify());
+        assert_eq!(codeword.len(), CARRYOPEN_FIELDS);
+        std::hint::black_box((&codeword, proof));
     }
 
     #[test]
